@@ -598,19 +598,55 @@ def flatten_quota_pools(raw_groups):
             })
     return flat
 
+def parse_iso_ms(raw_dt):
+    if not raw_dt:
+        return None
+    try:
+        return int(datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return None
+
+def _has_expired_pool(pools, now_ms):
+    for p in (pools or []):
+        rms = parse_iso_ms(p.get("resetTime") if isinstance(p, dict) else "")
+        if rms and rms <= now_ms:
+            return True
+    return False
+
+def _project_reset_ms(reset_ms, period_ms, now_ms):
+    if not reset_ms or period_ms <= 0:
+        return None
+    if reset_ms <= now_ms:
+        steps = ((now_ms - reset_ms) // period_ms) + 1
+        return reset_ms + steps * period_ms
+    return reset_ms
+
+def _is_3p_model(model_name):
+    ml = (model_name or "").lower()
+    return ("claude" in ml) or ("opus" in ml) or ("sonnet" in ml) or ("haiku" in ml) or ("gpt" in ml) or ("openai" in ml)
+
+_LAST_QUOTA_REFRESH_ATTEMPT = 0.0
+
 def fetch_live_quota(force_refresh=False):
+    global _LAST_QUOTA_REFRESH_ATTEMPT
     now = time.time()
+    now_ms = int(now * 1000)
     raw_groups = None
     if not force_refresh and os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-                if now - cached.get("timestamp", 0) < 90:
-                    raw_groups = cached.get("groups", [])
+                age = now - cached.get("timestamp", 0)
+                cand_groups = cached.get("groups", [])
+                cand_flat = flatten_quota_pools(cand_groups or [])
+                expired = _has_expired_pool(cand_flat, now_ms)
+                if age < 90 and (not expired or (now - _LAST_QUOTA_REFRESH_ATTEMPT) < 10):
+                    raw_groups = cand_groups
         except Exception:
             pass
 
     if raw_groups is None:
+        _LAST_QUOTA_REFRESH_ATTEMPT = now
         agy_bin = _find_agy_binary()
         if agy_bin:
             try:
@@ -671,6 +707,8 @@ def load_raw_telemetry(force=False):
     global _TELEMETRY_CACHE, _TELEMETRY_CACHE_TIME
     now = time.time()
     if not force and _TELEMETRY_CACHE and (now - _TELEMETRY_CACHE_TIME < 30):
+        if _has_expired_pool(_TELEMETRY_CACHE.get("quota"), int(now * 1000)) and (now - _LAST_QUOTA_REFRESH_ATTEMPT >= 10):
+            _TELEMETRY_CACHE["quota"] = fetch_live_quota(force_refresh=True)
         return _TELEMETRY_CACHE
 
     t0 = time.time()
@@ -1071,43 +1109,47 @@ def load_raw_telemetry(force=False):
     _TELEMETRY_CACHE_TIME = now
     return _TELEMETRY_CACHE
 
-def parse_iso_ms(raw_dt):
-    if not raw_dt:
-        return None
-    try:
-        return int(datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).timestamp() * 1000)
-    except Exception:
-        return None
+def _ms_to_utc_iso(ms):
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
     telemetry = load_raw_telemetry()
     all_reqs = telemetry["all_requests"]
     now_ms = int(time.time() * 1000)
+    period_5h_ms = 5 * 3600 * 1000
+    period_wk_ms = 7 * 86400 * 1000
 
-    # Resolve live server reset cycle boundaries (5h and Weekly)
-    quota_list = telemetry.get("quota") or []
-    gem_5h = next((q for q in quota_list if q.get("id") == "gemini-5h"), None)
-    gem_wk = next((q for q in quota_list if q.get("id") == "gemini-weekly"), None)
-    fh_reset_ms = parse_iso_ms(gem_5h.get("resetTime")) if gem_5h else None
-    wk_reset_ms = parse_iso_ms(gem_wk.get("resetTime")) if gem_wk else None
+    # Resolve live server reset cycle boundaries (5h and Weekly), rolling forward if a cached reset_time just passed
+    raw_quota_list = telemetry.get("quota") or []
+    gem_5h_raw = next((q for q in raw_quota_list if q.get("id") == "gemini-5h"), None)
+    gem_wk_raw = next((q for q in raw_quota_list if q.get("id") == "gemini-weekly"), None)
+    tp_5h_raw = next((q for q in raw_quota_list if q.get("id") == "3p-5h"), None)
+    tp_wk_raw = next((q for q in raw_quota_list if q.get("id") == "3p-weekly"), None)
 
-    if fh_reset_ms and fh_reset_ms > now_ms:
-        fh_cycle_start_ms = fh_reset_ms - 5 * 3600 * 1000
-    else:
-        fh_cycle_start_ms = now_ms - 5 * 3600 * 1000
+    raw_fh_reset_ms = parse_iso_ms(gem_5h_raw.get("resetTime")) if gem_5h_raw else None
+    raw_wk_reset_ms = parse_iso_ms(gem_wk_raw.get("resetTime")) if gem_wk_raw else None
+    raw_tp_fh_reset_ms = parse_iso_ms(tp_5h_raw.get("resetTime")) if tp_5h_raw else None
+    raw_tp_wk_reset_ms = parse_iso_ms(tp_wk_raw.get("resetTime")) if tp_wk_raw else None
 
-    if wk_reset_ms and wk_reset_ms > now_ms:
-        wk_cycle_start_ms = wk_reset_ms - 7 * 86400 * 1000
-    else:
-        wk_cycle_start_ms = now_ms - 7 * 86400 * 1000
+    fh_reset_ms = _project_reset_ms(raw_fh_reset_ms, period_5h_ms, now_ms)
+    wk_reset_ms = _project_reset_ms(raw_wk_reset_ms, period_wk_ms, now_ms)
+    tp_fh_reset_ms = _project_reset_ms(raw_tp_fh_reset_ms, period_5h_ms, now_ms)
+    tp_wk_reset_ms = _project_reset_ms(raw_tp_wk_reset_ms, period_wk_ms, now_ms)
+
+    fh_cycle_start_ms = (fh_reset_ms - period_5h_ms) if fh_reset_ms else (now_ms - period_5h_ms)
+    wk_cycle_start_ms = (wk_reset_ms - period_wk_ms) if wk_reset_ms else (now_ms - period_wk_ms)
+    tp_fh_cycle_start_ms = (tp_fh_reset_ms - period_5h_ms) if tp_fh_reset_ms else (now_ms - period_5h_ms)
+    tp_wk_cycle_start_ms = (tp_wk_reset_ms - period_wk_ms) if tp_wk_reset_ms else (now_ms - period_wk_ms)
 
     fh_cycle_since = datetime.fromtimestamp(fh_cycle_start_ms / 1000).astimezone().strftime("%H:%M")
     wk_cycle_since = datetime.fromtimestamp(wk_cycle_start_ms / 1000).astimezone().strftime("%b %d %H:%M")
-    fh_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - fh_cycle_start_ms) / (5 * 3600 * 1000)) * 100.0)), 1)
-    wk_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - wk_cycle_start_ms) / (7 * 86400 * 1000)) * 100.0)), 1)
+    fh_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - fh_cycle_start_ms) / period_5h_ms) * 100.0)), 1)
+    wk_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - wk_cycle_start_ms) / period_wk_ms) * 100.0)), 1)
 
-    cycle_5h_units = sum(r["units"] for r in all_reqs if r["ts"] >= fh_cycle_start_ms)
-    cycle_wk_units = sum(r["units"] for r in all_reqs if r["ts"] >= wk_cycle_start_ms)
+    cycle_5h_units = sum(r["units"] for r in all_reqs if r["ts"] >= fh_cycle_start_ms and not _is_3p_model(r["model"]))
+    cycle_wk_units = sum(r["units"] for r in all_reqs if r["ts"] >= wk_cycle_start_ms and not _is_3p_model(r["model"]))
+    cycle_3p_5h_units = sum(r["units"] for r in all_reqs if r["ts"] >= tp_fh_cycle_start_ms and _is_3p_model(r["model"]))
+    cycle_3p_wk_units = sum(r["units"] for r in all_reqs if r["ts"] >= tp_wk_cycle_start_ms and _is_3p_model(r["model"]))
 
     range_configs = {
         "1h":  {"span_ms": 3600 * 1000,       "bucket_ms": 300 * 1000,   "unit": "5m", "desc": "Per 5m",   "label": "1h"},
@@ -1473,6 +1515,39 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
 
     local_5h_cycle_pct = units_to_pct_5h(cycle_5h_units, 2)
     local_wk_cycle_pct = units_to_pct_week(cycle_wk_units, 2)
+    local_3p_5h_cycle_pct = units_to_pct_5h(cycle_3p_5h_units, 2)
+    local_3p_wk_cycle_pct = units_to_pct_week(cycle_3p_wk_units, 2)
+
+    active_5h_in_range_units = sum(r["units"] for r in in_range if r["ts"] >= fh_cycle_start_ms and not _is_3p_model(r["model"]))
+    forgiven_5h_in_range_units = sum(r["units"] for r in in_range if r["ts"] < fh_cycle_start_ms and not _is_3p_model(r["model"]))
+    active_pct_5h_spent = units_to_pct_5h(active_5h_in_range_units, 2)
+    forgiven_pct_5h_spent = units_to_pct_5h(forgiven_5h_in_range_units, 2)
+
+    effective_quota_list = []
+    for q in raw_quota_list:
+        qc = dict(q)
+        qid = qc.get("id", "")
+        qwin = qc.get("window", "")
+        per_ms = period_5h_ms if qwin == "5h" or qid.endswith("-5h") else period_wk_ms
+        q_raw_ms = parse_iso_ms(qc.get("resetTime"))
+        if q_raw_ms and q_raw_ms <= now_ms:
+            q_proj_ms = _project_reset_ms(q_raw_ms, per_ms, now_ms)
+            qc["resetTime"] = _ms_to_utc_iso(q_proj_ms)
+            loc_fallback = (
+                local_5h_cycle_pct if qid == "gemini-5h" else
+                local_wk_cycle_pct if qid == "gemini-weekly" else
+                local_3p_5h_cycle_pct if qid == "3p-5h" else
+                local_3p_wk_cycle_pct if qid == "3p-weekly" else 0.0
+            )
+            used_est = min(100.0, loc_fallback)
+            qc["usedPct"] = round(used_est, 1)
+            qc["remainingPct"] = round(max(0.0, 100.0 - used_est), 1)
+            qc["remainingFraction"] = max(0.0, (100.0 - used_est) / 100.0)
+        effective_quota_list.append(qc)
+
+    gem_5h = next((q for q in effective_quota_list if q.get("id") == "gemini-5h"), None)
+    gem_wk = next((q for q in effective_quota_list if q.get("id") == "gemini-weekly"), None)
+
     server_5h_used_pct = round(float(gem_5h.get("usedPct", local_5h_cycle_pct)), 2) if gem_5h else local_5h_cycle_pct
     server_5h_rem_pct = round(float(gem_5h.get("remainingPct", max(0.0, 100.0 - server_5h_used_pct))), 2) if gem_5h else round(max(0.0, 100.0 - server_5h_used_pct), 2)
     server_wk_used_pct = round(float(gem_wk.get("usedPct", local_wk_cycle_pct)), 2) if gem_wk else local_wk_cycle_pct
@@ -1541,9 +1616,13 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "avgTtft": avg_ttft,
         "avgTokensPerSecond": avg_tps,
         "pct5hSpent": units_to_pct_5h(tot_units, 2),
+        "activePct5hSpent": active_pct_5h_spent,
+        "forgivenPct5hSpent": forgiven_pct_5h_spent,
         "pctWeeklySpent": units_to_pct_week(tot_units, 2),
         "cycle5hLocalPct": local_5h_cycle_pct,
         "cycleWeekLocalPct": local_wk_cycle_pct,
+        "cycle3p5hLocalPct": local_3p_5h_cycle_pct,
+        "cycle3pWeekLocalPct": local_3p_wk_cycle_pct,
         "fhCycleSince": fh_cycle_since,
         "wkCycleSince": wk_cycle_since,
         "fhElapsedPct": fh_elapsed_pct,
@@ -1578,7 +1657,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "frustration_categories": dict(frust_cats.most_common()),
         "projects": projects_list,
         "sessions": sessions_list,
-        "quota": telemetry["quota"],
+        "quota": effective_quota_list,
         "today": {
             "date": today_str,
             **today_entry
@@ -3560,14 +3639,55 @@ def handle_settings_cli(args_list):
     print_settings_table(saved)
 
 # ============================================================================
-# Web Dashboard HTML
+# Web Dashboard HTML & Official Antigravity Brand Mark
 # ============================================================================
+FAVICON_SVG = r"""<svg width="120" height="120" viewBox="0 0 136 136" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .fav-bg { fill: #FFFFFF; }
+    @media (prefers-color-scheme: dark) {
+      .fav-bg { fill: #000000; }
+    }
+  </style>
+  <circle class="fav-bg" cx="68" cy="68" r="65" fill="#FFFFFF"/>
+  <g transform="translate(12 10)">
+    <path d="M89.6992 93.695C94.3659 97.195 101.366 94.8617 94.9492 88.445C75.6992 69.7783 79.7825 18.445 55.8659 18.445C31.9492 18.445 36.0325 69.7783 16.7825 88.445C9.78251 95.445 17.3658 97.195 22.0325 93.695C40.1159 81.445 38.9492 59.8617 55.8659 59.8617C72.7825 59.8617 71.6159 81.445 89.6992 93.695Z" fill="#3186FF"/>
+    <mask id="ag_fav_m" style="mask-type:alpha" maskUnits="userSpaceOnUse" x="13" y="18" width="85" height="78">
+      <path d="M89.6992 93.695C94.3659 97.195 101.366 94.8617 94.9492 88.445C75.6992 69.7783 79.7825 18.445 55.8659 18.445C31.9492 18.445 36.0325 69.7783 16.7825 88.445C9.78251 95.445 17.3658 97.195 22.0325 93.695C40.1159 81.445 38.9492 59.8617 55.8659 59.8617C72.7825 59.8617 71.6159 81.445 89.6992 93.695Z" fill="black"/>
+    </mask>
+    <g mask="url(#ag_fav_m)">
+      <g filter="url(#ag_fav_f0)"><ellipse cx="22.7873" cy="26.8098" rx="22.7873" ry="26.8098" transform="matrix(-0.112784 0.99362 -0.99362 -0.112781 66.2473 -15.5344)" fill="#FFE432"/></g>
+      <g filter="url(#ag_fav_f1)"><ellipse cx="96.491" cy="35.1231" rx="29.5007" ry="30.1492" transform="rotate(76.9243 96.491 35.1231)" fill="#FC413D"/></g>
+      <g filter="url(#ag_fav_f2)"><ellipse cx="9.02988" cy="41.6647" rx="30.832" ry="39.9417" transform="rotate(74.1257 9.02988 41.6647)" fill="#00B95C"/></g>
+      <g filter="url(#ag_fav_f3)"><ellipse cx="11.2212" cy="42.8915" rx="30.22" ry="33.2695" transform="rotate(45.6065 11.2212 42.8915)" fill="#00B95C"/></g>
+      <g filter="url(#ag_fav_f4)"><ellipse cx="75.7546" cy="104.822" rx="29.0177" ry="27.943" transform="rotate(76.9243 75.7546 104.822)" fill="#3186FF"/></g>
+      <g filter="url(#ag_fav_f5)"><ellipse cx="33.5661" cy="35.4043" rx="33.5661" ry="35.4043" transform="matrix(-0.409539 0.912293 -0.912294 -0.409537 101.25 -15.1674)" fill="#FBBC04"/></g>
+      <g filter="url(#ag_fav_f6)"><path d="M2.56802 149.695C-15.8116 142.48 15.5987 83.1163 23.4093 63.2203C31.22 43.3244 52.4514 33.0447 70.831 40.26C89.2107 47.4753 110.996 87.2162 103.185 107.112C95.3742 127.008 20.9477 156.91 2.56802 149.695Z" fill="#3186FF"/></g>
+      <g filter="url(#ag_fav_f7)"><path d="M113.934 75.8079C109.013 81.5509 96.1724 78.6224 85.253 69.2667C74.3335 59.911 69.4704 47.6711 74.391 41.928C79.3116 36.185 92.1525 39.1136 103.072 48.4692C113.991 57.8249 118.855 70.0648 113.934 75.8079Z" fill="#749BFF"/></g>
+      <g filter="url(#ag_fav_f8)"><ellipse cx="92.611" cy="23.7962" rx="44.2411" ry="27.5016" transform="rotate(34.0763 92.611 23.7962)" fill="#FC413D"/></g>
+      <g filter="url(#ag_fav_f9)"><ellipse cx="23.4949" cy="29.5887" rx="23.7071" ry="13.7869" transform="rotate(112.516 23.4949 29.5887)" fill="#FFEE48"/></g>
+    </g>
+  </g>
+  <defs>
+    <filter id="ag_fav_f0" x="2.49348" y="-26.5423" width="69.0899" height="61.2525" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="3.89034"/></filter>
+    <filter id="ag_fav_f1" x="28.7524" y="-32.0333" width="135.477" height="134.313" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="18.8078"/></filter>
+    <filter id="ag_fav_f2" x="-62.2884" y="-21.9253" width="142.637" height="127.18" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="15.9884"/></filter>
+    <filter id="ag_fav_f3" x="-52.5697" y="-20.8346" width="127.582" height="127.452" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="15.9884"/></filter>
+    <filter id="ag_fav_f4" x="17.3619" y="45.4646" width="116.786" height="118.715" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="15.1937"/></filter>
+    <filter id="ag_fav_f5" x="-7.44765" y="-60.4737" width="125.303" height="122.858" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="13.7698"/></filter>
+    <filter id="ag_fav_f6" x="-27.7086" y="13.3597" width="157.119" height="162.029" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="12.297"/></filter>
+    <filter id="ag_fav_f7" x="50.4638" y="16.981" width="87.3973" height="83.7738" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="11.0036"/></filter>
+    <filter id="ag_fav_f8" x="34.2604" y="-28.457" width="116.701" height="104.506" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="9.29385"/></filter>
+    <filter id="ag_fav_f9" x="-15.1522" y="-15.9493" width="77.2941" height="91.076" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="11.5027"/></filter>
+  </defs>
+</svg>"""
+
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>agy / stats</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;550;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -3747,10 +3867,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-size: 15px;
   }
   .topbar-mark {
-    width: 14px;
-    height: 14px;
-    border-radius: 3px;
-    background: var(--accent-gradient);
+    width: 19px;
+    height: 19px;
     flex-shrink: 0;
   }
   .topbar-slash { color: var(--ink-3); font-weight: 400; }
@@ -4623,7 +4741,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <header class="topbar" id="shellTopbar" data-scrolled="false">
   <div class="topbar-brand">
-    <div class="topbar-mark"></div>
+    <svg class="topbar-mark" width="19" height="19" viewBox="12 16 88 82" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M89.6992 93.695C94.3659 97.195 101.366 94.8617 94.9492 88.445C75.6992 69.7783 79.7825 18.445 55.8659 18.445C31.9492 18.445 36.0325 69.7783 16.7825 88.445C9.78251 95.445 17.3658 97.195 22.0325 93.695C40.1159 81.445 38.9492 59.8617 55.8659 59.8617C72.7825 59.8617 71.6159 81.445 89.6992 93.695Z" fill="#3186FF"/>
+      <mask id="ag_tb_m" style="mask-type:alpha" maskUnits="userSpaceOnUse" x="13" y="18" width="85" height="78">
+        <path d="M89.6992 93.695C94.3659 97.195 101.366 94.8617 94.9492 88.445C75.6992 69.7783 79.7825 18.445 55.8659 18.445C31.9492 18.445 36.0325 69.7783 16.7825 88.445C9.78251 95.445 17.3658 97.195 22.0325 93.695C40.1159 81.445 38.9492 59.8617 55.8659 59.8617C72.7825 59.8617 71.6159 81.445 89.6992 93.695Z" fill="black"/>
+      </mask>
+      <g mask="url(#ag_tb_m)">
+        <g filter="url(#ag_tb_f0)"><ellipse cx="22.7873" cy="26.8098" rx="22.7873" ry="26.8098" transform="matrix(-0.112784 0.99362 -0.99362 -0.112781 66.2473 -15.5344)" fill="#FFE432"/></g>
+        <g filter="url(#ag_tb_f1)"><ellipse cx="96.491" cy="35.1231" rx="29.5007" ry="30.1492" transform="rotate(76.9243 96.491 35.1231)" fill="#FC413D"/></g>
+        <g filter="url(#ag_tb_f2)"><ellipse cx="9.02988" cy="41.6647" rx="30.832" ry="39.9417" transform="rotate(74.1257 9.02988 41.6647)" fill="#00B95C"/></g>
+        <g filter="url(#ag_tb_f3)"><ellipse cx="11.2212" cy="42.8915" rx="30.22" ry="33.2695" transform="rotate(45.6065 11.2212 42.8915)" fill="#00B95C"/></g>
+        <g filter="url(#ag_tb_f4)"><ellipse cx="75.7546" cy="104.822" rx="29.0177" ry="27.943" transform="rotate(76.9243 75.7546 104.822)" fill="#3186FF"/></g>
+        <g filter="url(#ag_tb_f5)"><ellipse cx="33.5661" cy="35.4043" rx="33.5661" ry="35.4043" transform="matrix(-0.409539 0.912293 -0.912294 -0.409537 101.25 -15.1674)" fill="#FBBC04"/></g>
+        <g filter="url(#ag_tb_f6)"><path d="M2.56802 149.695C-15.8116 142.48 15.5987 83.1163 23.4093 63.2203C31.22 43.3244 52.4514 33.0447 70.831 40.26C89.2107 47.4753 110.996 87.2162 103.185 107.112C95.3742 127.008 20.9477 156.91 2.56802 149.695Z" fill="#3186FF"/></g>
+        <g filter="url(#ag_tb_f7)"><path d="M113.934 75.8079C109.013 81.5509 96.1724 78.6224 85.253 69.2667C74.3335 59.911 69.4704 47.6711 74.391 41.928C79.3116 36.185 92.1525 39.1136 103.072 48.4692C113.991 57.8249 118.855 70.0648 113.934 75.8079Z" fill="#749BFF"/></g>
+        <g filter="url(#ag_tb_f8)"><ellipse cx="92.611" cy="23.7962" rx="44.2411" ry="27.5016" transform="rotate(34.0763 92.611 23.7962)" fill="#FC413D"/></g>
+        <g filter="url(#ag_tb_f9)"><ellipse cx="23.4949" cy="29.5887" rx="23.7071" ry="13.7869" transform="rotate(112.516 23.4949 29.5887)" fill="#FFEE48"/></g>
+      </g>
+      <defs>
+        <filter id="ag_tb_f0" x="2.49348" y="-26.5423" width="69.0899" height="61.2525" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="3.89034"/></filter>
+        <filter id="ag_tb_f1" x="28.7524" y="-32.0333" width="135.477" height="134.313" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="18.8078"/></filter>
+        <filter id="ag_tb_f2" x="-62.2884" y="-21.9253" width="142.637" height="127.18" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="15.9884"/></filter>
+        <filter id="ag_tb_f3" x="-52.5697" y="-20.8346" width="127.582" height="127.452" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="15.9884"/></filter>
+        <filter id="ag_tb_f4" x="17.3619" y="45.4646" width="116.786" height="118.715" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="15.1937"/></filter>
+        <filter id="ag_tb_f5" x="-7.44765" y="-60.4737" width="125.303" height="122.858" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="13.7698"/></filter>
+        <filter id="ag_tb_f6" x="-27.7086" y="13.3597" width="157.119" height="162.029" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="12.297"/></filter>
+        <filter id="ag_tb_f7" x="50.4638" y="16.981" width="87.3973" height="83.7738" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="11.0036"/></filter>
+        <filter id="ag_tb_f8" x="34.2604" y="-28.457" width="116.701" height="104.506" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="9.29385"/></filter>
+        <filter id="ag_tb_f9" x="-15.1522" y="-15.9493" width="77.2941" height="91.076" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="11.5027"/></filter>
+      </defs>
+    </svg>
     <span>agy</span>
     <span class="topbar-slash">/</span>
     <span class="topbar-title">stats</span>
@@ -5414,18 +5561,23 @@ function renderDynamicOverview() {
   const isMulti = (G_QUOTA_MODE === "multi");
 
   // In Server (1 machine) mode: cycle ranges ("5h", "wk", "all") show the server ground-truth cycle % as headline,
-  // while sub-ranges ("1h", "24h", "7d", etc.) show the range estimate with the live Server cycle in the footnote.
-  const headline5h = (!isMulti && gem5h && ov.range === "5h") ? gem5h.usedPct : ov.pct5hSpent;
+  // while sub-ranges ("1h", "7d", etc.) show the active cycle range estimate (excluding already-reset 5h tokens) with live Server cycle in the footnote.
+  const activeRange5h = ov.activePct5hSpent ?? ov.pct5hSpent;
+  const forgivenRange5h = Number(ov.forgivenPct5hSpent || 0);
+  const headline5h = (!isMulti && gem5h && ov.range === "5h") ? gem5h.usedPct : activeRange5h;
   const headlineWk = (!isMulti && gemWk && (ov.range === "wk" || ov.range === "all")) ? gemWk.usedPct : ov.pctWeeklySpent;
 
   const label5h = isMulti ? "5h quota (this machine)" : (ov.range === "5h" ? "5h quota (server)" : "5h quota");
   const labelWk = isMulti ? "Weekly quota (this machine)" : ((ov.range === "wk" || ov.range === "all") ? "Weekly quota (server)" : "Weekly quota");
 
+  const forgivenNote = forgivenRange5h > 0
+    ? `+${forgivenRange5h}% prior cycle (reset ${ov.fhCycleSince}) · `
+    : "";
   const foot5h = gem5h
     ? (isMulti
-        ? `Cycle: ${ov.cycle5hLocalPct ?? ov.pct5hSpent}% machine · ${gem5h.usedPct}% server (${gem5h.remainingPct}% left)`
-        : `Server cycle: ${gem5h.usedPct}% used · ${gem5h.remainingPct}% left (resets ${fmtResetIn(gem5h.resetTime)})`)
-    : `${Re(ov.conversationTokens)} tokens`;
+        ? `${forgivenNote}Cycle: ${ov.cycle5hLocalPct ?? activeRange5h}% machine · ${gem5h.usedPct}% server (${gem5h.remainingPct}% left)`
+        : `${forgivenNote}Server cycle: ${gem5h.usedPct}% used · ${gem5h.remainingPct}% left (resets ${fmtResetIn(gem5h.resetTime)})`)
+    : `${forgivenNote}${Re(ov.conversationTokens)} tokens`;
   const footWk = gemWk
     ? (isMulti
         ? `Cycle: ${ov.cycleWeekLocalPct ?? ov.pctWeeklySpent}% machine · ${gemWk.usedPct}% server (${gemWk.remainingPct}% left)`
@@ -6445,10 +6597,15 @@ function renderFullViews() {
       const used = Number(g.usedPct ?? (100 - g.remainingFraction * 100)).toFixed(1);
       const isGemWk = g.id === "gemini-weekly";
       const isGem5h = g.id === "gemini-5h";
+      const is3pWk = g.id === "3p-weekly";
+      const is3p5h = g.id === "3p-5h";
       const localCycleStr = isMulti
         ? (isGemWk
             ? ` · ${ov.cycleWeekLocalPct ?? 0}% this machine (${ov.wkElapsedPct ?? 0}% of week elapsed)`
-            : (isGem5h ? ` · ${ov.cycle5hLocalPct ?? 0}% this machine` : ""))
+            : isGem5h ? ` · ${ov.cycle5hLocalPct ?? 0}% this machine`
+            : is3pWk ? ` · ${ov.cycle3pWeekLocalPct ?? 0}% this machine`
+            : is3p5h ? ` · ${ov.cycle3p5hLocalPct ?? 0}% this machine`
+            : "")
         : (isGemWk ? ` · ${ov.wkElapsedPct ?? 0}% of week elapsed` : "");
       return `
         <div class="stat">
@@ -7139,6 +7296,14 @@ class StatsHandler(BaseHTTPRequestHandler):
             body = json.dumps(cfg).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif parsed.path in ("/favicon.svg", "/favicon.ico"):
+            body = FAVICON_SVG.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Cache-Control", "public, max-age=86400")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
