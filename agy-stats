@@ -1153,6 +1153,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
 
     range_configs = {
         "1h":  {"span_ms": 3600 * 1000,       "bucket_ms": 300 * 1000,   "unit": "5m", "desc": "Per 5m",   "label": "1h"},
+        "5h":  {"span_ms": 5 * 3600 * 1000,   "bucket_ms": 300 * 1000,   "unit": "5m", "desc": "Per 5m",   "label": "5h"},
         "24h": {"span_ms": 86400 * 1000,      "bucket_ms": 3600 * 1000,  "unit": "1h", "desc": "Per hour", "label": "24h"},
         "7d":  {"span_ms": 7 * 86400 * 1000,  "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "7d"},
         "30d": {"span_ms": 30 * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "30d"},
@@ -1160,29 +1161,11 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "all": {"span_ms": None,              "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "all"}
     }
 
-    if range_str == "5h":
-        span_ms = max(300_000, now_ms - fh_cycle_start_ms)
-        bucket_ms = 300 * 1000
-        unit = "5m"
-        desc = f"Per 5m · 5h cycle since {fh_cycle_since}"
-        label = "5h cycle"
-        in_time = lambda ts: ts >= fh_cycle_start_ms
-        cur_bucket = (now_ms // bucket_ms) * bucket_ms
-        start_bucket = (fh_cycle_start_ms // bucket_ms) * bucket_ms
-    elif range_str == "wk":
-        span_ms = max(3600_000, now_ms - wk_cycle_start_ms)
-        bucket_ms = 86400 * 1000 if span_ms > 48 * 3600 * 1000 else 3600 * 1000
-        unit = "1d" if bucket_ms == 86400 * 1000 else "1h"
-        desc = f"Per {'day' if unit == '1d' else 'hour'} · weekly cycle since {wk_cycle_since}"
-        label = "Wk cycle"
-        in_time = lambda ts: ts >= wk_cycle_start_ms
-        cur_bucket = (now_ms // bucket_ms) * bucket_ms
-        start_bucket = (wk_cycle_start_ms // bucket_ms) * bucket_ms
-    elif range_str == "custom" and from_ms is not None and to_ms is not None:
+    if range_str == "custom" and from_ms is not None and to_ms is not None:
         start_ms = min(int(from_ms), int(to_ms))
         end_ms = max(int(from_ms), int(to_ms))
         span_ms = max(60_000, end_ms - start_ms)
-        if span_ms <= 2 * 3600 * 1000:
+        if span_ms <= 6 * 3600 * 1000:
             bucket_ms, unit, desc = 300 * 1000, "5m", "Per 5m"
         elif span_ms <= 48 * 3600 * 1000:
             bucket_ms, unit, desc = 3600 * 1000, "1h", "Per hour"
@@ -1211,7 +1194,8 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
             oldest_ts = all_reqs[-1]["ts"] if all_reqs else now_ms
             start_bucket = (oldest_ts // bucket_ms) * bucket_ms
 
-    show_5h = bool(span_ms is not None and span_ms < 86400 * 1000)
+    is_short_window = bool(span_ms is not None and span_ms < 86400 * 1000)
+    is_subweek_window = bool(span_ms is not None and span_ms <= 7 * 86400 * 1000)
 
     in_range = [r for r in all_reqs if in_time(r["ts"])]
     errs_in_range = [e for e in telemetry["all_errors"] if in_time(e["ts"])]
@@ -1518,10 +1502,27 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
     local_3p_5h_cycle_pct = units_to_pct_5h(cycle_3p_5h_units, 2)
     local_3p_wk_cycle_pct = units_to_pct_week(cycle_3p_wk_units, 2)
 
-    active_5h_in_range_units = sum(r["units"] for r in in_range if r["ts"] >= fh_cycle_start_ms and not _is_3p_model(r["model"]))
-    forgiven_5h_in_range_units = sum(r["units"] for r in in_range if r["ts"] < fh_cycle_start_ms and not _is_3p_model(r["model"]))
+    active_5h_in_range_units = sum(
+        r["units"] for r in in_range
+        if r["ts"] >= (tp_fh_cycle_start_ms if _is_3p_model(r["model"]) else fh_cycle_start_ms)
+    )
+    forgiven_5h_in_range_units = sum(
+        r["units"] for r in in_range
+        if r["ts"] < (tp_fh_cycle_start_ms if _is_3p_model(r["model"]) else fh_cycle_start_ms)
+    )
     active_pct_5h_spent = units_to_pct_5h(active_5h_in_range_units, 2)
     forgiven_pct_5h_spent = units_to_pct_5h(forgiven_5h_in_range_units, 2)
+
+    active_wk_in_range_units = sum(
+        r["units"] for r in in_range
+        if r["ts"] >= (tp_wk_cycle_start_ms if _is_3p_model(r["model"]) else wk_cycle_start_ms)
+    )
+    prior_wk_in_range_units = sum(
+        r["units"] for r in in_range
+        if r["ts"] < (tp_wk_cycle_start_ms if _is_3p_model(r["model"]) else wk_cycle_start_ms)
+    )
+    active_pct_wk_spent = units_to_pct_week(active_wk_in_range_units, 2)
+    prior_pct_wk_spent = units_to_pct_week(prior_wk_in_range_units, 2)
 
     effective_quota_list = []
     for q in raw_quota_list:
@@ -1594,7 +1595,8 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
 
     overall = {
         "range": range_str,
-        "show5h": show_5h,
+        "isShortWindow": is_short_window,
+        "isSubweekWindow": is_subweek_window,
         "windowLabel": label,
         "unitDescription": desc,
         "unit": unit,
@@ -1619,6 +1621,8 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "activePct5hSpent": active_pct_5h_spent,
         "forgivenPct5hSpent": forgiven_pct_5h_spent,
         "pctWeeklySpent": units_to_pct_week(tot_units, 2),
+        "activePctWeekSpent": active_pct_wk_spent,
+        "priorPctWeekSpent": prior_pct_wk_spent,
         "cycle5hLocalPct": local_5h_cycle_pct,
         "cycleWeekLocalPct": local_wk_cycle_pct,
         "cycle3p5hLocalPct": local_3p_5h_cycle_pct,
@@ -1946,8 +1950,8 @@ def print_cli_quota(data):
         burst_refill = f" · Refills in {fh_reset_disp}" if fh_reset_disp else ""
         print()
         print(f"  {C.DIM}5-Hour Burst Pool: {p['server5hUsedPct']:.1f}% used · {p['server5hRemPct']:.1f}% available{burst_refill}{C.RESET}")
-        if p.get('otherWkUsedPct', 0) > 0 or p.get('localWkUsedPct', 0) > 0:
-            print(f"  {C.DIM}Machine Attribution: This machine CLI: {p['localWkUsedPct']:.2f}% | Other devices / IDE: {p['otherWkUsedPct']:.2f}%{C.RESET}")
+        if p.get('otherWkUsedPct', 0) >= 1.0 or p.get('localWkUsedPct', 0) > 0:
+            print(f"  {C.DIM}Setup Attribution: This setup: {p['localWkUsedPct']:.2f}% | Other products / devices: {p['otherWkUsedPct']:.2f}%{C.RESET}")
 
 def print_cli_tokens(data, limit_days=10):
     ov = data["overall"]
@@ -2147,7 +2151,6 @@ def print_settings_table(cfg):
     print(f"  {'Default Launch Mode':<28} {C.GREEN if def_mode=='web' else C.CYAN}{def_mode.upper():<30}{C.RESET} default=web|cli")
     print(f"  {'Web Auto-Open Browser':<28} {browser_str:<30} open_browser=true|false")
     print(f"  {'Web Dashboard Port':<28} {str(web_cfg.get('port', 3872)):<30} port=3872")
-    print(f"  {'Web Quota Mode':<28} {web_cfg.get('quota_mode', 'server'):<30} quota_mode=server|multi")
     print(f"  {'CLI Default View':<28} {cli_cfg.get('default_view', 'overview'):<30} cli.view=tokens|summary")
     print(f"  {'Overview Display Sections':<28} {disp_str:<30} disable=sessions,tools")
     print(f"  {'Launch Update Policy':<28} {upd_policy_str:<39} auto_update=true|false")
@@ -3095,13 +3098,10 @@ def _run_onboarding_fallback(cfg):
             return cfg, False
         chosen_mode = "cli" if ans_mode == "2" else "web"
         open_browser = True
-        quota_mode = "server"
         cli_view = "overview"
         if chosen_mode == "web":
             ans_br = _prompt_tty("Step 2/4 Auto-open browser? [Y/n]: ").strip().lower()
             open_browser = False if ans_br in ("n", "no", "0", "false") else True
-            ans_qm = _prompt_tty("Quota mode [1=server, 2=multi]: ").strip()
-            quota_mode = "multi" if ans_qm == "2" else "server"
         else:
             ans_cv = _prompt_tty("Step 2/4 CLI view [1=overview,2=tokens,3=quota,4=summary,5=sessions]: ").strip()
             cli_view = {"1": "overview", "2": "tokens", "3": "quota", "4": "summary", "5": "sessions"}.get(ans_cv, "overview")
@@ -3123,7 +3123,7 @@ def _run_onboarding_fallback(cfg):
             "default_mode": chosen_mode,
             "auto_check_updates": auto_check_updates,
             "auto_update": auto_update,
-            "web": {"open_browser": open_browser, "quota_mode": quota_mode, "disabled_tabs": []},
+            "web": {"open_browser": open_browser, "disabled_tabs": []},
             "cli": {"default_view": cli_view, "disabled_sections": disabled_sections},
         })
         print(f"\n{C.BOLD}{C.GREEN}✓ Setup complete! Saved to {CONFIG_PATH}{C.RESET}")
@@ -3147,7 +3147,6 @@ def run_onboarding_wizard(cfg=None, from_menu=False):
 
     chosen_mode = cfg.get("default_mode", "web")
     open_browser = bool(cfg.get("web", {}).get("open_browser", True))
-    quota_mode = cfg.get("web", {}).get("quota_mode", "server")
     cli_view = cfg.get("cli", {}).get("default_view", "overview")
     disabled_sections = list(cfg.get("cli", {}).get("disabled_sections", []))
     auto_check_updates = bool(cfg.get("auto_check_updates", True))
@@ -3160,7 +3159,7 @@ def run_onboarding_wizard(cfg=None, from_menu=False):
             hdr.append(f"{C.GREEN}◇{C.RESET}  Launch Mode {C.DIM}·{C.RESET} {m_lbl}")
         if upto_step >= 2:
             if chosen_mode == "web":
-                b_lbl = ("Auto-open browser" if open_browser else "Server only") + " · " + ("Server quota" if quota_mode == "server" else "Multi-device quota")
+                b_lbl = "Auto-open browser" if open_browser else "Server only"
             else:
                 b_lbl = f"CLI view: {cli_view}"
             hdr.append(f"{C.GREEN}◇{C.RESET}  Mode Behavior {C.DIM}·{C.RESET} {b_lbl}")
@@ -3217,27 +3216,6 @@ def run_onboarding_wizard(cfg=None, from_menu=False):
                         step = 0
                         continue
                     open_browser = bool(val)
-
-                    act2, val2 = ui.select_one(
-                        _breadcrumbs(1),
-                        "Step 2/4 — Quota Pacing Mode",
-                        [
-                            ("server", "Server-First (Single Machine)", "Recommended · official account reset clock", False),
-                            ("multi", "Multi-Device Breakdown", "Splits This Machine vs IDE / other PCs", False),
-                            ("__back__", "Back", "Return to Browser Launch", True),
-                        ],
-                        default_idx=(1 if quota_mode == "multi" else 0),
-                        footer="↑/↓ move · Enter select · Esc/b back · q cancel",
-                    )
-                    if act2 == "QUIT":
-                        ui.finish([
-                            f"{C.CYAN}┌{C.RESET}  {C.BOLD}AGY STATS · Onboarding Setup{C.RESET}",
-                            f"{C.DIM}└  Setup cancelled (no changes saved).{C.RESET}",
-                        ])
-                        return cfg
-                    if act2 == "BACK" or val2 == "__back__":
-                        continue
-                    quota_mode = val2
                     step = 2
                 else:
                     cv_opts = ["overview", "tokens", "quota", "summary", "sessions"]
@@ -3352,7 +3330,6 @@ def run_onboarding_wizard(cfg=None, from_menu=False):
             "auto_update": auto_update,
             "web": {
                 "open_browser": open_browser,
-                "quota_mode": quota_mode,
                 "disabled_tabs": [],
             },
             "cli": {
@@ -3362,7 +3339,7 @@ def run_onboarding_wizard(cfg=None, from_menu=False):
         })
 
         m_lbl = (
-            f"Web Dashboard ({'auto-open' if open_browser else 'server only'} · {quota_mode} quota)"
+            f"Web Dashboard ({'auto-open' if open_browser else 'server only'})"
             if chosen_mode == "web"
             else f"CLI Terminal ({cli_view})"
         )
@@ -4787,13 +4764,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </button>
     <div class="segmented" id="timeRangeSeg" aria-label="Time range">
       <button class="segmented-option" data-range="1h" onclick="setTimeRange('1h')" title="Last 1 hour (per 5m)">1h</button>
-      <button class="segmented-option" data-range="5h" onclick="setTimeRange('5h')" title="Current 5h quota cycle (since server 5h reset)">5h</button>
+      <button class="segmented-option" data-range="5h" onclick="setTimeRange('5h')" title="Last 5 hours (per 5m)">5h</button>
       <button class="segmented-option" data-range="24h" onclick="setTimeRange('24h')" title="Last 24 hours (per hour)">24h</button>
-      <button class="segmented-option" data-range="wk" onclick="setTimeRange('wk')" title="Current weekly quota cycle (since server weekly reset)">Wk</button>
-      <button class="segmented-option" data-range="7d" onclick="setTimeRange('7d')" title="Rolling 7 days">7d</button>
-      <button class="segmented-option" data-range="30d" onclick="setTimeRange('30d')" title="Rolling 30 days">30d</button>
-      <button class="segmented-option" data-range="90d" onclick="setTimeRange('90d')" title="Rolling 90 days">90d</button>
-      <button class="segmented-option" data-range="all" data-active="true" onclick="setTimeRange('all')" title="All time">all</button>
+      <button class="segmented-option" data-range="7d" onclick="setTimeRange('7d')" title="Last 7 days (per day)">7d</button>
+      <button class="segmented-option" data-range="30d" onclick="setTimeRange('30d')" title="Last 30 days (per day)">30d</button>
+      <button class="segmented-option" data-range="90d" onclick="setTimeRange('90d')" title="Last 90 days (per day)">90d</button>
+      <button class="segmented-option" data-range="all" data-active="true" onclick="setTimeRange('all')" title="All time (per day)">all</button>
       <button class="segmented-option" data-range="custom" onclick="setTimeRange('custom')" title="Custom time window">Custom</button>
     </div>
     <div class="custom-range-bar" id="customRangeBar">
@@ -4864,7 +4840,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="sidebar-foot micro">
-    <div><span class="kbd">1</span>–<span class="kbd">9</span> range</div>
+    <div><span class="kbd">1</span>–<span class="kbd">8</span> range</div>
     <div><span class="kbd">G</span> then letter to jump</div>
   </div>
 </nav>
@@ -4876,13 +4852,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <section id="pane-overview" class="view-pane active">
       <div class="page-header rise">
         <div><h1 class="page-title">Overview</h1></div>
-        <div class="row" style="gap:8px;">
-          <span class="micro dim">Quota mode:</span>
-          <div class="segmented" data-size="sm" id="overviewQuotaModeSeg" title="Single machine uses Server /usage as cycle ground truth; Multi-machine splits This Machine vs Other Devices">
-            <button class="segmented-option" data-qmode="server" data-active="true" onclick="setQuotaMode('server', true)">Server (1 machine)</button>
-            <button class="segmented-option" data-qmode="multi" onclick="setQuotaMode('multi', true)">Multi-machine</button>
-          </div>
-        </div>
       </div>
 
       <div id="overviewStatsSkeleton" class="skeleton rise" style="width:100%;height:112px;border-radius:8px;"></div>
@@ -4994,18 +4963,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <section id="pane-quota" class="view-pane">
       <div class="page-header rise">
         <div><h1 class="page-title">Quota</h1></div>
-        <div class="row" style="gap:8px;">
-          <span class="micro dim">Quota mode:</span>
-          <div class="segmented" data-size="sm" id="quotaPaneModeSeg">
-            <button class="segmented-option" data-qmode="server" data-active="true" onclick="setQuotaMode('server', true)">Server (1 machine)</button>
-            <button class="segmented-option" data-qmode="multi" onclick="setQuotaMode('multi', true)">Multi-machine</button>
-          </div>
-        </div>
       </div>
       <div class="skeleton rise" data-grid-skel="true" style="width:100%;height:96px;border-radius:12px;"></div>
       <div class="stat-grid rise" style="--stat-min:220px;" id="quotaPoolsGrid" data-stale-target="true" data-stale="false" hidden></div>
       <section class="card rise" style="--i:1"><div class="card-body" id="quotaPacingBody" data-stale-target="true" data-stale="false"><div class="skeleton" style="width:100%;height:96px;border-radius:8px;"></div></div></section>
-      <div class="card rise" style="--i:2"><header class="card-header"><h2 class="card-title">Daily ledger</h2></header><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="10"></div><div class="table-wrap" hidden><table class="table"><thead><tr><th>Date</th><th data-align="right">Requests</th><th data-align="right">Input</th><th data-align="right">Output</th><th data-align="right">Cache read</th><th data-align="right">Tokens</th><th data-align="right">Weekly quota (machine)</th></tr></thead><tbody id="quotaLedgerTbody"></tbody></table></div></div></div>
+      <div class="card rise" style="--i:2"><header class="card-header"><h2 class="card-title">Daily ledger</h2></header><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="10"></div><div class="table-wrap" hidden><table class="table"><thead><tr><th>Date</th><th data-align="right">Requests</th><th data-align="right">Input</th><th data-align="right">Output</th><th data-align="right">Cache read</th><th data-align="right">Tokens</th><th data-align="right">Weekly quota</th></tr></thead><tbody id="quotaLedgerTbody"></tbody></table></div></div></div>
     </section>
 
     <!-- REQUESTS -->
@@ -5149,22 +5111,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
       </div>
 
-      <!-- Quota Pacing Mode -->
-      <div class="form-section">
-        <div class="form-section-title">Quota Pacing Mode</div>
-        <div class="form-desc">Choose between official server account quota pacing or multi-device local attribution.</div>
-        <div class="radio-pill-group">
-          <label class="radio-pill-label">
-            <input type="radio" name="settingQMode" value="server" id="settingQModeServer">
-            <span>Server-First (Single Machine / Account Reset Clock)</span>
-          </label>
-          <label class="radio-pill-label">
-            <input type="radio" name="settingQMode" value="multi" id="settingQModeMulti">
-            <span>Multi-Device Breakdown (CLI vs IDE / Remote)</span>
-          </label>
-        </div>
-      </div>
-
       <!-- Overview & Summary Display Sections -->
       <div class="form-section">
         <div class="form-section-title">Overview &amp; Summary Display</div>
@@ -5242,7 +5188,6 @@ let G_CURRENT_RANGE = "all";
 let G_ACTIVITY_METRIC = "requests";
 let G_REQ_STATUS_FILTER = "all";
 let G_CURRENT_TRACE = null;
-let G_QUOTA_MODE = localStorage.getItem("agy-stats-quota-mode") || "server";
 let G_TRACE_SORT = "quota";
 let G_LAST_SYNCED_AT = null;
 let G_PREV_STAT_VALUES = new Map();
@@ -5355,26 +5300,6 @@ window.addEventListener("scroll", () => {
   const topbar = document.getElementById("shellTopbar");
   if (topbar) topbar.dataset.scrolled = window.scrollY > 4 ? "true" : "false";
 }, { passive: true });
-
-function setQuotaMode(mode, persist = false) {
-  G_QUOTA_MODE = mode === "multi" ? "multi" : "server";
-  localStorage.setItem("agy-stats-quota-mode", G_QUOTA_MODE);
-  document.querySelectorAll("[data-qmode]").forEach(b => {
-    b.dataset.active = (b.dataset.qmode === G_QUOTA_MODE);
-  });
-  syncSegmentedThumbs(!persist && !G_INITIAL_REVEALED);
-  if (persist) {
-    if (G_SETTINGS && G_SETTINGS.web) G_SETTINGS.web.quota_mode = G_QUOTA_MODE;
-    fetch("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Agy-Stats": "1" },
-      body: JSON.stringify({ web: { quota_mode: G_QUOTA_MODE } })
-    }).catch(() => {});
-  }
-  if (G_OVERVIEW_DATA) renderDynamicOverview();
-  if (G_FULL_DATA) renderFullViews();
-  if (G_INITIAL_REVEALED) flashChangedStats();
-}
 
 function setTraceSort(sortKey, btn) {
   G_TRACE_SORT = sortKey;
@@ -5531,8 +5456,8 @@ function setReqStatusFilter(status, btn) {
   renderRequestsPane();
 }
 
-function isShow5h() {
-  return !!(G_OVERVIEW_DATA && G_OVERVIEW_DATA.overall && G_OVERVIEW_DATA.overall.show5h);
+function isShortWindow() {
+  return !!(G_OVERVIEW_DATA && G_OVERVIEW_DATA.overall && G_OVERVIEW_DATA.overall.isShortWindow);
 }
 
 function findPool(poolId) {
@@ -5546,56 +5471,40 @@ function renderDynamicOverview() {
 
   const ov = ovData.overall;
   const ts = ovData.timeSeries || [];
-  const show5h = !!ov.show5h;
+  const shortWin = !!ov.isShortWindow;
+  const subweekWin = !!ov.isSubweekWindow;
 
   document.getElementById("activityDescription").textContent = ov.unitDescription;
 
   const reqSpark = ts.map(t => t.requests);
   const tokSpark = ts.map(t => t.tokens);
-  const q5hSpark = ts.map(t => t.pct5h);
   const qWkSpark = ts.map(t => t.pctWeek);
   const cacheSpark = ts.map(t => Math.max(0, t.tokens - (t.requests * 200)));
 
-  const gem5h = findPool("gemini-5h");
   const gemWk = findPool("gemini-weekly");
-  const isMulti = (G_QUOTA_MODE === "multi");
+  const priorWk = Number(ov.priorPctWeekSpent || 0);
+  const activeWk = Number(ov.activePctWeekSpent ?? ov.pctWeeklySpent ?? 0);
 
-  // In Server (1 machine) mode: cycle ranges ("5h", "wk", "all") show the server ground-truth cycle % as headline,
-  // while sub-ranges ("1h", "7d", etc.) show the active cycle range estimate (excluding already-reset 5h tokens) with live Server cycle in the footnote.
-  const activeRange5h = ov.activePct5hSpent ?? ov.pct5hSpent;
-  const forgivenRange5h = Number(ov.forgivenPct5hSpent || 0);
-  const headline5h = (!isMulti && gem5h && ov.range === "5h") ? gem5h.usedPct : activeRange5h;
-  const headlineWk = (!isMulti && gemWk && (ov.range === "wk" || ov.range === "all")) ? gemWk.usedPct : ov.pctWeeklySpent;
-
-  const label5h = isMulti ? "5h quota (this machine)" : (ov.range === "5h" ? "5h quota (server)" : "5h quota");
-  const labelWk = isMulti ? "Weekly quota (this machine)" : ((ov.range === "wk" || ov.range === "all") ? "Weekly quota (server)" : "Weekly quota");
-
-  const forgivenNote = forgivenRange5h > 0
-    ? `+${forgivenRange5h}% prior cycle (reset ${ov.fhCycleSince}) · `
-    : "";
-  const foot5h = gem5h
-    ? (isMulti
-        ? `${forgivenNote}Cycle: ${ov.cycle5hLocalPct ?? activeRange5h}% machine · ${gem5h.usedPct}% server (${gem5h.remainingPct}% left)`
-        : `${forgivenNote}Server cycle: ${gem5h.usedPct}% used · ${gem5h.remainingPct}% left (resets ${fmtResetIn(gem5h.resetTime)})`)
-    : `${forgivenNote}${Re(ov.conversationTokens)} tokens`;
-  const footWk = gemWk
-    ? (isMulti
-        ? `Cycle: ${ov.cycleWeekLocalPct ?? ov.pctWeeklySpent}% machine · ${gemWk.usedPct}% server (${gemWk.remainingPct}% left)`
-        : `Server cycle: ${gemWk.usedPct}% used · ${gemWk.remainingPct}% left (resets ${fmtResetIn(gemWk.resetTime)})`)
-    : `${Re(ov.conversationTokens)} tokens`;
+  let footWk = "";
+  if (shortWin) {
+    footWk = `≈ ${ov.pct5hSpent}% of 5h limit`;
+    if (priorWk > 0) {
+      footWk += ` · ${activeWk}% in current week`;
+    } else if (gemWk) {
+      footWk += ` · ${gemWk.remainingPct}% wk left`;
+    }
+  } else if (subweekWin && priorWk > 0) {
+    footWk = `${activeWk}% in current week · +${priorWk}% prior week`;
+  } else if (gemWk) {
+    footWk = `This week: ${ov.cycleWeekLocalPct ?? ov.pctWeeklySpent}% here · ${gemWk.remainingPct}% wk left`;
+  } else {
+    footWk = `${Re(ov.conversationTokens)} tokens`;
+  }
 
   document.getElementById("primaryStatGrid").innerHTML = `
-    ${show5h ? `
     <div class="stat">
-      <div class="stat-label">${esc(label5h)}</div>
-      <div class="stat-value" style="color:var(--chart-secondary);">${headline5h}%</div>
-      <div class="stat-foot"><span class="truncate" title="${esc(foot5h)}">${esc(foot5h)}</span></div>
-      <div class="stat-spark">${renderSparklineSVG(q5hSpark, "var(--chart-secondary)")}</div>
-    </div>` : ""}
-
-    <div class="stat">
-      <div class="stat-label">${esc(labelWk)}</div>
-      <div class="stat-value" style="color:var(--chart-primary);">${headlineWk}%</div>
+      <div class="stat-label">Weekly quota</div>
+      <div class="stat-value" style="color:var(--chart-primary);">${ov.pctWeeklySpent}%</div>
       <div class="stat-foot"><span class="truncate" title="${esc(footWk)}">${esc(footWk)}</span></div>
       <div class="stat-spark">${renderSparklineSVG(qWkSpark, "var(--chart-primary)")}</div>
     </div>
@@ -5649,7 +5558,7 @@ function renderPacingSection(targetId) {
   }
   const ov = G_OVERVIEW_DATA.overall;
   const p = ov.pacing;
-  const isMulti = (G_QUOTA_MODE === "multi");
+  const showSplit = (Number(p.otherWkUsedPct || 0) >= 1.0 && Number(p.localWkUsedPct || 0) > 0) || (Number(p.otherWkUsedPct || 0) >= 1.0);
 
   const paceRatio = Number(p.serverWkPaceRatio || 1.0);
   let paceStatus = "HEALTHY PACING";
@@ -5749,7 +5658,7 @@ function renderPacingSection(targetId) {
           <div class="row" style="justify-content:space-between; font-size:12px;">
             <span style="color:var(--ink-2); display:flex; align-items:center; gap:6px;">
               <span class="swatch" style="background:${quotaColor}; border-radius:2px;"></span>
-              <strong>Quota pool used${isMulti ? " (account)" : ""}</strong>
+              <strong>Account quota used</strong>
             </span>
             <span class="mono">
               <strong style="color:${quotaColor};">${p.serverWkUsedPct}%</strong>
@@ -5757,17 +5666,17 @@ function renderPacingSection(targetId) {
             </span>
           </div>
           <div style="height:10px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
-            ${isMulti ? `
-              <div style="width:${localW}%; height:100%; background:var(--chart-primary);" title="This machine CLI: ${p.localWkUsedPct}%"></div>
-              <div style="width:${otherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other devices / IDE: ${p.otherWkUsedPct}%"></div>
+            ${showSplit ? `
+              <div style="width:${localW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
+              <div style="width:${otherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
             ` : `
-              <div style="width:${serverW}%; height:100%; background:${quotaColor}; border-radius:var(--r-pill);" title="Quota used: ${p.serverWkUsedPct}%"></div>
+              <div style="width:${serverW}%; height:100%; background:${quotaColor}; border-radius:var(--r-pill);" title="Account quota used: ${p.serverWkUsedPct}%"></div>
             `}
           </div>
-          ${isMulti ? `
+          ${showSplit ? `
             <div class="row micro dim" style="gap:12px; margin-top:2px;">
-              <span><span class="swatch" style="background:var(--chart-primary);"></span> This machine CLI: <strong class="mono" style="color:var(--ink-1);">${p.localWkUsedPct}%</strong></span>
-              <span><span class="swatch" style="background:var(--chart-secondary);"></span> Other devices / IDE: <strong class="mono" style="color:var(--ink-1);">${p.otherWkUsedPct}%</strong></span>
+              <span><span class="swatch" style="background:var(--chart-primary);"></span> This setup: <strong class="mono" style="color:var(--ink-1);">${p.localWkUsedPct}%</strong></span>
+              <span><span class="swatch" style="background:var(--chart-secondary);"></span> Other products / devices: <strong class="mono" style="color:var(--ink-1);">${p.otherWkUsedPct}%</strong></span>
             </div>
           ` : ""}
         </div>
@@ -5805,11 +5714,8 @@ function renderPacingSection(targetId) {
           <span class="dot" data-tone="${p.server5hUsedPct > 80 ? 'bad' : 'ok'}"></span>
           <span style="color:var(--ink-2); font-weight:500;">5-Hour Burst Pool:</span>
           <span class="mono">${burstUsed}% used · ${burstAvail}% available · Refills in ${esc(burstRefill)}</span>
-          ${isMulti ? `<span class="dim">(${p.local5hUsedPct}% this machine)</span>` : ""}
+          ${Number(p.local5hUsedPct || 0) > 0 && Number(p.other5hUsedPct || 0) >= 1.0 ? `<span class="dim">(${p.local5hUsedPct}% this setup)</span>` : ""}
         </div>
-        ${!isMulti && (p.otherWkUsedPct > 0 || p.localWkUsedPct > 0) ? `
-          <div class="dim">Account quota tracking (single-machine mode)</div>
-        ` : ""}
       </div>
     </div>
   `;
@@ -5818,7 +5724,6 @@ function renderPacingSection(targetId) {
 function renderTopSessionsOverview() {
   const d = G_FULL_DATA;
   if (!d) return;
-  const show5h = isShow5h();
   const thead = document.getElementById("topSessionsThead");
   const tbody = document.getElementById("topSessionsTbody");
   if (!thead || !tbody) return;
@@ -5832,14 +5737,13 @@ function renderTopSessionsOverview() {
       <th data-align="right">Requests</th>
       <th data-align="right" title="Average input + cache context tokens per request">Avg context</th>
       <th data-align="right">Cache</th>
-      ${show5h ? '<th data-align="right">5h quota</th>' : ""}
       <th data-align="right">Weekly quota</th>
     </tr>
   `;
 
   const top = (d.sessions || []).slice(0, 8);
   if (!top.length) {
-    tbody.innerHTML = `<tr><td colspan="${show5h ? 9 : 8}" class="dim" style="text-align:center;padding:20px;">No sessions in this range</td></tr>`;
+    tbody.innerHTML = '<tr><td colspan="8" class="dim" style="text-align:center;padding:20px;">No sessions in this range</td></tr>';
     return;
   }
 
@@ -5859,8 +5763,7 @@ function renderTopSessionsOverview() {
         <td data-align="right" class="num">${B(s.steps)}</td>
         <td data-align="right" class="num" style="${isBloated ? 'color:var(--warn);font-weight:600;' : ''}" title="${isBloated ? 'High context window size per turn' : ''}">${Re(s.avgContextTokens || 0)}</td>
         <td data-align="right" class="num">${s.cacheRate ?? 0}%</td>
-        ${show5h ? `<td data-align="right" class="num" style="color:var(--chart-secondary);">${s.pct_5h}%</td>` : ""}
-        <td data-align="right" class="num" style="min-width:120px;">
+        <td data-align="right" class="num" style="min-width:120px;" title="≈ ${s.pct_5h}% of 5h limit">
           <div class="row" style="justify-content:flex-end; gap:8px;">
             <div style="width:48px; height:6px; background:var(--raised); border-radius:3px; overflow:hidden;">
               <div style="width:${barPct}%; height:100%; background:var(--chart-primary);"></div>
@@ -5878,7 +5781,7 @@ function renderOverviewActivityChart() {
   if (!ovData) return;
 
   const ts = ovData.timeSeries || [];
-  const show5h = !!ovData.overall?.show5h;
+  const shortWin = !!ovData.overall?.isShortWindow;
   const el = document.getElementById("activityChart");
   const legendEl = document.getElementById("activityLegend");
 
@@ -5891,8 +5794,7 @@ function renderOverviewActivityChart() {
   const n = ts.length;
   const isReq = G_ACTIVITY_METRIC === "requests";
   const isTok = G_ACTIVITY_METRIC === "tokens";
-  const quotaGetter = t => show5h ? t.pct5h : t.pctWeek;
-  const maxVal = Math.max(...ts.map(t => isReq ? t.requests : (isTok ? t.tokens : quotaGetter(t))), 0.001);
+  const maxVal = Math.max(...ts.map(t => isReq ? t.requests : (isTok ? t.tokens : t.pctWeek)), 0.001);
 
   if (isReq) {
     legendEl.innerHTML = `
@@ -5905,8 +5807,7 @@ function renderOverviewActivityChart() {
     `;
   } else {
     legendEl.innerHTML = `
-      ${show5h ? `<div class="legend-item"><span class="swatch" style="background:var(--chart-secondary);"></span> 5h quota: ${ovData.overall.pct5hSpent}%</div>` : ""}
-      <div class="legend-item"><span class="swatch" style="background:var(--chart-primary);"></span> Weekly quota: ${ovData.overall.pctWeeklySpent}%</div>
+      <div class="legend-item"><span class="swatch" style="background:var(--chart-primary);"></span> Weekly quota: ${ovData.overall.pctWeeklySpent}%${shortWin ? ` <span class="dim">(≈ ${ovData.overall.pct5hSpent}% of 5h limit)</span>` : ""}</div>
     `;
   }
 
@@ -5938,9 +5839,9 @@ function renderOverviewActivityChart() {
         </g>
       `;
     } else {
-      const val = isTok ? t.tokens : quotaGetter(t);
+      const val = isTok ? t.tokens : t.pctWeek;
       const h = val > 0 ? Math.max(2, Math.round((val / maxVal) * plotHeight)) : 0;
-      const fill = isTok ? "var(--chart-primary)" : (show5h ? "var(--chart-secondary)" : "var(--chart-primary)");
+      const fill = "var(--chart-primary)";
       barsHtml += `
         <g class="chart-bar-group" data-idx="${i}" onmouseenter="showChartTip(event, ${i})" onmouseleave="hideChartTip()">
           <rect x="${colLeft.toFixed(1)}" y="0" width="${colWidth.toFixed(1)}" height="${baselineY}" fill="transparent"></rect>
@@ -5983,7 +5884,7 @@ function showChartTip(e, idx) {
   const tip = document.getElementById("chartTooltip");
   if (!tip) return;
 
-  const show5h = !!ovData.overall?.show5h;
+  const shortWin = !!ovData.overall?.isShortWindow;
   tip.innerHTML = `
     <div class="chart-tooltip-title">${esc(item.date)}</div>
     <div class="chart-tooltip-row">
@@ -5991,17 +5892,17 @@ function showChartTip(e, idx) {
       <span class="chart-tooltip-label">Requests</span>
       <span class="chart-tooltip-value">${B(item.requests)}${item.errors > 0 ? ` (${B(item.errors)} err)` : ""}</span>
     </div>
-    ${show5h ? `
-    <div class="chart-tooltip-row">
-      <span class="swatch" style="background:var(--chart-secondary);"></span>
-      <span class="chart-tooltip-label">5h quota</span>
-      <span class="chart-tooltip-value">${item.pct5h}%</span>
-    </div>` : ""}
     <div class="chart-tooltip-row">
       <span class="swatch" style="background:var(--chart-primary);"></span>
       <span class="chart-tooltip-label">Weekly quota</span>
       <span class="chart-tooltip-value">${item.pctWeek}%</span>
     </div>
+    ${shortWin ? `
+    <div class="chart-tooltip-row">
+      <span class="swatch" style="background:var(--chart-secondary);"></span>
+      <span class="chart-tooltip-label">5h equiv</span>
+      <span class="chart-tooltip-value">${item.pct5h}%</span>
+    </div>` : ""}
     <div class="chart-tooltip-row chart-tooltip-total">
       <span class="chart-tooltip-label">Tokens</span>
       <span class="chart-tooltip-value">${Re(item.tokens)}</span>
@@ -6104,13 +6005,11 @@ function renderDynamicLatestRequests() {
   const ovData = G_OVERVIEW_DATA;
   if (!ovData) return;
 
-  const show5h = !!ovData.overall?.show5h;
   document.getElementById("latestRequestsThead").innerHTML = `
     <tr>
       <th>Model</th>
       <th>When</th>
       <th data-align="right">Tokens</th>
-      ${show5h ? '<th data-align="right">5h quota</th>' : ""}
       <th data-align="right">Weekly quota</th>
       <th data-align="right">Duration</th>
       <th data-align="right">Status</th>
@@ -6119,7 +6018,7 @@ function renderDynamicLatestRequests() {
 
   const reqs = (ovData.recent_requests || []).slice(0, 12);
   if (!reqs.length) {
-    document.getElementById("latestRequestsTbody").innerHTML = `<tr><td colspan="${show5h ? 7 : 6}" class="dim" style="text-align:center;padding:16px;">No requests</td></tr>`;
+    document.getElementById("latestRequestsTbody").innerHTML = '<tr><td colspan="6" class="dim" style="text-align:center;padding:16px;">No requests</td></tr>';
     return;
   }
 
@@ -6133,8 +6032,7 @@ function renderDynamicLatestRequests() {
       </td>
       <td class="muted">${da(r.ts || r.time)}</td>
       <td data-align="right" class="num">${Re(r.total)}</td>
-      ${show5h ? `<td data-align="right" class="num">${r.pct_5h}%</td>` : ""}
-      <td data-align="right" class="num">${r.pct_week}%</td>
+      <td data-align="right" class="num" title="≈ ${r.pct_5h}% of 5h limit">${r.pct_week}%</td>
       <td data-align="right" class="num">${Rt(r.durationMs)}</td>
       <td data-align="right">
         <span class="badge" data-tone="${r.status === 'error' ? 'bad' : 'ok'}">${r.status === 'error' ? 'Failed' : 'OK'}</span>
@@ -6149,7 +6047,6 @@ function openDrawer(reqId) {
             (G_OVERVIEW_DATA?.recent_requests || []).find(x => x.id === reqId);
   if (!r) return;
 
-  const show5h = isShow5h();
   document.getElementById("drawerToneBadge").textContent = r.status === "error" ? "Failed" : "OK";
   document.getElementById("drawerToneBadge").setAttribute("data-tone", r.status === "error" ? "bad" : "ok");
   document.getElementById("drawerTitle").textContent = r.model;
@@ -6157,14 +6054,10 @@ function openDrawer(reqId) {
 
   document.getElementById("drawerBody").innerHTML = `
     <div class="stat-grid" style="--stat-min:120px;">
-      ${show5h ? `
-      <div class="stat" data-size="sm">
-        <div class="stat-label">5h quota</div>
-        <div class="stat-value" style="color:var(--chart-secondary);">${r.pct_5h}%</div>
-      </div>` : ""}
       <div class="stat" data-size="sm">
         <div class="stat-label">Weekly quota</div>
         <div class="stat-value" style="color:var(--chart-primary);">${r.pct_week}%</div>
+        <div class="stat-foot">≈ ${r.pct_5h}% of 5h</div>
       </div>
       <div class="stat" data-size="sm">
         <div class="stat-label">In / Out / Cache</div>
@@ -6235,7 +6128,6 @@ function openErrorDrawer(errIdx) {
 function openSpanDrawer(spanIdx) {
   const sp = (G_CURRENT_TRACE?.spans || [])[spanIdx];
   if (!sp) return;
-  const show5h = isShow5h();
 
   document.getElementById("drawerToneBadge").textContent = sp.isError ? "Failed" : sp.agent;
   document.getElementById("drawerToneBadge").setAttribute("data-tone", sp.isError ? "bad" : (sp.kind === "user" ? "accent" : "ok"));
@@ -6244,8 +6136,7 @@ function openSpanDrawer(spanIdx) {
 
   document.getElementById("drawerBody").innerHTML = `
     <div class="stat-grid" style="--stat-min:120px;">
-      ${show5h && sp.total > 0 ? `<div class="stat" data-size="sm"><div class="stat-label">5h quota</div><div class="stat-value">${sp.pct5h}%</div></div>` : ""}
-      <div class="stat" data-size="sm"><div class="stat-label">Weekly quota</div><div class="stat-value">${sp.pctWeek}%</div></div>
+      <div class="stat" data-size="sm"><div class="stat-label">Weekly quota</div><div class="stat-value" style="color:var(--chart-primary);">${sp.pctWeek}%</div>${sp.total > 0 ? `<div class="stat-foot">≈ ${sp.pct5h}% of 5h</div>` : ""}</div>
       <div class="stat" data-size="sm"><div class="stat-label">Tokens</div><div class="stat-value">${Re(sp.total)}</div></div>
       <div class="stat" data-size="sm"><div class="stat-label">Duration</div><div class="stat-value">${Rt(sp.durationMs)}</div></div>
     </div>
@@ -6272,7 +6163,6 @@ function closeDrawer() {
 function renderRequestsPane() {
   const d = G_FULL_DATA;
   if (!d) return;
-  const show5h = isShow5h();
   const q = (document.getElementById("reqSearchInput")?.value || "").trim().toLowerCase();
 
   document.getElementById("requestsFullThead").innerHTML = `
@@ -6283,7 +6173,6 @@ function renderRequestsPane() {
       <th>Model</th>
       <th data-align="right">Tools</th>
       <th data-align="right">Tokens</th>
-      ${show5h ? '<th data-align="right">5h quota</th>' : ""}
       <th data-align="right">Weekly quota</th>
       <th data-align="right">Duration</th>
       <th data-align="right">Status</th>
@@ -6298,7 +6187,7 @@ function renderRequestsPane() {
   });
 
   if (!filtered.length) {
-    document.getElementById("requestsFullTbody").innerHTML = `<tr><td colspan="${show5h ? 10 : 9}" class="dim" style="text-align:center;padding:24px;">No matching requests</td></tr>`;
+    document.getElementById("requestsFullTbody").innerHTML = '<tr><td colspan="9" class="dim" style="text-align:center;padding:24px;">No matching requests</td></tr>';
     return;
   }
 
@@ -6310,8 +6199,7 @@ function renderRequestsPane() {
       <td class="mono micro">${esc(r.model)}</td>
       <td data-align="right" class="num">${(r.tools || []).length}</td>
       <td data-align="right" class="num">${Re(r.total)}</td>
-      ${show5h ? `<td data-align="right" class="num">${r.pct_5h}%</td>` : ""}
-      <td data-align="right" class="num">${r.pct_week}%</td>
+      <td data-align="right" class="num" title="≈ ${r.pct_5h}% of 5h limit">${r.pct_week}%</td>
       <td data-align="right" class="num">${Rt(r.durationMs)}</td>
       <td data-align="right"><span class="badge" data-tone="${r.status === 'error' ? 'bad' : 'ok'}">${r.status === 'error' ? 'Failed' : 'OK'}</span></td>
     </tr>
@@ -6353,7 +6241,6 @@ function renderErrorsPane() {
 function renderTracesPane() {
   const d = G_FULL_DATA;
   if (!d) return;
-  const show5h = isShow5h();
   const q = (document.getElementById("traceSearchInput")?.value || "").trim().toLowerCase();
 
   document.getElementById("tracesSessionsThead").innerHTML = `
@@ -6366,7 +6253,6 @@ function renderTracesPane() {
       <th data-align="right" title="Average input + cache context tokens per request">Avg context</th>
       <th data-align="right">Cache</th>
       <th data-align="right">Tokens</th>
-      ${show5h ? '<th data-align="right">5h quota</th>' : ""}
       <th data-align="right">Weekly quota</th>
     </tr>
   `;
@@ -6387,7 +6273,7 @@ function renderTracesPane() {
   }
 
   if (!sessions.length) {
-    document.getElementById("tracesSessionsTbody").innerHTML = `<tr><td colspan="${show5h ? 10 : 9}" class="dim" style="text-align:center;padding:24px;">No sessions</td></tr>`;
+    document.getElementById("tracesSessionsTbody").innerHTML = '<tr><td colspan="9" class="dim" style="text-align:center;padding:24px;">No sessions</td></tr>';
     return;
   }
 
@@ -6408,8 +6294,7 @@ function renderTracesPane() {
       <td data-align="right" class="num" style="${isBloated ? 'color:var(--warn);font-weight:600;' : ''}">${Re(s.avgContextTokens || 0)}</td>
       <td data-align="right" class="num">${s.cacheRate ?? 0}%</td>
       <td data-align="right" class="num">${Re(s.total)}</td>
-      ${show5h ? `<td data-align="right" class="num" style="color:var(--chart-secondary);">${s.pct_5h}%</td>` : ""}
-      <td data-align="right" class="num" style="min-width:125px;">
+      <td data-align="right" class="num" style="min-width:125px;" title="≈ ${s.pct_5h}% of 5h limit">
         <div class="row" style="justify-content:flex-end; gap:8px;">
           <div style="width:48px; height:6px; background:var(--raised); border-radius:3px; overflow:hidden;">
             <div style="width:${barPct}%; height:100%; background:var(--chart-primary);"></div>
@@ -6447,7 +6332,6 @@ async function openSessionTrace(cid) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const tr = await res.json();
     G_CURRENT_TRACE = tr;
-    const show5h = isShow5h();
 
     const spanColor = sp => {
       if (sp.isError) return "var(--bad)";
@@ -6470,8 +6354,7 @@ async function openSessionTrace(cid) {
       </div>
 
       <div class="stat-grid rise" style="--stat-min:150px; --i:1;">
-        ${show5h ? `<div class="stat" data-size="sm"><div class="stat-label">5h quota</div><div class="stat-value" style="color:var(--chart-secondary);">${tr.pct5h}%</div></div>` : ""}
-        <div class="stat" data-size="sm"><div class="stat-label">Weekly quota</div><div class="stat-value" style="color:var(--chart-primary);">${tr.pctWeek}%</div></div>
+        <div class="stat" data-size="sm"><div class="stat-label">Weekly quota</div><div class="stat-value" style="color:var(--chart-primary);">${tr.pctWeek}%</div><div class="stat-foot">≈ ${tr.pct5h}% of 5h limit</div></div>
         <div class="stat" data-size="sm"><div class="stat-label">Tokens</div><div class="stat-value">${Re(tr.totalTokens)}</div></div>
         <div class="stat" data-size="sm"><div class="stat-label">Spans</div><div class="stat-value">${B(tr.stepsCount)}</div></div>
         <div class="stat" data-size="sm"><div class="stat-label">Tools</div><div class="stat-value">${B(tr.toolsCount)}</div></div>
@@ -6556,7 +6439,6 @@ async function openSessionTrace(cid) {
 function renderFullViews() {
   const d = G_FULL_DATA;
   if (!d) return;
-  const show5h = isShow5h();
 
   // Models
   try {
@@ -6568,7 +6450,6 @@ function renderFullViews() {
         <th data-align="right">Output</th>
         <th data-align="right">Cache read</th>
         <th data-align="right">Median / p95</th>
-        ${show5h ? '<th data-align="right">5h quota</th>' : ""}
         <th data-align="right">Weekly quota</th>
       </tr>
     `;
@@ -6581,16 +6462,14 @@ function renderFullViews() {
         <td data-align="right" class="num">${Re(v.out)}</td>
         <td data-align="right" class="num">${Re(v.cache)}</td>
         <td data-align="right" class="num">${Rt(v.medianMs)} / ${Rt(v.p95Ms)}</td>
-        ${show5h ? `<td data-align="right" class="num" style="color:var(--chart-secondary);">${v.pct_5h}%</td>` : ""}
-        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;">${v.pct_week}%</td>
+        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;" title="≈ ${v.pct_5h}% of 5h limit">${v.pct_week}%</td>
       </tr>
-    `).join("") : `<tr><td colspan="${show5h ? 8 : 7}" class="dim" style="text-align:center;padding:20px;">No models</td></tr>`;
+    `).join("") : '<tr><td colspan="7" class="dim" style="text-align:center;padding:20px;">No models</td></tr>';
   } catch (e) { console.error("Models render error", e); }
 
   // Quota
   try {
     const ov = d.overall || {};
-    const isMulti = (G_QUOTA_MODE === "multi");
     const qList = d.quota || [];
     document.getElementById("quotaPoolsGrid").innerHTML = qList.length ? qList.map(g => {
       const rem = Number(g.remainingPct ?? (g.remainingFraction * 100)).toFixed(1);
@@ -6599,19 +6478,18 @@ function renderFullViews() {
       const isGem5h = g.id === "gemini-5h";
       const is3pWk = g.id === "3p-weekly";
       const is3p5h = g.id === "3p-5h";
-      const localCycleStr = isMulti
-        ? (isGemWk
-            ? ` · ${ov.cycleWeekLocalPct ?? 0}% this machine (${ov.wkElapsedPct ?? 0}% of week elapsed)`
-            : isGem5h ? ` · ${ov.cycle5hLocalPct ?? 0}% this machine`
-            : is3pWk ? ` · ${ov.cycle3pWeekLocalPct ?? 0}% this machine`
-            : is3p5h ? ` · ${ov.cycle3p5hLocalPct ?? 0}% this machine`
-            : "")
-        : (isGemWk ? ` · ${ov.wkElapsedPct ?? 0}% of week elapsed` : "");
+      const localPct = isGemWk ? Number(ov.cycleWeekLocalPct || 0)
+        : isGem5h ? Number(ov.cycle5hLocalPct || 0)
+        : is3pWk ? Number(ov.cycle3pWeekLocalPct || 0)
+        : is3p5h ? Number(ov.cycle3p5hLocalPct || 0)
+        : 0;
+      const localCycleStr = localPct > 0 ? ` · ${localPct}% here` : "";
+      const fullFoot = `${rem}% left · resets ${fmtResetIn(g.resetTime)}${localCycleStr}`;
       return `
         <div class="stat">
-          <div class="stat-label">${esc(g.groupName)} · ${esc(g.windowLabel)}${isMulti ? " (account server)" : ""}</div>
+          <div class="stat-label">${esc(g.groupName)} · ${esc(g.windowLabel)}</div>
           <div class="stat-value">${used}%</div>
-          <div class="stat-foot"><span class="truncate" title="${rem}% left · resets in ${esc(fmtResetIn(g.resetTime))}${esc(localCycleStr)}">${rem}% left · resets in ${esc(fmtResetIn(g.resetTime))}${esc(localCycleStr)}</span></div>
+          <div class="stat-foot"><span class="truncate" title="${esc(fullFoot)}">${esc(fullFoot)}</span></div>
         </div>
       `;
     }).join("") : `<div class="stat"><div class="stat-label">Server quota</div><div class="stat-value">–</div><div class="stat-foot">Live quota pools unavailable</div></div>`;
@@ -6626,7 +6504,7 @@ function renderFullViews() {
         <td data-align="right" class="num">${Re(v.out)}</td>
         <td data-align="right" class="num">${Re(v.cache)}</td>
         <td data-align="right" class="num">${Re(v.total)}</td>
-        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;">${v.pct_week ?? 0}%</td>
+        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;" title="≈ ${v.pct_5h ?? 0}% of 5h limit">${v.pct_week ?? 0}%</td>
       </tr>
     `).join("");
   } catch (e) { console.error("Quota render error", e); }
@@ -6647,7 +6525,7 @@ function renderFullViews() {
         <th data-align="right">Result chars</th>
         <th data-align="right">Avg / call</th>
         <th data-align="right">Tokens</th>
-        ${show5h ? '<th data-align="right">5h quota</th>' : '<th data-align="right">Weekly quota</th>'}
+        <th data-align="right">Weekly quota</th>
       </tr>
     `;
     const tList = d.tools_detailed || [];
@@ -6660,7 +6538,7 @@ function renderFullViews() {
         <td data-align="right" class="num">${Re(t.resultChars)}</td>
         <td data-align="right" class="num">${Re(t.avgResultChars)}</td>
         <td data-align="right" class="num">${Re(t.tokensShare)}</td>
-        <td data-align="right" class="num" style="color:var(--chart-primary);">${show5h ? t.pct5hShare : t.pctWeekShare}%</td>
+        <td data-align="right" class="num" style="color:var(--chart-primary);" title="≈ ${t.pct5hShare}% of 5h limit">${t.pctWeekShare}%</td>
       </tr>
     `).join("") : '<tr><td colspan="8" class="dim" style="text-align:center;padding:20px;">No tool calls</td></tr>';
   } catch (e) { console.error("Tools render error", e); }
@@ -6698,7 +6576,6 @@ function renderFullViews() {
         <th data-align="right">Failures</th>
         <th data-align="right">Cache rate</th>
         <th data-align="right">Tokens</th>
-        ${show5h ? '<th data-align="right">5h quota</th>' : ""}
         <th data-align="right">Weekly quota</th>
       </tr>
     `;
@@ -6711,10 +6588,9 @@ function renderFullViews() {
         <td data-align="right" class="num">${p.errors}</td>
         <td data-align="right" class="num">${p.cacheRate}%</td>
         <td data-align="right" class="num">${Re(p.total)}</td>
-        ${show5h ? `<td data-align="right" class="num" style="color:var(--chart-secondary);">${p.pct_5h}%</td>` : ""}
-        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;">${p.pct_week}%</td>
+        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;" title="≈ ${p.pct_5h}% of 5h limit">${p.pct_week}%</td>
       </tr>
-    `).join("") : `<tr><td colspan="${show5h ? 8 : 7}" class="dim" style="text-align:center;padding:20px;">No projects</td></tr>`;
+    `).join("") : '<tr><td colspan="7" class="dim" style="text-align:center;padding:20px;">No projects</td></tr>';
   } catch (e) { console.error("Projects render error", e); }
 }
 
@@ -6739,12 +6615,11 @@ window.addEventListener("keydown", (e) => {
   if (k === "1") setTimeRange("1h");
   else if (k === "2") setTimeRange("5h");
   else if (k === "3") setTimeRange("24h");
-  else if (k === "4") setTimeRange("wk");
-  else if (k === "5") setTimeRange("7d");
-  else if (k === "6") setTimeRange("30d");
-  else if (k === "7") setTimeRange("90d");
-  else if (k === "8") setTimeRange("all");
-  else if (k === "9") setTimeRange("custom");
+  else if (k === "4") setTimeRange("7d");
+  else if (k === "5") setTimeRange("30d");
+  else if (k === "6") setTimeRange("90d");
+  else if (k === "7") setTimeRange("all");
+  else if (k === "8") setTimeRange("custom");
 });
 
 // Settings & Preferences
@@ -6753,32 +6628,27 @@ let G_SETTINGS = null;
 function applyOnboardingPreset(presetKey) {
   let mode = "web";
   let openBrowser = true;
-  let quotaMode = "server";
   let cliView = "overview";
   let disabledSections = [];
 
   if (presetKey === "full_web") {
     mode = "web";
     openBrowser = true;
-    quotaMode = "server";
     cliView = "overview";
     disabledSections = [];
   } else if (presetKey === "minimalist") {
     mode = "web";
     openBrowser = true;
-    quotaMode = "server";
     cliView = "overview";
     disabledSections = ["sessions", "requests", "tools", "frustration"];
   } else if (presetKey === "cli_minimalist") {
     mode = "cli";
     openBrowser = false;
-    quotaMode = "server";
     cliView = "overview";
     disabledSections = ["sessions", "requests", "tools", "frustration"];
   } else if (presetKey === "cli_tokens") {
     mode = "cli";
     openBrowser = false;
-    quotaMode = "server";
     cliView = "tokens";
     disabledSections = [];
   }
@@ -6790,11 +6660,6 @@ function applyOnboardingPreset(presetKey) {
 
   const brCheck = document.getElementById("settingOpenBrowser");
   if (brCheck) brCheck.checked = openBrowser;
-
-  const qServ = document.getElementById("settingQModeServer");
-  const qMult = document.getElementById("settingQModeMulti");
-  if (qServ) qServ.checked = (quotaMode === "server");
-  if (qMult) qMult.checked = (quotaMode === "multi");
 
   const selView = document.getElementById("settingCliView");
   if (selView) selView.value = cliView;
@@ -6824,9 +6689,6 @@ function applySettings(cfg) {
   if (!cfg) return;
   const disSec = (cfg.cli && Array.isArray(cfg.cli.disabled_sections)) ? cfg.cli.disabled_sections : [];
   applyOverviewDisplaySections(disSec);
-  if (cfg.web && cfg.web.quota_mode) {
-    setQuotaMode(cfg.web.quota_mode, false);
-  }
 }
 
 function applyOverviewDisplaySections(disabledSections = []) {
@@ -6874,7 +6736,7 @@ async function openSettingsModal(isFirstRun = false) {
       }
     } catch (e) {}
   }
-  const cfg = G_SETTINGS || { onboarded: false, default_mode: "web", web: { open_browser: true, quota_mode: "server", disabled_tabs: [] }, cli: { default_view: "overview", disabled_sections: [] } };
+  const cfg = G_SETTINGS || { onboarded: false, default_mode: "web", web: { open_browser: true, disabled_tabs: [] }, cli: { default_view: "overview", disabled_sections: [] } };
 
   const titleEl = document.getElementById("settingsModalTitle");
   if (titleEl) {
@@ -6890,12 +6752,6 @@ async function openSettingsModal(isFirstRun = false) {
 
   const brCheck = document.getElementById("settingOpenBrowser");
   if (brCheck) brCheck.checked = cfg.web?.open_browser !== false;
-
-  const isMulti = cfg.web?.quota_mode === "multi";
-  const qServ = document.getElementById("settingQModeServer");
-  const qMult = document.getElementById("settingQModeMulti");
-  if (qServ) qServ.checked = !isMulti;
-  if (qMult) qMult.checked = isMulti;
 
   const cliView = cfg.cli?.default_view || "overview";
   const selView = document.getElementById("settingCliView");
@@ -7006,7 +6862,6 @@ async function saveSettingsFromModal() {
     update_url: updUrlVal,
     web: {
       open_browser: !!document.getElementById("settingOpenBrowser")?.checked,
-      quota_mode: document.getElementById("settingQModeMulti")?.checked ? "multi" : "server",
       disabled_tabs: []
     },
     cli: {
@@ -7051,7 +6906,7 @@ async function resetSettingsToDefault() {
         update_url: "",
         auto_check_updates: true,
         auto_update: false,
-        web: { open_browser: true, quota_mode: "server", disabled_tabs: [] },
+        web: { open_browser: true, disabled_tabs: [] },
         cli: { default_view: "overview", days: 10, disabled_sections: [] }
       })
     });
@@ -7185,9 +7040,6 @@ window.addEventListener("resize", () => {
 
 initSkeletons();
 initTheme();
-document.querySelectorAll("[data-qmode]").forEach(b => {
-  b.dataset.active = (b.dataset.qmode === G_QUOTA_MODE);
-});
 syncSegmentedThumbs(true);
 fetchSettings();
 setTimeRange("all");
