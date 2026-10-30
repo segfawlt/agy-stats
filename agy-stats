@@ -3676,7 +3676,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   *, *:before, *:after { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
+  html, body, h1, h2, h3, h4, p { margin: 0; padding: 0; }
   html { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility; background: var(--bg); }
   body {
     font-family: var(--font-sans);
@@ -3709,7 +3709,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .stack { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 
-  /* Topbar */
+  /* Ambient Glow & Topbar */
+  .shell-ambient {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background:
+      radial-gradient(60rem 28rem at 12% -10%, color-mix(in srgb, var(--accent-a) 7%, transparent), transparent 70%),
+      radial-gradient(50rem 26rem at 95% -12%, color-mix(in srgb, var(--accent-b) 6%, transparent), transparent 70%);
+  }
   .topbar {
     position: fixed;
     height: var(--topbar-h);
@@ -3719,11 +3728,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     backdrop-filter: blur(14px) saturate(160%);
     -webkit-backdrop-filter: blur(14px) saturate(160%);
     transition: border-color var(--dur-2) var(--ease);
-    border-bottom: 1px solid var(--line-1);
+    border-bottom: 1px solid transparent;
     align-items: center;
     gap: 12px;
     padding: 0 14px 0 18px;
     top: 0; left: 0; right: 0;
+  }
+  .topbar[data-scrolled="true"] {
+    border-bottom-color: var(--line-1);
   }
   .topbar-brand {
     display: flex;
@@ -3757,9 +3769,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     z-index: 30;
     flex-direction: column;
     gap: 18px;
-    padding: 12px 10px 14px;
+    padding: 8px 10px 14px;
     bottom: 0; left: 0;
-    border-right: 1px solid var(--line-1);
   }
   .sidebar::-webkit-scrollbar { display: none; }
   .nav-group { display: flex; flex-direction: column; gap: 1px; }
@@ -3839,17 +3850,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   /* Main Shell */
   .shell-main {
-    margin-left: var(--sidebar-w);
-    padding-top: var(--topbar-h);
-    min-height: 100vh;
+    position: relative;
+    z-index: 1;
+    margin: var(--topbar-h) 8px 8px var(--sidebar-w);
+    min-height: calc(100dvh - var(--topbar-h) - 8px);
+    background: var(--panel);
+    border-radius: var(--r-panel);
+    border: 1px solid var(--line-1);
+    box-shadow: var(--shadow-1);
+    overflow: clip;
   }
   .page {
     display: flex;
     flex-direction: column;
     gap: 20px;
-    max-width: 1360px;
+    max-width: 1560px;
     margin: 0 auto;
-    padding: 24px var(--gutter) 60px;
+    padding: 26px var(--gutter) 48px;
   }
   .page-header {
     display: flex;
@@ -3931,12 +3948,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     align-items: center;
     gap: 0;
     padding: 2px;
+    isolation: isolate;
+  }
+  .segmented-thumb {
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    border-radius: 6px;
+    background: var(--raised);
+    border: 1px solid var(--line-3);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+    transition: left var(--dur-2) var(--ease-out), width var(--dur-2) var(--ease-out);
+    z-index: -1;
+    pointer-events: none;
   }
   .segmented-option {
     color: var(--ink-3);
     white-space: nowrap;
     display: inline-flex;
-    transition: color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+    transition: color var(--dur-1) var(--ease);
     border-radius: 6px;
     align-items: center;
     gap: 6px;
@@ -3951,6 +3981,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .segmented-option:hover { color: var(--ink-1); }
   .segmented-option[data-active="true"] {
     color: var(--ink-1);
+  }
+  .segmented:not([data-measured="true"]) .segmented-option[data-active="true"] {
     background: var(--raised);
     box-shadow: 0 1px 2px rgba(0,0,0,0.25);
     border: 1px solid var(--line-3);
@@ -4000,7 +4032,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     line-height: 1.15;
     color: var(--ink-1);
   }
-  .stat[data-size="sm"] .stat-value { font-size: 17px; font-weight: 550; }
+  .stat[data-size="sm"] .stat-value { font-size: 18px; font-weight: 550; }
+  .stat-value[data-flash="true"] { animation: flash 900ms var(--ease) both; }
   .stat-foot {
     display: flex;
     color: var(--ink-3);
@@ -4066,7 +4099,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   @media (max-width: 1060px) {
     .grid-main-side { grid-template-columns: 1fr; }
     .sidebar { display: none; }
-    .shell-main { margin-left: 0; }
+    .shell-main { margin-left: 8px; }
   }
 
   /* Share Bar / Proportion Stack */
@@ -4348,19 +4381,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   /* Loading Animations, Topbar Progress, Live Chip & Skeletons */
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+  }
   @keyframes shimmer {
-    0% { background-position: 200% 0; }
-    100% { background-position: -200% 0; }
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
   }
   @keyframes indeterminate {
-    0% { transform: translateX(-100%); }
-    100% { transform: translateX(250%); }
+    from { transform: translateX(-100%); }
+    to { transform: translateX(250%); }
   }
   @keyframes spin {
     to { transform: rotate(360deg); }
   }
+  @keyframes flash {
+    0% { color: var(--accent-a); }
+    100% { color: inherit; }
+  }
+  .rise {
+    animation: rise var(--dur-3) var(--ease-out) backwards;
+    animation-delay: calc(var(--i, 0) * var(--stagger));
+  }
   .spin {
-    animation: 0.9s linear infinite spin;
+    animation: spin 0.9s linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *:before, *:after {
+      animation-duration: 1ms !important;
+      animation-delay: 0ms !important;
+      transition-duration: 1ms !important;
+    }
   }
   .topbar-progress {
     position: absolute;
@@ -4370,11 +4422,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     bottom: -1px;
     left: 0;
     right: 0;
-    opacity: 0;
-    transition: opacity var(--dur-1) var(--ease);
+    display: none;
   }
   .topbar-progress[data-loading="true"] {
-    opacity: 1;
+    display: block;
   }
   .topbar-progress-fill {
     background: var(--accent-gradient);
@@ -4395,25 +4446,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     gap: 8px;
     height: 30px;
     padding: 0 10px 0 11px;
-    font-size: 12px;
+    font-size: 12.5px;
   }
-  .live-chip:hover {
+  .live-chip:hover:not(:disabled) {
     border-color: var(--line-3);
     color: var(--ink-1);
+  }
+  .live-chip-count {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
   }
   .skeleton {
     background: linear-gradient(90deg, var(--line-1) 0%, var(--line-2) 50%, var(--line-1) 100%);
     background-size: 200% 100%;
-    animation: 1.6s linear infinite shimmer;
+    animation: shimmer 1.6s linear infinite;
     border-radius: 6px;
+  }
+  .table-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 8px 16px 16px;
   }
   [data-stale="true"] {
     opacity: 0.55;
     transition: opacity var(--dur-2) var(--ease);
-    pointer-events: none;
   }
   [data-stale="false"] {
-    opacity: 1;
     transition: opacity var(--dur-2) var(--ease);
   }
 
@@ -4559,8 +4619,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div class="shell-ambient"></div>
 
-<header class="topbar">
+<header class="topbar" id="shellTopbar" data-scrolled="false">
   <div class="topbar-brand">
     <div class="topbar-mark"></div>
     <span>agy</span>
@@ -4571,10 +4632,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="topbar-spacer"></div>
 
   <div class="topbar-actions">
-    <button type="button" class="live-chip" id="liveScanChip" onclick="refreshCurrentRange()" title="Click to sync telemetry and server quota">
-      <svg class="spin" id="liveChipSpin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+    <button type="button" class="live-chip" id="liveScanChip" onclick="refreshCurrentRange()" disabled title="Ingesting session files">
+      <svg class="spin" id="liveChipSpin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
       <span class="dot" id="liveChipDot" data-tone="live" data-pulse="true" style="display:none;"></span>
-      <span class="mono micro" id="liveScanInfo" style="color:var(--ink-2);">Loading telemetry...</span>
+      <span id="liveChipLabel">Syncing</span>
+      <span class="live-chip-count" id="liveScanInfo" style="display:none;"></span>
     </button>
     <div class="segmented" id="timeRangeSeg" aria-label="Time range">
       <button class="segmented-option" data-range="1h" onclick="setTimeRange('1h')" title="Last 1 hour (per 5m)">1h</button>
@@ -4661,11 +4723,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </nav>
 
 <main class="shell-main">
-  <div class="page" id="mainPage" data-stale="false">
+  <div class="page" id="mainPage">
 
     <!-- OVERVIEW -->
     <section id="pane-overview" class="view-pane active">
-      <div class="page-header">
+      <div class="page-header rise">
         <div><h1 class="page-title">Overview</h1></div>
         <div class="row" style="gap:8px;">
           <span class="micro dim">Quota mode:</span>
@@ -4676,31 +4738,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="stat-grid" style="--stat-min:190px;" id="primaryStatGrid">
-        <div class="stat"><div class="skeleton" style="width:90px;height:12px;"></div><div class="skeleton" style="width:110px;height:28px;margin-top:6px;"></div><div class="skeleton" style="width:140px;height:11px;margin-top:6px;"></div></div>
-        <div class="stat"><div class="skeleton" style="width:90px;height:12px;"></div><div class="skeleton" style="width:110px;height:28px;margin-top:6px;"></div><div class="skeleton" style="width:140px;height:11px;margin-top:6px;"></div></div>
-        <div class="stat"><div class="skeleton" style="width:90px;height:12px;"></div><div class="skeleton" style="width:110px;height:28px;margin-top:6px;"></div><div class="skeleton" style="width:140px;height:11px;margin-top:6px;"></div></div>
-        <div class="stat"><div class="skeleton" style="width:90px;height:12px;"></div><div class="skeleton" style="width:110px;height:28px;margin-top:6px;"></div><div class="skeleton" style="width:140px;height:11px;margin-top:6px;"></div></div>
-      </div>
-      <div class="stat-grid" style="--stat-min:140px;" id="secondaryStatGrid">
-        <div class="stat" data-size="sm"><div class="skeleton" style="width:70px;height:10px;"></div><div class="skeleton" style="width:80px;height:20px;margin-top:6px;"></div></div>
-        <div class="stat" data-size="sm"><div class="skeleton" style="width:70px;height:10px;"></div><div class="skeleton" style="width:80px;height:20px;margin-top:6px;"></div></div>
-        <div class="stat" data-size="sm"><div class="skeleton" style="width:70px;height:10px;"></div><div class="skeleton" style="width:80px;height:20px;margin-top:6px;"></div></div>
-        <div class="stat" data-size="sm"><div class="skeleton" style="width:70px;height:10px;"></div><div class="skeleton" style="width:80px;height:20px;margin-top:6px;"></div></div>
+      <div id="overviewStatsSkeleton" class="skeleton rise" style="width:100%;height:112px;border-radius:8px;"></div>
+      <div id="overviewStatsWrap" class="stack" style="gap:16px;display:none;" data-stale-target="true" data-stale="false">
+        <div class="stat-grid rise" style="--stat-min:190px;" id="primaryStatGrid"></div>
+        <div class="stat-grid rise" style="--stat-min:140px;" id="secondaryStatGrid"></div>
       </div>
 
-      <section class="card" id="overviewPacingCard">
-        <div class="card-body" id="overviewPacingBody">
-          <div class="skeleton" style="width:100%;height:68px;"></div>
+      <section class="card rise" style="--i:1" id="overviewPacingCard">
+        <div class="card-body" id="overviewPacingBody" data-stale-target="true" data-stale="false">
+          <div class="skeleton" style="width:100%;height:96px;border-radius:8px;"></div>
         </div>
       </section>
 
       <div class="grid-main-side" id="overviewMainSideGrid">
-        <section class="card" id="overviewActivityCard">
+        <section class="card rise" style="--i:2" id="overviewActivityCard">
           <header class="card-header">
             <div class="card-titles">
               <h2 class="card-title">Activity</h2>
-              <p class="card-description" id="activityDescription">Loading...</p>
+              <p class="card-description" id="activityDescription">Per day</p>
             </div>
             <div class="card-actions">
               <div class="segmented" data-size="sm" id="activityMetricSeg">
@@ -4710,31 +4765,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               </div>
             </div>
           </header>
-          <div class="card-body">
+          <div class="card-body" data-stale-target="true" data-stale="false">
             <div class="chart" id="activityChart">
-              <div class="skeleton" style="width:100%;height:212px;display:flex;align-items:center;justify-content:center;gap:10px;color:var(--ink-3);font-size:12.5px;">
-                <svg class="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-                <span>Loading telemetry & quota...</span>
-              </div>
+              <div class="skeleton" style="width:100%;height:240px;border-radius:8px;"></div>
               <div class="chart-tooltip" id="chartTooltip"></div>
             </div>
             <div class="legend" id="activityLegend" style="margin-top:14px;"></div>
           </div>
         </section>
 
-        <section class="card" id="overviewTokenMixCard">
+        <section class="card rise" style="--i:3" id="overviewTokenMixCard">
           <header class="card-header">
             <div class="card-titles">
               <h2 class="card-title">Token mix</h2>
+              <p class="card-description">Where conversation tokens went</p>
             </div>
           </header>
-          <div class="card-body" id="tokenMixBody">
-            <div class="skeleton" style="width:100%;height:140px;"></div>
+          <div class="card-body" id="tokenMixBody" data-stale-target="true" data-stale="false">
+            <div class="skeleton" style="width:100%;height:240px;border-radius:8px;"></div>
           </div>
         </section>
       </div>
 
-      <section class="card" id="topSessionsCard">
+      <section class="card rise" style="--i:4" id="topSessionsCard">
         <header class="card-header">
           <div class="card-titles">
             <h2 class="card-title">Top sessions by quota</h2>
@@ -4746,8 +4799,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </button>
           </div>
         </header>
-        <div class="card-body" data-flush="true">
-          <div class="table-wrap">
+        <div class="card-body" data-flush="true" data-stale-target="true" data-stale="false">
+          <div class="table-skeleton" data-table-skel="8"></div>
+          <div class="table-wrap" hidden>
             <table class="table" data-dense="true">
               <thead id="topSessionsThead"></thead>
               <tbody id="topSessionsTbody"></tbody>
@@ -4756,13 +4810,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </section>
 
-      <section class="card" id="latestRequestsCard">
+      <section class="card rise" style="--i:5" id="latestRequestsCard">
         <header class="card-header">
           <div class="card-titles">
             <h2 class="card-title">
               <span class="dot" data-tone="live" data-pulse="true"></span>
               Latest requests
             </h2>
+            <p class="card-description">Most recent model calls across every session</p>
           </div>
           <div class="card-actions">
             <button class="btn" data-size="sm" data-variant="ghost" onclick="navigateTab('requests')">
@@ -4770,8 +4825,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </button>
           </div>
         </header>
-        <div class="card-body" data-flush="true">
-          <div class="table-wrap">
+        <div class="card-body" data-flush="true" data-stale-target="true" data-stale="false">
+          <div class="table-skeleton" data-table-skel="8"></div>
+          <div class="table-wrap" hidden>
             <table class="table" data-dense="true">
               <thead id="latestRequestsThead"></thead>
               <tbody id="latestRequestsTbody"></tbody>
@@ -4783,13 +4839,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     <!-- MODELS -->
     <section id="pane-models" class="view-pane">
-      <div class="page-header"><div><h1 class="page-title">Models</h1></div></div>
-      <div class="card"><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table"><thead id="modelsFullThead"></thead><tbody id="modelsFullTbody"></tbody></table></div></div></div>
+      <div class="page-header rise"><div><h1 class="page-title">Models</h1></div></div>
+      <div class="card rise" style="--i:1"><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="8"></div><div class="table-wrap" hidden><table class="table"><thead id="modelsFullThead"></thead><tbody id="modelsFullTbody"></tbody></table></div></div></div>
     </section>
 
     <!-- QUOTA -->
     <section id="pane-quota" class="view-pane">
-      <div class="page-header">
+      <div class="page-header rise">
         <div><h1 class="page-title">Quota</h1></div>
         <div class="row" style="gap:8px;">
           <span class="micro dim">Quota mode:</span>
@@ -4799,14 +4855,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
-      <div class="stat-grid" style="--stat-min:220px;" id="quotaPoolsGrid"></div>
-      <section class="card"><div class="card-body" id="quotaPacingBody"></div></section>
-      <div class="card"><header class="card-header"><h2 class="card-title">Daily ledger</h2></header><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table"><thead><tr><th>Date</th><th data-align="right">Requests</th><th data-align="right">Input</th><th data-align="right">Output</th><th data-align="right">Cache read</th><th data-align="right">Tokens</th><th data-align="right">Weekly quota (machine)</th></tr></thead><tbody id="quotaLedgerTbody"></tbody></table></div></div></div>
+      <div class="skeleton rise" data-grid-skel="true" style="width:100%;height:96px;border-radius:12px;"></div>
+      <div class="stat-grid rise" style="--stat-min:220px;" id="quotaPoolsGrid" data-stale-target="true" data-stale="false" hidden></div>
+      <section class="card rise" style="--i:1"><div class="card-body" id="quotaPacingBody" data-stale-target="true" data-stale="false"><div class="skeleton" style="width:100%;height:96px;border-radius:8px;"></div></div></section>
+      <div class="card rise" style="--i:2"><header class="card-header"><h2 class="card-title">Daily ledger</h2></header><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="10"></div><div class="table-wrap" hidden><table class="table"><thead><tr><th>Date</th><th data-align="right">Requests</th><th data-align="right">Input</th><th data-align="right">Output</th><th data-align="right">Cache read</th><th data-align="right">Tokens</th><th data-align="right">Weekly quota (machine)</th></tr></thead><tbody id="quotaLedgerTbody"></tbody></table></div></div></div>
     </section>
 
     <!-- REQUESTS -->
     <section id="pane-requests" class="view-pane">
-      <div class="page-header">
+      <div class="page-header rise">
         <div><h1 class="page-title">Requests</h1></div>
         <div class="row" style="gap:8px;">
           <input type="text" class="search-input" id="reqSearchInput" placeholder="Filter model, session, tool..." oninput="renderRequestsPane()">
@@ -4817,21 +4874,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
-      <div class="card"><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table" data-dense="true"><thead id="requestsFullThead"></thead><tbody id="requestsFullTbody"></tbody></table></div></div></div>
+      <div class="card rise" style="--i:1"><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="12"></div><div class="table-wrap" hidden><table class="table" data-dense="true"><thead id="requestsFullThead"></thead><tbody id="requestsFullTbody"></tbody></table></div></div></div>
     </section>
 
     <!-- ERRORS -->
     <section id="pane-errors" class="view-pane">
-      <div class="page-header"><div><h1 class="page-title">Errors</h1></div></div>
-      <div class="stat-grid" style="--stat-min:180px;" id="errorsStatGrid"></div>
-      <div class="card"><header class="card-header"><h2 class="card-title">Signatures</h2></header><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table"><thead><tr><th>Signature</th><th data-align="right">Count</th><th>Model</th><th data-align="right">Latest</th></tr></thead><tbody id="errorSigTbody"></tbody></table></div></div></div>
-      <div class="card"><header class="card-header"><h2 class="card-title">Failures</h2></header><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table" data-dense="true"><thead><tr><th>When</th><th>Session</th><th>Model</th><th>Message</th></tr></thead><tbody id="errorLogTbody"></tbody></table></div></div></div>
+      <div class="page-header rise"><div><h1 class="page-title">Errors</h1></div></div>
+      <div class="skeleton rise" data-grid-skel="true" style="width:100%;height:84px;border-radius:12px;"></div>
+      <div class="stat-grid rise" style="--stat-min:180px;" id="errorsStatGrid" data-stale-target="true" data-stale="false" hidden></div>
+      <div class="card rise" style="--i:1"><header class="card-header"><h2 class="card-title">Signatures</h2></header><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="6"></div><div class="table-wrap" hidden><table class="table"><thead><tr><th>Signature</th><th data-align="right">Count</th><th>Model</th><th data-align="right">Latest</th></tr></thead><tbody id="errorSigTbody"></tbody></table></div></div></div>
+      <div class="card rise" style="--i:2"><header class="card-header"><h2 class="card-title">Failures</h2></header><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="8"></div><div class="table-wrap" hidden><table class="table" data-dense="true"><thead><tr><th>When</th><th>Session</th><th>Model</th><th>Message</th></tr></thead><tbody id="errorLogTbody"></tbody></table></div></div></div>
     </section>
 
     <!-- TRACES -->
     <section id="pane-traces" class="view-pane">
       <div id="tracesListContainer" class="stack" style="gap:20px;">
-        <div class="page-header">
+        <div class="page-header rise">
           <div><h1 class="page-title">Traces & Session Ranking</h1></div>
           <div class="row" style="gap:8px;">
             <input type="text" class="search-input" id="traceSearchInput" placeholder="Filter session or project..." oninput="renderTracesPane()">
@@ -4843,28 +4901,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
           </div>
         </div>
-        <div class="card"><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table"><thead id="tracesSessionsThead"></thead><tbody id="tracesSessionsTbody"></tbody></table></div></div></div>
+        <div class="card rise" style="--i:1"><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="10"></div><div class="table-wrap" hidden><table class="table"><thead id="tracesSessionsThead"></thead><tbody id="tracesSessionsTbody"></tbody></table></div></div></div>
       </div>
       <div id="traceDetailContainer" class="stack" style="display:none; gap:18px;"></div>
     </section>
 
     <!-- TOOLS -->
     <section id="pane-tools" class="view-pane">
-      <div class="page-header"><div><h1 class="page-title">Tools</h1></div></div>
-      <div class="card"><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table"><thead id="toolsDetailedThead"></thead><tbody id="toolsDetailedTbody"></tbody></table></div></div></div>
+      <div class="page-header rise"><div><h1 class="page-title">Tools</h1></div></div>
+      <div class="card rise" style="--i:1"><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="10"></div><div class="table-wrap" hidden><table class="table"><thead id="toolsDetailedThead"></thead><tbody id="toolsDetailedTbody"></tbody></table></div></div></div>
     </section>
 
     <!-- FRUSTRATION -->
     <section id="pane-frustration" class="view-pane">
-      <div class="page-header"><div><h1 class="page-title">Frustration</h1></div></div>
-      <div class="stat-grid" style="--stat-min:180px;" id="frustrationStatGrid"></div>
-      <div class="card"><header class="card-header"><h2 class="card-title">Signals</h2></header><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table" data-dense="true"><thead><tr><th>When</th><th>Category</th><th>Model</th><th>Session</th><th>Detail</th></tr></thead><tbody id="frustrationEventsTbody"></tbody></table></div></div></div>
+      <div class="page-header rise"><div><h1 class="page-title">Frustration</h1></div></div>
+      <div class="skeleton rise" data-grid-skel="true" style="width:100%;height:84px;border-radius:12px;"></div>
+      <div class="stat-grid rise" style="--stat-min:180px;" id="frustrationStatGrid" data-stale-target="true" data-stale="false" hidden></div>
+      <div class="card rise" style="--i:1"><header class="card-header"><h2 class="card-title">Signals</h2></header><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="8"></div><div class="table-wrap" hidden><table class="table" data-dense="true"><thead><tr><th>When</th><th>Category</th><th>Model</th><th>Session</th><th>Detail</th></tr></thead><tbody id="frustrationEventsTbody"></tbody></table></div></div></div>
     </section>
 
     <!-- PROJECTS -->
     <section id="pane-projects" class="view-pane">
-      <div class="page-header"><div><h1 class="page-title">Projects</h1></div></div>
-      <div class="card"><div class="card-body" data-flush="true"><div class="table-wrap"><table class="table"><thead id="projectsFullThead"></thead><tbody id="projectsFullTbody"></tbody></table></div></div></div>
+      <div class="page-header rise"><div><h1 class="page-title">Projects</h1></div></div>
+      <div class="card rise" style="--i:1"><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="8"></div><div class="table-wrap" hidden><table class="table"><thead id="projectsFullThead"></thead><tbody id="projectsFullTbody"></tbody></table></div></div></div>
     </section>
 
   </div>
@@ -5032,12 +5091,123 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 let G_FULL_DATA = null;
 let G_OVERVIEW_DATA = null;
-let G_CURRENT_RANGE = "24h";
+let G_CURRENT_RANGE = "all";
 let G_ACTIVITY_METRIC = "requests";
 let G_REQ_STATUS_FILTER = "all";
 let G_CURRENT_TRACE = null;
 let G_QUOTA_MODE = localStorage.getItem("agy-stats-quota-mode") || "server";
 let G_TRACE_SORT = "quota";
+let G_LAST_SYNCED_AT = null;
+let G_PREV_STAT_VALUES = new Map();
+let G_INITIAL_REVEALED = false;
+let G_SYNC_PHASE = "syncing";
+
+function initSkeletons() {
+  document.querySelectorAll("[data-table-skel]").forEach(el => {
+    const rows = Math.max(1, Number(el.dataset.tableSkel || 8));
+    let html = "";
+    for (let i = 0; i < rows; i++) {
+      const w = 92 - ((i * 13) % 30);
+      html += `<div class="skeleton" style="height:16px;width:${w}%;"></div>`;
+    }
+    el.innerHTML = html;
+  });
+}
+
+function revealLoadedContent() {
+  if (G_INITIAL_REVEALED) return;
+  G_INITIAL_REVEALED = true;
+  const ovSkel = document.getElementById("overviewStatsSkeleton");
+  if (ovSkel) ovSkel.style.display = "none";
+  document.querySelectorAll("[data-grid-skel], [data-table-skel]").forEach(el => {
+    el.style.display = "none";
+  });
+  ["quotaPoolsGrid", "errorsStatGrid", "frustrationStatGrid"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.removeAttribute("hidden");
+  });
+  document.querySelectorAll(".table-wrap[hidden]").forEach(el => {
+    el.removeAttribute("hidden");
+  });
+  const disSec = (G_SETTINGS && G_SETTINGS.cli && Array.isArray(G_SETTINGS.cli.disabled_sections))
+    ? G_SETTINGS.cli.disabled_sections
+    : [];
+  applyOverviewDisplaySections(disSec);
+}
+
+function syncSegmentedThumbs(snap = false) {
+  document.querySelectorAll(".segmented").forEach(seg => {
+    let thumb = seg.querySelector(":scope > .segmented-thumb");
+    if (!thumb) {
+      thumb = document.createElement("span");
+      thumb.className = "segmented-thumb";
+      thumb.setAttribute("aria-hidden", "true");
+      seg.insertBefore(thumb, seg.firstChild);
+    }
+    const active = seg.querySelector(':scope > .segmented-option[data-active="true"]');
+    if (!active || active.offsetWidth === 0) {
+      seg.dataset.measured = "false";
+      thumb.style.display = "none";
+      return;
+    }
+    const skipTransition = snap || seg.dataset.measured !== "true";
+    if (skipTransition) thumb.style.transition = "none";
+    thumb.style.display = "";
+    thumb.style.width = active.offsetWidth + "px";
+    thumb.style.left = active.offsetLeft + "px";
+    seg.dataset.measured = "true";
+    if (skipTransition) {
+      void thumb.offsetWidth;
+      thumb.style.transition = "";
+    }
+  });
+}
+
+function flashChangedStats() {
+  const isFirstPass = G_PREV_STAT_VALUES.size === 0;
+  document.querySelectorAll(".stat-grid").forEach(grid => {
+    const gridKey = grid.id || "grid";
+    grid.querySelectorAll(":scope > .stat").forEach((statEl, idx) => {
+      const labelEl = statEl.querySelector(".stat-label");
+      const valEl = statEl.querySelector(".stat-value");
+      if (!valEl) return;
+      const rawLabel = (labelEl ? labelEl.textContent : String(idx)) || String(idx);
+      const normLabel = rawLabel.replace(/\s*\([^)]*\)\s*/g, " ").trim();
+      const key = `${gridKey}::${normLabel}`;
+      const valText = (valEl.textContent || "").trim();
+      if (!isFirstPass && G_PREV_STAT_VALUES.has(key) && G_PREV_STAT_VALUES.get(key) !== valText) {
+        valEl.dataset.flash = "true";
+        setTimeout(() => { valEl.dataset.flash = "false"; }, 900);
+      }
+      G_PREV_STAT_VALUES.set(key, valText);
+    });
+  });
+}
+
+function fmtLiveAgo(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 45) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
+function updateLiveAgo() {
+  if (G_SYNC_PHASE !== "idle" || G_LAST_SYNCED_AT === null) return;
+  const info = document.getElementById("liveScanInfo");
+  if (info) {
+    info.textContent = fmtLiveAgo(Date.now() - G_LAST_SYNCED_AT);
+    info.style.display = "inline";
+  }
+}
+
+setInterval(updateLiveAgo, 15000);
+
+window.addEventListener("scroll", () => {
+  const topbar = document.getElementById("shellTopbar");
+  if (topbar) topbar.dataset.scrolled = window.scrollY > 4 ? "true" : "false";
+}, { passive: true });
 
 function setQuotaMode(mode, persist = false) {
   G_QUOTA_MODE = mode === "multi" ? "multi" : "server";
@@ -5045,6 +5215,7 @@ function setQuotaMode(mode, persist = false) {
   document.querySelectorAll("[data-qmode]").forEach(b => {
     b.dataset.active = (b.dataset.qmode === G_QUOTA_MODE);
   });
+  syncSegmentedThumbs(!persist && !G_INITIAL_REVEALED);
   if (persist) {
     if (G_SETTINGS && G_SETTINGS.web) G_SETTINGS.web.quota_mode = G_QUOTA_MODE;
     fetch("/api/settings", {
@@ -5055,12 +5226,14 @@ function setQuotaMode(mode, persist = false) {
   }
   if (G_OVERVIEW_DATA) renderDynamicOverview();
   if (G_FULL_DATA) renderFullViews();
+  if (G_INITIAL_REVEALED) flashChangedStats();
 }
 
 function setTraceSort(sortKey, btn) {
   G_TRACE_SORT = sortKey;
   document.querySelectorAll("#traceSortSeg .segmented-option").forEach(b => b.dataset.active = false);
   if (btn) btn.dataset.active = "true";
+  syncSegmentedThumbs();
   renderTracesPane();
 }
 
@@ -5143,7 +5316,11 @@ function initTheme() {
 function navigateTab(tabId) {
   document.querySelectorAll(".nav-row").forEach(b => b.dataset.active = (b.dataset.tab === tabId));
   document.querySelectorAll(".view-pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + tabId));
-  window.scrollTo({ top: 0, behavior: "smooth" });
+  window.scrollTo({ top: 0 });
+  requestAnimationFrame(() => {
+    syncSegmentedThumbs();
+    if (tabId === "overview" && G_OVERVIEW_DATA) renderOverviewActivityChart();
+  });
 }
 
 function initCustomInputs() {
@@ -5161,6 +5338,7 @@ function setTimeRange(rangeKey) {
   document.querySelectorAll("#timeRangeSeg .segmented-option").forEach(b => {
     b.dataset.active = (b.dataset.range === rangeKey);
   });
+  syncSegmentedThumbs();
   const bar = document.getElementById("customRangeBar");
   if (rangeKey === "custom") {
     initCustomInputs();
@@ -5194,6 +5372,7 @@ function setActivityMetric(metric, btn) {
   G_ACTIVITY_METRIC = metric;
   document.querySelectorAll("#activityMetricSeg .segmented-option").forEach(b => b.dataset.active = false);
   if (btn) btn.dataset.active = "true";
+  syncSegmentedThumbs();
   renderOverviewActivityChart();
 }
 
@@ -5201,6 +5380,7 @@ function setReqStatusFilter(status, btn) {
   G_REQ_STATUS_FILTER = status;
   document.querySelectorAll("#reqStatusSeg .segmented-option").forEach(b => b.dataset.active = false);
   if (btn) btn.dataset.active = "true";
+  syncSegmentedThumbs();
   renderRequestsPane();
 }
 
@@ -5251,11 +5431,6 @@ function renderDynamicOverview() {
         ? `Cycle: ${ov.cycleWeekLocalPct ?? ov.pctWeeklySpent}% machine · ${gemWk.usedPct}% server (${gemWk.remainingPct}% left)`
         : `Server cycle: ${gemWk.usedPct}% used · ${gemWk.remainingPct}% left (resets ${fmtResetIn(gemWk.resetTime)})`)
     : `${Re(ov.conversationTokens)} tokens`;
-
-  const liveEl = document.getElementById("liveScanInfo");
-  if (liveEl && G_FULL_DATA) {
-    liveEl.textContent = `${G_FULL_DATA.total_sessions_count || G_FULL_DATA.sessions_count} sessions · ${G_FULL_DATA.scan_ms}ms`;
-  }
 
   document.getElementById("primaryStatGrid").innerHTML = `
     ${show5h ? `
@@ -5315,7 +5490,11 @@ function renderDynamicOverview() {
 
 function renderPacingSection(targetId) {
   const el = document.getElementById(targetId);
-  if (!el || !G_OVERVIEW_DATA?.overall?.pacing) return;
+  if (!el || !G_OVERVIEW_DATA?.overall) return;
+  if (!G_OVERVIEW_DATA.overall.pacing) {
+    el.innerHTML = `<div class="dim micro" style="padding:8px 0;">Live server quota pacing unavailable.</div>`;
+    return;
+  }
   const ov = G_OVERVIEW_DATA.overall;
   const p = ov.pacing;
   const isMulti = (G_QUOTA_MODE === "multi");
@@ -6100,12 +6279,20 @@ function closeSessionTrace() {
 async function openSessionTrace(cid) {
   const listEl = document.getElementById("tracesListContainer");
   const detEl = document.getElementById("traceDetailContainer");
+  const prog = document.getElementById("topbarProgress");
   listEl.style.display = "none";
   detEl.style.display = "flex";
-  detEl.innerHTML = '<div class="card" style="padding:24px;color:var(--ink-3);">Loading trace...</div>';
+  if (prog) prog.dataset.loading = "true";
+  detEl.innerHTML = `
+    <div class="row rise" style="gap:8px;">
+      <button class="btn" data-size="sm" data-variant="ghost" onclick="closeSessionTrace()">← Traces</button>
+    </div>
+    <div class="skeleton rise" style="--i:1; width:100%; height:420px; border-radius:8px;"></div>
+  `;
 
   try {
     const res = await fetch(`/api/trace?cid=${encodeURIComponent(cid)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const tr = await res.json();
     G_CURRENT_TRACE = tr;
     const show5h = isShow5h();
@@ -6118,7 +6305,7 @@ async function openSessionTrace(cid) {
     };
 
     detEl.innerHTML = `
-      <div class="page-header">
+      <div class="page-header rise">
         <div class="stack" style="gap:4px;">
           <div class="row" style="gap:8px;">
             <button class="btn" data-size="sm" data-variant="ghost" onclick="closeSessionTrace()">← Traces</button>
@@ -6130,7 +6317,7 @@ async function openSessionTrace(cid) {
         </div>
       </div>
 
-      <div class="stat-grid" style="--stat-min:150px;">
+      <div class="stat-grid rise" style="--stat-min:150px; --i:1;">
         ${show5h ? `<div class="stat" data-size="sm"><div class="stat-label">5h quota</div><div class="stat-value" style="color:var(--chart-secondary);">${tr.pct5h}%</div></div>` : ""}
         <div class="stat" data-size="sm"><div class="stat-label">Weekly quota</div><div class="stat-value" style="color:var(--chart-primary);">${tr.pctWeek}%</div></div>
         <div class="stat" data-size="sm"><div class="stat-label">Tokens</div><div class="stat-value">${Re(tr.totalTokens)}</div></div>
@@ -6140,7 +6327,7 @@ async function openSessionTrace(cid) {
       </div>
 
       ${tr.subagents && tr.subagents.length ? `
-      <div class="card" style="padding:12px 16px;">
+      <div class="card rise" style="--i:2; padding:12px 16px;">
         <div class="row" style="gap:8px; flex-wrap:wrap;">
           <span class="section-label" style="margin-right:4px;">Subagents</span>
           ${tr.subagents.map(c => `
@@ -6151,7 +6338,7 @@ async function openSessionTrace(cid) {
         </div>
       </div>` : ""}
 
-      <div class="card">
+      <div class="card rise" style="--i:${tr.subagents && tr.subagents.length ? 3 : 2};">
         <header class="card-header">
           <h2 class="card-title">Timeline</h2>
           <div class="legend">
@@ -6203,7 +6390,14 @@ async function openSessionTrace(cid) {
       </div>
     `;
   } catch (err) {
-    detEl.innerHTML = `<div class="card" style="padding:24px;color:var(--bad);">Failed to load trace: ${esc(err.message)}</div>`;
+    detEl.innerHTML = `
+      <div class="row rise" style="gap:8px;">
+        <button class="btn" data-size="sm" data-variant="ghost" onclick="closeSessionTrace()">← Traces</button>
+      </div>
+      <div class="card rise" style="padding:24px;color:var(--bad);">Failed to load trace: ${esc(err.message)}</div>
+    `;
+  } finally {
+    if (prog && G_SYNC_PHASE !== "syncing") prog.dataset.loading = "false";
   }
 }
 
@@ -6245,7 +6439,8 @@ function renderFullViews() {
   try {
     const ov = d.overall || {};
     const isMulti = (G_QUOTA_MODE === "multi");
-    document.getElementById("quotaPoolsGrid").innerHTML = (d.quota || []).map(g => {
+    const qList = d.quota || [];
+    document.getElementById("quotaPoolsGrid").innerHTML = qList.length ? qList.map(g => {
       const rem = Number(g.remainingPct ?? (g.remainingFraction * 100)).toFixed(1);
       const used = Number(g.usedPct ?? (100 - g.remainingFraction * 100)).toFixed(1);
       const isGemWk = g.id === "gemini-weekly";
@@ -6262,7 +6457,7 @@ function renderFullViews() {
           <div class="stat-foot"><span class="truncate" title="${rem}% left · resets in ${esc(fmtResetIn(g.resetTime))}${esc(localCycleStr)}">${rem}% left · resets in ${esc(fmtResetIn(g.resetTime))}${esc(localCycleStr)}</span></div>
         </div>
       `;
-    }).join("");
+    }).join("") : `<div class="stat"><div class="stat-label">Server quota</div><div class="stat-value">–</div><div class="stat-foot">Live quota pools unavailable</div></div>`;
 
     renderPacingSection("quotaPacingBody");
 
@@ -6483,8 +6678,11 @@ function applyOverviewDisplaySections(disabledSections = []) {
     const el = document.getElementById(id);
     if (el) el.style.display = show ? "" : "none";
   };
-  setVis("primaryStatGrid", !dSet.has("summary"));
-  setVis("secondaryStatGrid", !dSet.has("summary"));
+  const showSummary = !dSet.has("summary");
+  setVis("overviewStatsSkeleton", showSummary && !G_INITIAL_REVEALED);
+  setVis("overviewStatsWrap", showSummary && G_INITIAL_REVEALED);
+  setVis("primaryStatGrid", showSummary);
+  setVis("secondaryStatGrid", showSummary);
   setVis("overviewPacingCard", !dSet.has("quota"));
 
   const showAct = !dSet.has("days");
@@ -6503,9 +6701,10 @@ function applyOverviewDisplaySections(disabledSections = []) {
 
   setVis("topSessionsCard", !dSet.has("sessions"));
   setVis("latestRequestsCard", !dSet.has("requests"));
-  if (showAct && G_OVERVIEW_DATA) {
-    requestAnimationFrame(() => renderOverviewActivityChart());
-  }
+  requestAnimationFrame(() => {
+    syncSegmentedThumbs();
+    if (showAct && G_OVERVIEW_DATA) renderOverviewActivityChart();
+  });
 }
 
 async function openSettingsModal(isFirstRun = false) {
@@ -6669,11 +6868,10 @@ async function saveSettingsFromModal() {
       G_SETTINGS = await res.json();
       applySettings(G_SETTINGS);
       closeSettingsModal();
-      const info = document.getElementById("liveScanInfo");
-      if (info) {
-        const orig = info.textContent;
-        info.textContent = "Preferences saved";
-        setTimeout(() => { if (info.textContent === "Preferences saved") info.textContent = orig; }, 2500);
+      const lbl = document.getElementById("liveChipLabel");
+      if (lbl && G_SYNC_PHASE === "idle") {
+        lbl.textContent = "Saved";
+        setTimeout(() => { if (G_SYNC_PHASE === "idle" && lbl.textContent === "Saved") lbl.textContent = "Live"; }, 2000);
       }
     }
   } catch (err) {
@@ -6710,21 +6908,79 @@ async function resetSettingsToDefault() {
   }
 }
 
-function setLoadingState(isLoading, statusText = null) {
+let G_LOAD_SEQ = 0;
+
+function setLoadingState(isLoading, isError = false, errorMsg = "") {
   const prog = document.getElementById("topbarProgress");
+  const chip = document.getElementById("liveScanChip");
   const spin = document.getElementById("liveChipSpin");
   const dot = document.getElementById("liveChipDot");
+  const lbl = document.getElementById("liveChipLabel");
   const info = document.getElementById("liveScanInfo");
-  const page = document.getElementById("mainPage");
-  if (prog) prog.dataset.loading = isLoading ? "true" : "false";
-  if (spin) spin.style.display = isLoading ? "inline-block" : "none";
-  if (dot) dot.style.display = isLoading ? "none" : "inline-block";
-  if (statusText && info) info.textContent = statusText;
-  if (page && G_FULL_DATA) page.dataset.stale = isLoading ? "true" : "false";
+
+  if (isLoading) {
+    G_SYNC_PHASE = "syncing";
+    if (prog) prog.dataset.loading = "true";
+    if (chip) {
+      chip.disabled = true;
+      chip.title = "Ingesting session files";
+    }
+    if (spin) spin.style.display = "inline-block";
+    if (dot) dot.style.display = "none";
+    if (lbl) lbl.textContent = "Syncing";
+    if (info) info.style.display = "none";
+    if (G_INITIAL_REVEALED) {
+      document.querySelectorAll('[data-stale-target="true"]').forEach(el => {
+        el.dataset.stale = "true";
+      });
+    }
+    return;
+  }
+
+  if (prog) prog.dataset.loading = "false";
+  document.querySelectorAll('[data-stale-target="true"]').forEach(el => {
+    el.dataset.stale = "false";
+  });
+
+  if (isError) {
+    G_SYNC_PHASE = "error";
+    if (chip) {
+      chip.disabled = false;
+      chip.title = `${errorMsg || "Sync failed"} — click to retry`;
+    }
+    if (spin) spin.style.display = "none";
+    if (dot) {
+      dot.style.display = "inline-block";
+      dot.dataset.tone = "bad";
+      dot.dataset.pulse = "false";
+    }
+    if (lbl) lbl.textContent = "Sync failed";
+    if (info) info.style.display = "none";
+    return;
+  }
+
+  G_SYNC_PHASE = "idle";
+  if (chip) {
+    chip.disabled = false;
+    chip.title = G_FULL_DATA
+      ? `Click to sync session files now · ${G_FULL_DATA.total_sessions_count || G_FULL_DATA.sessions_count || 0} sessions · ${G_FULL_DATA.scan_ms ?? 0}ms`
+      : "Click to sync session files now";
+  }
+  if (spin) spin.style.display = "none";
+  if (dot) {
+    dot.style.display = "inline-block";
+    dot.dataset.tone = "live";
+    dot.dataset.pulse = "true";
+  }
+  if (lbl) lbl.textContent = "Live";
+  updateLiveAgo();
 }
 
 async function loadStats(rangeKey = "all", force = false, fromMs = null, toMs = null) {
-  setLoadingState(true, force ? "Syncing quota & logs..." : (G_FULL_DATA ? "Updating range..." : "Loading telemetry..."));
+  const seq = ++G_LOAD_SEQ;
+  setLoadingState(true);
+  let errMsg = "";
+  let hadErr = false;
   try {
     let url = `/api/stats?range=${encodeURIComponent(rangeKey)}`;
     if (rangeKey === "custom" && fromMs !== null && toMs !== null) {
@@ -6732,29 +6988,51 @@ async function loadStats(rangeKey = "all", force = false, fromMs = null, toMs = 
     }
     if (force) url += "&refresh=1";
     const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
+    if (seq !== G_LOAD_SEQ) return;
     G_FULL_DATA = data;
     G_OVERVIEW_DATA = data;
+    G_LAST_SYNCED_AT = Date.now();
+    revealLoadedContent();
     renderDynamicOverview();
     renderFullViews();
+    flashChangedStats();
+    requestAnimationFrame(syncSegmentedThumbs);
   } catch (err) {
+    if (seq !== G_LOAD_SEQ) return;
     console.error("Failed to load stats", err);
-    const info = document.getElementById("liveScanInfo");
-    if (info) info.textContent = "Sync error";
+    hadErr = true;
+    errMsg = err && err.message ? err.message : "Sync failed";
   } finally {
-    setLoadingState(false);
+    if (seq === G_LOAD_SEQ) {
+      setLoadingState(false, hadErr, errMsg);
+    }
   }
 }
 
+if (typeof ResizeObserver !== "undefined") {
+  const segRo = new ResizeObserver(() => syncSegmentedThumbs(true));
+  document.querySelectorAll(".segmented").forEach(seg => segRo.observe(seg));
+}
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(() => syncSegmentedThumbs(true));
+}
+
 window.addEventListener("resize", () => {
+  syncSegmentedThumbs(true);
   if (document.getElementById("pane-overview")?.classList.contains("active")) {
     renderOverviewActivityChart();
   }
 });
 
+initSkeletons();
 initTheme();
+document.querySelectorAll("[data-qmode]").forEach(b => {
+  b.dataset.active = (b.dataset.qmode === G_QUOTA_MODE);
+});
+syncSegmentedThumbs(true);
 fetchSettings();
-setQuotaMode(G_QUOTA_MODE, false);
 setTimeRange("all");
 </script>
 </body>
