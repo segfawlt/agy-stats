@@ -183,14 +183,19 @@ QUOTA_BUDGET_WEEK = 599.12
 
 MODEL_QUOTA_WEIGHTS = {
     # (input_per_1M, output_per_1M, cache_read_per_1M)
-    "argon_high":    (0.45,  3.60, 0.045),
-    "argon_med":     (0.38,  3.04, 0.038),
-    "flash_high":    (0.30,  2.40, 0.030),
-    "flash_med":     (0.20,  1.60, 0.020),
-    "flash_low":     (0.10,  0.80, 0.010),
-    "claude_opus":   (3.50, 20.00, 0.350),
-    "claude_sonnet": (2.10, 12.00, 0.210),
-    "other":         (0.35,  2.00, 0.035),
+    "argon_high":         (0.45,  3.60, 0.045),
+    "argon_med":          (0.38,  3.04, 0.038),
+    "flash_high":         (0.30,  2.40, 0.030),
+    "flash_med":          (0.20,  1.60, 0.020),
+    "flash_low":          (0.10,  0.80, 0.010),
+    "claude_opus_high":   (3.80, 22.00, 0.380),
+    "claude_opus_med":    (3.20, 18.50, 0.320),
+    "claude_sonnet_high": (2.30, 13.50, 0.230),
+    "claude_sonnet_med":  (1.90, 11.00, 0.190),
+    "claude_sonnet_low":  (1.40,  8.00, 0.140),
+    "claude_haiku":       (0.65,  3.80, 0.065),
+    "gpt_oss":            (0.85,  4.80, 0.085),
+    "other":              (0.35,  2.00, 0.035),
 }
 
 def compute_quota_units(model_name, inp, out, cache):
@@ -206,9 +211,18 @@ def compute_quota_units(model_name, inp, out, cache):
     elif "flash" in ml:
         w = MODEL_QUOTA_WEIGHTS["flash_med"]
     elif "opus" in ml:
-        w = MODEL_QUOTA_WEIGHTS["claude_opus"]
+        w = MODEL_QUOTA_WEIGHTS["claude_opus_high" if "(high)" in ml else "claude_opus_med"]
     elif "sonnet" in ml:
-        w = MODEL_QUOTA_WEIGHTS["claude_sonnet"]
+        if "(high)" in ml:
+            w = MODEL_QUOTA_WEIGHTS["claude_sonnet_high"]
+        elif "(low)" in ml:
+            w = MODEL_QUOTA_WEIGHTS["claude_sonnet_low"]
+        else:
+            w = MODEL_QUOTA_WEIGHTS["claude_sonnet_med"]
+    elif "haiku" in ml:
+        w = MODEL_QUOTA_WEIGHTS["claude_haiku"]
+    elif "gpt" in ml or "openai" in ml:
+        w = MODEL_QUOTA_WEIGHTS["gpt_oss"]
     else:
         w = MODEL_QUOTA_WEIGHTS["other"]
     return (inp * w[0] + out * w[1] + cache * w[2]) / 1_000_000.0
@@ -239,6 +253,7 @@ DEFAULT_CONFIG = {
         "port": 3872,
         "open_browser": True,
         "quota_mode": "server",
+        "pacing_style": "fun",
         "disabled_tabs": []
     },
     "cli": {
@@ -323,6 +338,8 @@ def _read_config_with_status():
             res["web"]["open_browser"] = _safe_bool(w.get("open_browser"), True)
             if w.get("quota_mode") in ("server", "multi"):
                 res["web"]["quota_mode"] = w["quota_mode"]
+            if w.get("pacing_style") in ("fun", "straight", "minimal"):
+                res["web"]["pacing_style"] = w["pacing_style"]
             if isinstance(w.get("disabled_tabs"), list):
                 res["web"]["disabled_tabs"] = [str(t).lower() for t in w["disabled_tabs"] if t]
         if isinstance(cfg.get("cli"), dict):
@@ -374,6 +391,8 @@ def save_config(updates):
                 cur["web"]["open_browser"] = _safe_bool(v, cur["web"]["open_browser"])
             elif k == "quota_mode":
                 cur["web"]["quota_mode"] = "multi" if v == "multi" else "server"
+            elif k == "pacing_style" and v in ("fun", "straight", "minimal"):
+                cur["web"]["pacing_style"] = v
             elif k == "disabled_tabs" and isinstance(v, list):
                 cur["web"]["disabled_tabs"] = [str(t).lower() for t in v if t]
     if "cli" in updates and isinstance(updates["cli"], dict):
@@ -691,6 +710,14 @@ def _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, visit
             return "Gemini 3.8 Flash (High)"
         if "pro" in ml:
             return "Gemini 4 Argon (High)"
+        if "opus" in ml:
+            return "Claude Opus 5.5 (High)"
+        if "sonnet" in ml or "claude" in ml:
+            return "Claude Sonnet 5.5 (High)"
+        if "haiku" in ml:
+            return "Claude Haiku 4.5"
+        if "gpt" in ml:
+            return "GPT-OSS 120B (Medium)"
         if tname == "research":
             return "Gemini 3.8 Flash (Medium)"
         if tname == "image-generator":
@@ -776,7 +803,9 @@ def load_raw_telemetry(force=False):
                             d0 = json.loads(line)
                             m0 = MODEL_SELECTION_RE.search(d0.get("content", ""))
                             if m0:
-                                conv_first_from[cid] = m0.group(1).strip()
+                                src_m = m0.group(1).strip()
+                                dst_m = m0.group(2).strip()
+                                conv_first_from[cid] = dst_m if src_m.lower() in ("none", "null", "unknown", "") else src_m
                         except Exception:
                             pass
                     if "invoke_subagent" in line or (pending_sub and "conversationId" in line):
@@ -1112,6 +1141,149 @@ def load_raw_telemetry(force=False):
 def _ms_to_utc_iso(ms):
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def _build_pool_pacing(
+    pool_key,
+    label,
+    full_name,
+    wk_pool,
+    fh_pool,
+    local_wk_pct,
+    local_5h_pct,
+    wk_reset_ms,
+    fh_reset_ms,
+    now_ms,
+    avg_wk_pct_per_req,
+):
+    period_5h_ms = 5 * 3600 * 1000
+    period_wk_ms = 7 * 86400 * 1000
+    burst_to_wk_pct = (QUOTA_BUDGET_5H / QUOTA_BUDGET_WEEK) * 100.0
+
+    wk_cycle_start_ms = (wk_reset_ms - period_wk_ms) if wk_reset_ms else (now_ms - period_wk_ms)
+    fh_cycle_start_ms = (fh_reset_ms - period_5h_ms) if fh_reset_ms else (now_ms - period_5h_ms)
+    wk_cycle_since = datetime.fromtimestamp(wk_cycle_start_ms / 1000).astimezone().strftime("%b %d %H:%M")
+    fh_cycle_since = datetime.fromtimestamp(fh_cycle_start_ms / 1000).astimezone().strftime("%H:%M")
+
+    wk_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - wk_cycle_start_ms) / period_wk_ms) * 100.0)), 1)
+    fh_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - fh_cycle_start_ms) / period_5h_ms) * 100.0)), 1)
+
+    wk_used = round(float(wk_pool.get("usedPct", local_wk_pct)), 2) if wk_pool else local_wk_pct
+    wk_rem = round(float(wk_pool.get("remainingPct", max(0.0, 100.0 - wk_used))), 2) if wk_pool else round(max(0.0, 100.0 - wk_used), 2)
+    fh_used = round(float(fh_pool.get("usedPct", local_5h_pct)), 2) if fh_pool else local_5h_pct
+    fh_rem = round(float(fh_pool.get("remainingPct", max(0.0, 100.0 - fh_used))), 2) if fh_pool else round(max(0.0, 100.0 - fh_used), 2)
+
+    other_wk = round(max(0.0, wk_used - local_wk_pct), 2)
+    other_5h = round(max(0.0, fh_used - local_5h_pct), 2)
+
+    wk_rem_hours = max(0.05, ((wk_reset_ms - now_ms) / 3_600_000.0) if (wk_reset_ms and wk_reset_ms > now_ms) else ((100.0 - wk_elapsed_pct) / 100.0 * 168.0))
+    wk_el_hours = max(0.05, 168.0 - wk_rem_hours)
+    wk_rem_days = wk_rem_hours / 24.0
+    wk_el_days = wk_el_hours / 24.0
+
+    fh_rem_hours = max(0.02, ((fh_reset_ms - now_ms) / 3_600_000.0) if (fh_reset_ms and fh_reset_ms > now_ms) else ((100.0 - fh_elapsed_pct) / 100.0 * 5.0))
+    fh_el_hours = max(0.02, 5.0 - fh_rem_hours)
+
+    if wk_reset_ms and fh_reset_ms and wk_reset_ms > fh_reset_ms:
+        after_fh_hours = max(0.0, (wk_reset_ms - fh_reset_ms) / 3_600_000.0)
+        extra_5h_windows = int(math.ceil(after_fh_hours / 5.0))
+    elif not wk_reset_ms:
+        extra_5h_windows = int(math.ceil(max(0.0, wk_rem_hours - fh_rem_hours) / 5.0))
+    else:
+        extra_5h_windows = 0
+
+    burst_windows_left = round((fh_rem / 100.0) + extra_5h_windows, 1)
+    max_reachable_add_wk = round(burst_windows_left * burst_to_wk_pct, 1)
+    unkillable_cap_per_burst = burst_to_wk_pct if pool_key == "gemini" else 25.0
+    wk_unkillable = bool(wk_rem > (burst_windows_left * unkillable_cap_per_burst + 0.5) and wk_rem > 1.0)
+
+    wk_warmup = bool(wk_el_hours < 6.0 and wk_used < 12.0)
+    fh_warmup = bool(fh_el_hours < 0.25 and fh_used < 20.0)
+
+    wk_rate_per_hour = wk_used / wk_el_hours
+    wk_rate_per_day = wk_used / wk_el_days
+    wk_safe_per_hour = wk_rem / wk_rem_hours
+    wk_safe_per_day = wk_rem / wk_rem_days
+
+    fh_rate_per_hour = fh_used / fh_el_hours
+    fh_safe_per_hour = fh_rem / fh_rem_hours
+
+    wk_unclipped_proj = round(min(999.0, wk_used + wk_rate_per_hour * wk_rem_hours), 1)
+    fh_unclipped_proj = round(min(999.0, fh_used + fh_rate_per_hour * fh_rem_hours), 1)
+
+    wk_pace_ratio = round(wk_used / max(2.0, wk_elapsed_pct), 2)
+    fh_pace_ratio = round(fh_used / max(4.0, fh_elapsed_pct), 2)
+
+    wk_tte_hours = round(wk_rem / wk_rate_per_hour, 2) if wk_rate_per_hour > 0.01 else None
+    wk_shortfall_hours = round(max(0.0, wk_rem_hours - wk_tte_hours), 2) if (wk_tte_hours is not None and wk_tte_hours < wk_rem_hours) else 0.0
+
+    fh_tte_hours = round(fh_rem / fh_rate_per_hour, 2) if fh_rate_per_hour > 0.05 else None
+    fh_shortfall_hours = round(max(0.0, fh_rem_hours - fh_tte_hours), 2) if (fh_tte_hours is not None and fh_tte_hours < fh_rem_hours) else 0.0
+
+    wk_will_run_out = bool(not wk_unkillable and not wk_warmup and (wk_rem <= 0.1 or wk_shortfall_hours > 0.25))
+    fh_will_run_out = bool(not fh_warmup and (fh_rem <= 0.1 or fh_shortfall_hours > 0.08))
+
+    est_reqs_left = int(round(wk_rem / max(0.0002, avg_wk_pct_per_req)))
+    est_fh_reqs_left = int(round(((fh_rem / 100.0) * burst_to_wk_pct) / max(0.0002, avg_wk_pct_per_req)))
+    burst_tanks_equiv_left = round(wk_rem / burst_to_wk_pct, 1)
+
+    return {
+        "key": pool_key,
+        "label": label,
+        "fullName": full_name,
+        "available": bool(wk_pool or fh_pool or local_wk_pct > 0 or local_5h_pct > 0),
+        "wkCycleSince": wk_cycle_since,
+        "fhCycleSince": fh_cycle_since,
+        "serverWkUsedPct": wk_used,
+        "serverWkRemPct": wk_rem,
+        "localWkUsedPct": local_wk_pct,
+        "otherWkUsedPct": other_wk,
+        "wkElapsedPct": wk_elapsed_pct,
+        "wkElapsedDays": round(wk_el_days, 2),
+        "wkRemainingDays": round(wk_rem_days, 2),
+        "wkElapsedHours": round(wk_el_hours, 2),
+        "wkRemainingHours": round(wk_rem_hours, 2),
+        "serverWkPaceRatio": wk_pace_ratio,
+        "localWkPaceRatio": round(local_wk_pct / max(2.0, wk_elapsed_pct), 2),
+        "serverWkProjectedPct": round(min(100.0, wk_unclipped_proj), 1),
+        "serverWkUnclippedPct": wk_unclipped_proj,
+        "localWkProjectedPct": round(min(100.0, local_wk_pct / max(0.02, wk_elapsed_pct / 100.0)), 1),
+        "serverWkRatePerDay": round(wk_rate_per_day, 2),
+        "serverWkRatePerHour": round(wk_rate_per_hour, 2),
+        "localWkRatePerDay": round(local_wk_pct / wk_el_days, 2),
+        "safeDailyBudgetLeft": round(wk_safe_per_day, 1),
+        "safeHourlyBudgetLeft": round(wk_safe_per_hour, 2),
+        "wkTteHours": wk_tte_hours,
+        "wkShortfallHours": wk_shortfall_hours,
+        "wkUnkillable": wk_unkillable,
+        "wkWarmup": wk_warmup,
+        "wkWillRunOut": wk_will_run_out,
+        "maxReachableAddWkPct": max_reachable_add_wk,
+        "burstWindowsLeft": burst_windows_left,
+        "burstTanksEquivLeft": burst_tanks_equiv_left,
+        "estReqsLeft": est_reqs_left,
+        "est5hReqsLeft": est_fh_reqs_left,
+        "server5hUsedPct": fh_used,
+        "server5hRemPct": fh_rem,
+        "local5hUsedPct": local_5h_pct,
+        "other5hUsedPct": other_5h,
+        "fhElapsedPct": fh_elapsed_pct,
+        "fhElapsedHours": round(fh_el_hours, 2),
+        "fhRemainingHours": round(fh_rem_hours, 2),
+        "server5hPaceRatio": fh_pace_ratio,
+        "local5hPaceRatio": round(local_5h_pct / max(4.0, fh_elapsed_pct), 2),
+        "server5hProjectedPct": round(min(100.0, fh_unclipped_proj), 1),
+        "server5hUnclippedPct": fh_unclipped_proj,
+        "local5hProjectedPct": round(min(100.0, local_5h_pct / max(0.02, fh_elapsed_pct / 100.0)), 1),
+        "server5hRatePerHour": round(fh_rate_per_hour, 2),
+        "local5hRatePerHour": round(local_5h_pct / fh_el_hours, 2),
+        "safe5hHourlyBudgetLeft": round(fh_safe_per_hour, 1),
+        "fhTteHours": fh_tte_hours,
+        "fhShortfallHours": fh_shortfall_hours,
+        "fhWarmup": fh_warmup,
+        "fhWillRunOut": fh_will_run_out,
+        "wkResetTime": wk_pool.get("resetTime", "") if wk_pool else "",
+        "fhResetTime": fh_pool.get("resetTime", "") if fh_pool else "",
+    }
+
 def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
     telemetry = load_raw_telemetry()
     all_reqs = telemetry["all_requests"]
@@ -1315,6 +1487,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
             "p95Ms": mdurs[int(len(mdurs) * 0.95)] if mdurs else 0,
             "pct_5h": units_to_pct_5h(mv["units"], 2),
             "pct_week": units_to_pct_week(mv["units"], 2),
+            "is3p": _is_3p_model(m_name),
             "frustrations": frust_by_model.get(m_name, 0)
         }
 
@@ -1548,50 +1721,35 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
 
     gem_5h = next((q for q in effective_quota_list if q.get("id") == "gemini-5h"), None)
     gem_wk = next((q for q in effective_quota_list if q.get("id") == "gemini-weekly"), None)
+    tp_5h = next((q for q in effective_quota_list if q.get("id") == "3p-5h"), None)
+    tp_wk = next((q for q in effective_quota_list if q.get("id") == "3p-weekly"), None)
 
-    server_5h_used_pct = round(float(gem_5h.get("usedPct", local_5h_cycle_pct)), 2) if gem_5h else local_5h_cycle_pct
-    server_5h_rem_pct = round(float(gem_5h.get("remainingPct", max(0.0, 100.0 - server_5h_used_pct))), 2) if gem_5h else round(max(0.0, 100.0 - server_5h_used_pct), 2)
-    server_wk_used_pct = round(float(gem_wk.get("usedPct", local_wk_cycle_pct)), 2) if gem_wk else local_wk_cycle_pct
-    server_wk_rem_pct = round(float(gem_wk.get("remainingPct", max(0.0, 100.0 - server_wk_used_pct))), 2) if gem_wk else round(max(0.0, 100.0 - server_wk_used_pct), 2)
+    gem_all = [r for r in all_reqs if not _is_3p_model(r["model"])]
+    tp_all = [r for r in all_reqs if _is_3p_model(r["model"])]
+    avg_gem_wk_per_req = (units_to_pct_week(sum(r["units"] for r in gem_all), 6) / len(gem_all)) if len(gem_all) >= 10 else 0.0015
+    avg_tp_wk_per_req = (units_to_pct_week(sum(r["units"] for r in tp_all), 6) / len(tp_all)) if len(tp_all) >= 10 else 0.015
 
-    other_5h_pct = round(max(0.0, server_5h_used_pct - local_5h_cycle_pct), 2)
-    other_wk_pct = round(max(0.0, server_wk_used_pct - local_wk_cycle_pct), 2)
-
-    wk_rem_days = max(0.04, ((wk_reset_ms - now_ms) / 86_400_000.0) if (wk_reset_ms and wk_reset_ms > now_ms) else ((100.0 - wk_elapsed_pct) / 100.0 * 7.0))
-    wk_el_days = max(0.04, 7.0 - wk_rem_days)
-    fh_rem_hours = max(0.04, ((fh_reset_ms - now_ms) / 3_600_000.0) if (fh_reset_ms and fh_reset_ms > now_ms) else ((100.0 - fh_elapsed_pct) / 100.0 * 5.0))
-    fh_el_hours = max(0.04, 5.0 - fh_rem_hours)
+    gem_pacing = _build_pool_pacing(
+        "gemini", "Gemini", "Gemini Models",
+        gem_wk, gem_5h, local_wk_cycle_pct, local_5h_cycle_pct,
+        wk_reset_ms, fh_reset_ms, now_ms, avg_gem_wk_per_req,
+    )
+    tp_pacing = _build_pool_pacing(
+        "3p", "Claude / GPT", "Claude and GPT models",
+        tp_wk, tp_5h, local_3p_wk_cycle_pct, local_3p_5h_cycle_pct,
+        tp_wk_reset_ms, tp_fh_reset_ms, now_ms, avg_tp_wk_per_req,
+    )
 
     pacing = {
-        "serverWkUsedPct": server_wk_used_pct,
-        "serverWkRemPct": server_wk_rem_pct,
-        "localWkUsedPct": local_wk_cycle_pct,
-        "otherWkUsedPct": other_wk_pct,
-        "wkElapsedPct": wk_elapsed_pct,
-        "wkElapsedDays": round(wk_el_days, 2),
-        "wkRemainingDays": round(wk_rem_days, 2),
-        "serverWkPaceRatio": round(server_wk_used_pct / max(1.0, wk_elapsed_pct), 2),
-        "localWkPaceRatio": round(local_wk_cycle_pct / max(1.0, wk_elapsed_pct), 2),
-        "serverWkProjectedPct": round(min(100.0, server_wk_used_pct / max(0.02, wk_elapsed_pct / 100.0)), 1),
-        "localWkProjectedPct": round(min(100.0, local_wk_cycle_pct / max(0.02, wk_elapsed_pct / 100.0)), 1),
-        "serverWkRatePerDay": round(server_wk_used_pct / wk_el_days, 2),
-        "localWkRatePerDay": round(local_wk_cycle_pct / wk_el_days, 2),
-        "safeDailyBudgetLeft": round(server_wk_rem_pct / wk_rem_days, 1),
-        "server5hUsedPct": server_5h_used_pct,
-        "server5hRemPct": server_5h_rem_pct,
-        "local5hUsedPct": local_5h_cycle_pct,
-        "other5hUsedPct": other_5h_pct,
-        "fhElapsedPct": fh_elapsed_pct,
-        "fhRemainingHours": round(fh_rem_hours, 2),
-        "server5hPaceRatio": round(server_5h_used_pct / max(1.0, fh_elapsed_pct), 2),
-        "local5hPaceRatio": round(local_5h_cycle_pct / max(1.0, fh_elapsed_pct), 2),
-        "server5hProjectedPct": round(min(100.0, server_5h_used_pct / max(0.02, fh_elapsed_pct / 100.0)), 1),
-        "local5hProjectedPct": round(min(100.0, local_5h_cycle_pct / max(0.02, fh_elapsed_pct / 100.0)), 1),
-        "server5hRatePerHour": round(server_5h_used_pct / fh_el_hours, 2),
-        "local5hRatePerHour": round(local_5h_cycle_pct / fh_el_hours, 2),
-        "wkResetTime": gem_wk.get("resetTime", "") if gem_wk else "",
-        "fhResetTime": gem_5h.get("resetTime", "") if gem_5h else ""
+        **gem_pacing,
+        "pools": {
+            "gemini": gem_pacing,
+            "3p": tp_pacing,
+        },
     }
+
+    range_gem_units = sum(r["units"] for r in in_range if not _is_3p_model(r["model"]))
+    range_3p_units = sum(r["units"] for r in in_range if _is_3p_model(r["model"]))
 
     overall = {
         "range": range_str,
@@ -1621,6 +1779,8 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "activePct5hSpent": active_pct_5h_spent,
         "forgivenPct5hSpent": forgiven_pct_5h_spent,
         "pctWeeklySpent": units_to_pct_week(tot_units, 2),
+        "pctGeminiWeeklySpent": units_to_pct_week(range_gem_units, 2),
+        "pct3pWeeklySpent": units_to_pct_week(range_3p_units, 2),
         "activePctWeekSpent": active_pct_wk_spent,
         "priorPctWeekSpent": prior_pct_wk_spent,
         "cycle5hLocalPct": local_5h_cycle_pct,
@@ -1875,83 +2035,93 @@ def print_cli_quota(data):
             reset_disp = r_str[:16]
         print(f"  {label:<34} {draw_bar(rem, 16)} {rem:>5.1f}%   {used:>6.1f}%   {C.DIM}{reset_disp:>12}{C.RESET}")
 
-    p = data.get("overall", {}).get("pacing")
-    if p:
-        r_str = p.get("wkResetTime", "")
-        reset_day = "cycle"
-        reset_disp = ""
-        if r_str:
-            try:
-                r_dt = datetime.fromisoformat(r_str.replace("Z", "+00:00")).astimezone()
-                reset_day = r_dt.strftime("%A")
-                diff = int((r_dt - now).total_seconds())
-                reset_disp = f"{diff//86400}d {(diff%86400)//3600}h" if diff > 86400 else f"{max(0,diff)//3600}h {(max(0,diff)%3600)//60}m"
-            except Exception:
-                reset_disp = r_str[:16]
-
-        fh_r_str = p.get("fhResetTime", "")
-        fh_reset_disp = ""
-        if fh_r_str:
-            try:
-                fh_dt = datetime.fromisoformat(fh_r_str.replace("Z", "+00:00")).astimezone()
-                diff_fh = int((fh_dt - now).total_seconds())
-                fh_reset_disp = f"{diff_fh//86400}d {(diff_fh%86400)//3600}h" if diff_fh > 86400 else f"{max(0,diff_fh)//3600}h {(max(0,diff_fh)%3600)//60}m"
-            except Exception:
-                fh_reset_disp = fh_r_str[:16]
-
-        pace_ratio = float(p.get("serverWkPaceRatio", 1.0))
-        if pace_ratio <= 0.85:
-            pace_pill = f"{C.BOLD}{C.GREEN}[HEALTHY PACING]{C.RESET}"
-            quota_color = C.GREEN
-            pct_slower = int(round((1.0 - pace_ratio) * 100))
-            velocity_desc = f"Using quota {pct_slower}% slower than week clock"
-            verdict_str = f"Safe buffer: At your current burn rate (~{p['serverWkRatePerDay']:.1f}%/day), you will only use ~{p['serverWkProjectedPct']:.1f}% of your weekly quota before the {reset_day} reset ({(100.0 - p['serverWkProjectedPct']):.1f}% headroom remaining)."
-        elif pace_ratio <= 1.10:
-            pace_pill = f"{C.BOLD}{C.YELLOW}[BALANCED PACE]{C.RESET}"
-            quota_color = C.YELLOW
-            if pace_ratio >= 1.0:
-                pct_diff = int(round((pace_ratio - 1.0) * 100))
-                velocity_desc = f"Using quota {pct_diff}% faster than week clock"
-            else:
-                pct_diff = int(round((1.0 - pace_ratio) * 100))
-                velocity_desc = f"Using quota {pct_diff}% slower than week clock"
-            verdict_str = f"Balanced pace: At your current burn rate (~{p['serverWkRatePerDay']:.1f}%/day), you are on track to use ~{p['serverWkProjectedPct']:.1f}% of your weekly quota before the {reset_day} reset."
-        else:
-            pace_pill = f"{C.BOLD}{C.RED}[HIGH BURN PACING]{C.RESET}"
-            quota_color = C.RED
-            pct_faster = int(round((pace_ratio - 1.0) * 100))
-            velocity_desc = f"Using quota {pct_faster}% faster than week clock"
-            verdict_str = f"High burn warning: At your current burn rate (~{p['serverWkRatePerDay']:.1f}%/day), you will exhaust your weekly quota (~{p['serverWkProjectedPct']:.1f}%) before the {reset_day} reset. Consider slowing down to {p['safeDailyBudgetLeft']:.1f}%/day."
+    p_root = data.get("overall", {}).get("pacing")
+    if p_root:
+        def _fmt_hrs_cli(h):
+            if h is None:
+                return "–"
+            total_m = max(1, int(round(h * 60)))
+            if total_m >= 1440:
+                return f"{total_m // 1440}d {(total_m % 1440) // 60}h"
+            if total_m >= 60:
+                return f"{total_m // 60}h {total_m % 60}m"
+            return f"{total_m}m"
 
         def _meter(pct, width=16, color=""):
             fill = int(round((min(max(pct, 0), 100) / 100.0) * width))
             emp = width - fill
             return f"{color}{'█' * fill}{C.DIM}{'░' * emp}{C.RESET}"
 
-        print(f"\n{C.BOLD}{C.CYAN}WEEKLY PACING & RUNWAY{C.RESET}")
-        print(f"{C.DIM}{'─' * 84}{C.RESET}")
-        print(f"  {pace_pill}  {C.BOLD}{pace_ratio:.1f}x burn velocity{C.RESET} ({velocity_desc})")
-        print()
-        print(f"  {C.BOLD}Comparative Progress:{C.RESET}")
-        time_bar = _meter(p['wkElapsedPct'], 16, C.DIM)
-        quota_bar = _meter(p['serverWkUsedPct'], 16, quota_color)
-        reset_suffix = f" · resets in {reset_disp}" if reset_disp else ""
-        print(f"    {'Time elapsed in cycle:':<26} {time_bar}  {p['wkElapsedPct']:>5.1f}% ({p['wkElapsedDays']:.1f} of 7.0 days{reset_suffix})")
-        print(f"    {'Quota pool used:':<26} {quota_bar}  {p['serverWkUsedPct']:>5.1f}% ({p['serverWkRemPct']:.1f}% remaining)")
-        print()
-        print(f"  {C.BOLD}Daily Allowance & Runway:{C.RESET}")
-        headroom = max(0.0, 100.0 - p['serverWkProjectedPct'])
-        print(f"    {'Safe daily speed limit:':<26} {C.GREEN}{p['safeDailyBudgetLeft']:.1f}% / day{C.RESET} (speed limit to last until reset)")
-        print(f"    {'Current burn rate:':<26} ~{p['serverWkRatePerDay']:.1f}% / day ({pace_ratio:.1f}x velocity vs 7-day clock)")
-        print(f"    {'Projected at reset:':<26} ~{p['serverWkProjectedPct']:.1f}% ({headroom:.1f}% headroom remaining)")
-        print()
-        print(f"  {C.BOLD}Verdict:{C.RESET}")
-        print(f"    {verdict_str}")
-        burst_refill = f" · Refills in {fh_reset_disp}" if fh_reset_disp else ""
-        print()
-        print(f"  {C.DIM}5-Hour Burst Pool: {p['server5hUsedPct']:.1f}% used · {p['server5hRemPct']:.1f}% available{burst_refill}{C.RESET}")
-        if p.get('otherWkUsedPct', 0) >= 1.0 or p.get('localWkUsedPct', 0) > 0:
-            print(f"  {C.DIM}Setup Attribution: This setup: {p['localWkUsedPct']:.2f}% | Other products / devices: {p['otherWkUsedPct']:.2f}%{C.RESET}")
+        pools_dict = p_root.get("pools") or {"gemini": p_root}
+        for pk in ("gemini", "3p"):
+            p = pools_dict.get(pk)
+            if not p or not p.get("available"):
+                continue
+            if pk == "3p" and p.get("serverWkUsedPct", 0) <= 0 and p.get("server5hUsedPct", 0) <= 0:
+                continue
+
+            wk_rem_h = float(p.get("wkRemainingHours", 24.0))
+            fh_rem_h = float(p.get("fhRemainingHours", 5.0))
+            reset_disp = _fmt_hrs_cli(wk_rem_h)
+            fh_reset_disp = _fmt_hrs_cli(fh_rem_h)
+            pace_ratio = float(p.get("serverWkPaceRatio", 1.0))
+            use_hr = wk_rem_h < 24.0
+            cur_rate = float(p.get("serverWkRatePerHour" if use_hr else "serverWkRatePerDay", 0.0))
+            safe_rate = float(p.get("safeHourlyBudgetLeft" if use_hr else "safeDailyBudgetLeft", 0.0))
+            unit_lbl = "hr" if use_hr else "day"
+
+            if float(p.get("serverWkRemPct", 100.0)) <= 0.05:
+                pace_pill = f"{C.BOLD}{C.RED}[EXHAUSTED]{C.RESET}"
+                quota_color = C.RED
+                runout_str = f"Already exhausted (0% left · resets in {reset_disp})"
+                adjust_str = "Wait for weekly reset or switch model pool"
+            elif p.get("wkWarmup"):
+                pace_pill = f"{C.BOLD}{C.CYAN}[WARMING UP]{C.RESET}"
+                quota_color = C.GREEN
+                runout_str = "Calibrating (fresh weekly cycle < 6h elapsed)"
+                adjust_str = f"Sustainable ceiling: <= {safe_rate:.1f}%/{unit_lbl} (~{p.get('estReqsLeft', 0):,} reqs left)"
+            elif p.get("wkUnkillable"):
+                pace_pill = f"{C.BOLD}{C.GREEN}[UNKILLABLE WK]{C.RESET}"
+                quota_color = C.GREEN
+                runout_str = f"Impossible before reset ({p['maxReachableAddWkPct']:.1f}% max burnable across {p['burstWindowsLeft']:.1f} burst windows)"
+                adjust_str = f"No weekly rationing needed — pace against 5h ceiling ({p['safe5hHourlyBudgetLeft']:.1f}%/hr)"
+            elif p.get("wkWillRunOut"):
+                pace_pill = f"{C.BOLD}{C.RED}[HIGH BURN {pace_ratio:.1f}x]{C.RESET}"
+                quota_color = C.RED
+                tte_s = _fmt_hrs_cli(p.get("wkTteHours"))
+                short_s = _fmt_hrs_cli(p.get("wkShortfallHours"))
+                cut_pct = max(1, int(round((1.0 - safe_rate / max(0.01, cur_rate)) * 100)))
+                runout_str = f"Yes — empties in ~{tte_s} ({short_s} before reset)"
+                adjust_str = f"Slow down by {cut_pct}% (to <= {safe_rate:.1f}%/{unit_lbl}, currently ~{cur_rate:.1f}%/{unit_lbl})"
+            elif p.get("serverWkUnclippedPct", 0) >= 85.0:
+                pace_pill = f"{C.BOLD}{C.YELLOW}[ON GLIDE PATH {pace_ratio:.1f}x]{C.RESET}"
+                quota_color = C.YELLOW
+                runout_str = f"Tracking ~{min(100.0, p['serverWkUnclippedPct']):.0f}% at reset"
+                adjust_str = f"Hold steady (ceiling {safe_rate:.1f}%/{unit_lbl})"
+            else:
+                pace_pill = f"{C.BOLD}{C.GREEN}[SAFE {pace_ratio:.1f}x]{C.RESET}"
+                quota_color = C.GREEN
+                unused = max(0.0, 100.0 - float(p.get("serverWkUnclippedPct", 0.0)))
+                runout_str = f"No — lands at ~{p['serverWkUnclippedPct']:.0f}% (~{unused:.0f}% unused at reset)"
+                if cur_rate >= (0.2 if use_hr else 1.5):
+                    mult = min(9.9, safe_rate / cur_rate)
+                    adjust_str = f"Can step up {mult:.1f}x (+{(safe_rate - cur_rate):.1f}%/{unit_lbl} to use 100%)"
+                else:
+                    adjust_str = f"Up to {safe_rate:.1f}%/{unit_lbl} available (~{p.get('estReqsLeft', 0):,} reqs left)"
+
+            print(f"\n{C.BOLD}{C.CYAN}PACING & RUNWAY · {p.get('fullName', pk).upper()}{C.RESET}")
+            print(f"{C.DIM}{'─' * 84}{C.RESET}")
+            print(f"  {pace_pill}  Weekly: {p['serverWkUsedPct']:.1f}% used ({p['serverWkRemPct']:.1f}% left · resets in {reset_disp})")
+            time_bar = _meter(p['wkElapsedPct'], 16, C.DIM)
+            quota_bar = _meter(p['serverWkUsedPct'], 16, quota_color)
+            print(f"    {'Week clock elapsed:':<24} {time_bar}  {p['wkElapsedPct']:>5.1f}%")
+            print(f"    {'Account quota used:':<24} {quota_bar}  {p['serverWkUsedPct']:>5.1f}%")
+            print(f"    {'Will it run out?:':<24} {runout_str}")
+            print(f"    {'Pace adjustment:':<24} {adjust_str}")
+            fh_note = f"Empties ~{_fmt_hrs_cli(p['fhShortfallHours'])} early!" if p.get("fhWillRunOut") else f"ceiling {p['safe5hHourlyBudgetLeft']:.1f}%/hr"
+            print(f"    {'5-Hour Burst:':<24} {p['server5hUsedPct']:.1f}% used · {p['server5hRemPct']:.1f}% left · refills in {fh_reset_disp} ({fh_note})")
+            if p.get('otherWkUsedPct', 0) >= 1.0 or p.get('localWkUsedPct', 0) > 0:
+                print(f"    {'Setup attribution:':<24} {C.DIM}This setup: {p['localWkUsedPct']:.2f}% | Other products / devices: {p['otherWkUsedPct']:.2f}%{C.RESET}")
 
 def print_cli_tokens(data, limit_days=10):
     ov = data["overall"]
@@ -5111,13 +5281,33 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
       </div>
 
+      <!-- Pacing Coach & Forecast Style -->
+      <div class="form-section">
+        <div class="form-section-title">Quota Pacing &amp; Coach Style</div>
+        <div class="form-desc">Choose how 5-hour &amp; weekly pacing guidance appears on Overview and Quota (also toggleable directly on the card):</div>
+        <div class="radio-pill-group">
+          <label class="radio-pill-label">
+            <input type="radio" name="settingPacingStyle" value="fun" id="settingPacingFun" checked>
+            <span>Fun Coach (Default)</span>
+          </label>
+          <label class="radio-pill-label">
+            <input type="radio" name="settingPacingStyle" value="straight" id="settingPacingStraight">
+            <span>Straight Numbers</span>
+          </label>
+          <label class="radio-pill-label">
+            <input type="radio" name="settingPacingStyle" value="minimal" id="settingPacingMinimal">
+            <span>Minimal (Zero Pressure)</span>
+          </label>
+        </div>
+      </div>
+
       <!-- Overview & Summary Display Sections -->
       <div class="form-section">
         <div class="form-section-title">Overview &amp; Summary Display</div>
         <div class="form-desc">Choose which sections are displayed on the Overview summary card &amp; CLI report (sidebar navigation tabs always remain accessible):</div>
         <div class="checkbox-grid">
           <label class="checkbox-row"><input type="checkbox" class="setting-cli-toggle" value="summary" checked> <span>Summary &amp; KPI Totals</span></label>
-          <label class="checkbox-row"><input type="checkbox" class="setting-cli-toggle" value="quota" checked> <span>Quota &amp; Weekly Pacing</span></label>
+          <label class="checkbox-row"><input type="checkbox" class="setting-cli-toggle" value="quota" checked> <span>Quota &amp; Pacing</span></label>
           <label class="checkbox-row"><input type="checkbox" class="setting-cli-toggle" value="models" checked> <span>Token Spend &amp; Models</span></label>
           <label class="checkbox-row"><input type="checkbox" class="setting-cli-toggle" value="days" checked> <span>Activity &amp; Daily Ledger</span></label>
           <label class="checkbox-row"><input type="checkbox" class="setting-cli-toggle" value="sessions" checked> <span>Top Sessions Leaderboard</span></label>
@@ -5193,6 +5383,14 @@ let G_LAST_SYNCED_AT = null;
 let G_PREV_STAT_VALUES = new Map();
 let G_INITIAL_REVEALED = false;
 let G_SYNC_PHASE = "syncing";
+let G_PACING_POOL = "gemini";
+let G_PACING_STYLE = (() => {
+  try {
+    const s = localStorage.getItem("agy-stats-pacing-style");
+    return (s === "fun" || s === "straight" || s === "minimal") ? s : "fun";
+  } catch (e) { return "fun"; }
+})();
+let G_PACING_QUIP_IDX = 0;
 
 function initSkeletons() {
   document.querySelectorAll("[data-table-skel]").forEach(el => {
@@ -5340,6 +5538,48 @@ function fmtResetIn(isoStr) {
   if (diff <= 0) return "refreshing";
   if (diff >= 86400) return `${Math.floor(diff / 86400)}d ${Math.floor((diff % 86400) / 3600)}h`;
   return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)}m`;
+}
+function fmtHoursJS(h) {
+  if (h === null || h === undefined || isNaN(h)) return "–";
+  const totalM = Math.max(1, Math.round(Number(h) * 60));
+  if (totalM >= 1440) return `${Math.floor(totalM / 1440)}d ${Math.floor((totalM % 1440) / 60)}h`;
+  if (totalM >= 60) return `${Math.floor(totalM / 60)}h ${totalM % 60}m`;
+  return `${totalM}m`;
+}
+function setPacingPool(poolKey) {
+  if (poolKey !== "gemini" && poolKey !== "3p") return;
+  G_PACING_POOL = poolKey;
+  renderPacingSection("overviewPacingBody");
+  renderPacingSection("quotaPacingBody");
+  syncSegmentedThumbs();
+}
+function setPacingStyle(styleKey, persist = true) {
+  if (styleKey !== "fun" && styleKey !== "straight" && styleKey !== "minimal") return;
+  G_PACING_STYLE = styleKey;
+  try { localStorage.setItem("agy-stats-pacing-style", styleKey); } catch (e) {}
+  const rFun = document.getElementById("settingPacingFun");
+  const rStr = document.getElementById("settingPacingStraight");
+  const rMin = document.getElementById("settingPacingMinimal");
+  if (rFun) rFun.checked = (styleKey === "fun");
+  if (rStr) rStr.checked = (styleKey === "straight");
+  if (rMin) rMin.checked = (styleKey === "minimal");
+  if (persist) {
+    if (G_SETTINGS && G_SETTINGS.web) G_SETTINGS.web.pacing_style = styleKey;
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Stats": "1" },
+      body: JSON.stringify({ web: { pacing_style: styleKey } })
+    }).catch(() => {});
+  }
+  renderPacingSection("overviewPacingBody");
+  renderPacingSection("quotaPacingBody");
+  syncSegmentedThumbs();
+}
+function cyclePacingQuip() {
+  G_PACING_QUIP_IDX = (G_PACING_QUIP_IDX + 1) % 12;
+  renderPacingSection("overviewPacingBody");
+  renderPacingSection("quotaPacingBody");
+  syncSegmentedThumbs();
 }
 function toLocalDatetimeValue(ms) {
   const d = new Date(ms);
@@ -5500,12 +5740,16 @@ function renderDynamicOverview() {
   } else {
     footWk = `${Re(ov.conversationTokens)} tokens`;
   }
+  const has3pRange = Number(ov.pct3pWeeklySpent || 0) > 0;
+  const footWkTitle = has3pRange
+    ? `Gemini: ${ov.pctGeminiWeeklySpent}% wk · Claude/GPT: ${ov.pct3pWeeklySpent}% wk — ${footWk}`
+    : footWk;
 
   document.getElementById("primaryStatGrid").innerHTML = `
     <div class="stat">
       <div class="stat-label">Weekly quota</div>
       <div class="stat-value" style="color:var(--chart-primary);">${ov.pctWeeklySpent}%</div>
-      <div class="stat-foot"><span class="truncate" title="${esc(footWk)}">${esc(footWk)}</span></div>
+      <div class="stat-foot"><span class="truncate" title="${esc(footWkTitle)}">${esc(footWk)}</span></div>
       <div class="stat-spark">${renderSparklineSVG(qWkSpark, "var(--chart-primary)")}</div>
     </div>
 
@@ -5549,6 +5793,17 @@ function renderDynamicOverview() {
   renderDynamicLatestRequests();
 }
 
+function _poolHealthTone(po) {
+  if (!po) return "neutral";
+  if (Number(po.serverWkRemPct ?? 100) <= 0.05 || Number(po.server5hRemPct ?? 100) <= 0.05 || po.wkWillRunOut || po.fhWillRunOut) {
+    return "bad";
+  }
+  if (Number(po.serverWkUnclippedPct || 0) >= 85 || Number(po.server5hUnclippedPct || 0) >= 85) {
+    return "warn";
+  }
+  return "ok";
+}
+
 function renderPacingSection(targetId) {
   const el = document.getElementById(targetId);
   if (!el || !G_OVERVIEW_DATA?.overall) return;
@@ -5557,168 +5812,456 @@ function renderPacingSection(targetId) {
     return;
   }
   const ov = G_OVERVIEW_DATA.overall;
-  const p = ov.pacing;
-  const showSplit = (Number(p.otherWkUsedPct || 0) >= 1.0 && Number(p.localWkUsedPct || 0) > 0) || (Number(p.otherWkUsedPct || 0) >= 1.0);
+  const pools = ov.pacing.pools || { gemini: ov.pacing };
+  const has3p = !!(pools["3p"] && pools["3p"].available);
+  if (G_PACING_POOL === "3p" && !has3p) G_PACING_POOL = "gemini";
+  const p = pools[G_PACING_POOL] || pools.gemini || ov.pacing;
+  const styleMode = (G_PACING_STYLE === "straight" || G_PACING_STYLE === "minimal") ? G_PACING_STYLE : "fun";
 
-  const paceRatio = Number(p.serverWkPaceRatio || 1.0);
-  let paceStatus = "HEALTHY PACING";
-  let paceTone = "ok";
-  let velocityDesc = "";
-  let quotaColor = "var(--ok)";
+  const gemTone = _poolHealthTone(pools.gemini);
+  const tpTone = _poolHealthTone(pools["3p"]);
 
-  if (paceRatio <= 0.85) {
-    paceStatus = "HEALTHY PACING";
-    paceTone = "ok";
-    quotaColor = "var(--ok)";
-    const pctSlower = Math.round((1.0 - paceRatio) * 100);
-    velocityDesc = `Using quota ${pctSlower}% slower than week clock`;
-  } else if (paceRatio <= 1.10) {
-    paceStatus = "BALANCED PACE";
-    paceTone = "warn";
-    quotaColor = "var(--warn)";
-    if (paceRatio >= 1.0) {
-      const pctFaster = Math.round((paceRatio - 1.0) * 100);
-      velocityDesc = `Using quota ${pctFaster}% faster than week clock`;
-    } else {
-      const pctSlower = Math.round((1.0 - paceRatio) * 100);
-      velocityDesc = `Using quota ${pctSlower}% slower than week clock`;
-    }
-  } else {
-    paceStatus = "HIGH BURN PACING";
-    paceTone = "bad";
-    quotaColor = "var(--bad)";
-    const pctFaster = Math.round((paceRatio - 1.0) * 100);
-    velocityDesc = `Using quota ${pctFaster}% faster than week clock`;
-  }
-
-  let resetDay = "cycle";
+  let resetDay = "reset";
   if (p.wkResetTime) {
     try {
       const d = new Date(p.wkResetTime);
-      if (!isNaN(d.getTime())) {
-        resetDay = d.toLocaleDateString("en-US", { weekday: "long" });
-      }
+      if (!isNaN(d.getTime())) resetDay = d.toLocaleDateString("en-US", { weekday: "long" });
     } catch (e) {}
   }
 
-  const headroom = Math.max(0, 100 - p.serverWkProjectedPct).toFixed(1);
-  let verdictHtml = "";
-  if (paceTone === "ok") {
-    verdictHtml = `<strong>Safe buffer:</strong> At your current burn rate (~${p.serverWkRatePerDay}%/day), you will only use ~${p.serverWkProjectedPct}% of your weekly quota before the ${resetDay} reset (${headroom}% headroom remaining).`;
-  } else if (paceTone === "warn") {
-    verdictHtml = `<strong>Balanced pace:</strong> At your current burn rate (~${p.serverWkRatePerDay}%/day), you are on track to use ~${p.serverWkProjectedPct}% of your weekly quota before the ${resetDay} reset.`;
+  const resetDisp = fmtResetIn(p.wkResetTime);
+  const burstRefill = fmtResetIn(p.fhResetTime);
+  const poolLabel = p.label || (G_PACING_POOL === "3p" ? "Claude / GPT" : "Gemini");
+
+  // 5-Hour Burst metrics
+  const fhUsed = Number(p.server5hUsedPct ?? 0);
+  const fhRem = Number(p.server5hRemPct ?? Math.max(0, 100 - fhUsed));
+  const fhExhausted = fhRem <= 0.05;
+  const fhWarmup = !!p.fhWarmup && !fhExhausted;
+  const fhRunOut = !!p.fhWillRunOut && !fhExhausted;
+  const fhProjUnclipped = Number(p.server5hUnclippedPct ?? fhUsed);
+  const fhProj = Number(p.server5hProjectedPct ?? Math.min(100, fhProjUnclipped));
+  const fhRatio = Number(p.server5hPaceRatio ?? 0);
+  const fhRateHr = Number(p.server5hRatePerHour ?? 0);
+  const fhSafeHr = Number(p.safe5hHourlyBudgetLeft ?? 20);
+  const fhCutPct = Math.min(99, Math.max(1, Math.round((1 - (fhSafeHr / Math.max(0.01, fhRateHr))) * 100)));
+  const fhLocalW = Math.min(100, Math.max(0, Number(p.local5hUsedPct || 0)));
+  const fhOtherW = Math.min(100 - fhLocalW, Math.max(0, Number(p.other5hUsedPct || 0)));
+  const fhHasDualSeg = fhLocalW > 0.05 && fhOtherW >= 1.0;
+
+  let fhTone = "ok";
+  let fhBadge = `SAFE · ${fhRatio.toFixed(1)}x`;
+  let fhBarColor = "var(--ok)";
+  let fhWillRunOutHtml = "";
+  let fhAdjustHtml = "";
+
+  if (fhExhausted) {
+    fhTone = "bad";
+    fhBadge = "EXHAUSTED";
+    fhBarColor = "var(--bad)";
+    fhWillRunOutHtml = `<strong style="color:var(--bad);">Exhausted (0% left)</strong> <span class="dim">· refills in ${esc(burstRefill)}</span>`;
+    fhAdjustHtml = `<strong>Paused until refill</strong> <span class="dim">· switch model pool or wait ${esc(burstRefill)}</span>`;
+  } else if (fhWarmup) {
+    fhTone = "neutral";
+    fhBadge = "FRESH WINDOW";
+    fhBarColor = "var(--ok)";
+    fhWillRunOutHtml = `<strong>Calibrating</strong> <span class="dim">· 5h window just started</span>`;
+    fhAdjustHtml = `Ceiling <strong>&lt;= ${fhSafeHr.toFixed(1)}%/hr</strong> <span class="dim">· ~${Re(p.est5hReqsLeft)} avg reqs in tank</span>`;
+  } else if (fhRunOut) {
+    fhTone = "bad";
+    fhBadge = `HOT · ${fhRatio.toFixed(1)}x`;
+    fhBarColor = "var(--bad)";
+    const fhTte = fmtHoursJS(p.fhTteHours);
+    const fhShort = fmtHoursJS(p.fhShortfallHours);
+    fhWillRunOutHtml = `<strong style="color:var(--bad);">Yes — in ~${esc(fhTte)}</strong> <span class="dim">(${esc(fhShort)} before refill)</span>`;
+    fhAdjustHtml = `<strong style="color:var(--bad);">Slow down by ${fhCutPct}%</strong> <span class="dim">(to &lt;= ${fhSafeHr.toFixed(1)}%/hr, now ~${fhRateHr.toFixed(1)}%/hr)</span>`;
+  } else if (fhProjUnclipped >= 85) {
+    fhTone = "warn";
+    fhBadge = `ACTIVE · ${fhRatio.toFixed(1)}x`;
+    fhBarColor = "var(--warn)";
+    fhWillRunOutHtml = `<strong>Tight</strong> <span class="dim">· lands near ~${fhProj.toFixed(0)}% by refill</span>`;
+    fhAdjustHtml = `<strong>Hold steady</strong> <span class="dim">(&lt;= ${fhSafeHr.toFixed(1)}%/hr · ~${Re(p.est5hReqsLeft)} reqs left)</span>`;
   } else {
-    verdictHtml = `<strong>High burn warning:</strong> At your current burn rate (~${p.serverWkRatePerDay}%/day), you will exhaust your weekly quota (~${p.serverWkProjectedPct}%) before the ${resetDay} reset. Consider slowing down to ${p.safeDailyBudgetLeft}%/day.`;
+    fhTone = "ok";
+    fhBadge = `SAFE · ${fhRatio.toFixed(1)}x`;
+    fhBarColor = "var(--ok)";
+    fhWillRunOutHtml = `<strong>No</strong> <span class="dim">· ~${fhProj.toFixed(0)}% used by refill</span>`;
+    const fhMult = fhRateHr >= 0.8 ? (fhSafeHr / fhRateHr) : 99;
+    const fhDelta = Math.max(0, fhSafeHr - fhRateHr).toFixed(1);
+    if (fhMult >= 1.15 && fhMult <= 12.0) {
+      fhAdjustHtml = `<strong>Can step up ${fhMult.toFixed(1)}x</strong> <span class="dim">(+${fhDelta}%/hr to ${fhSafeHr.toFixed(1)}%/hr · ~${Re(p.est5hReqsLeft)} reqs)</span>`;
+    } else {
+      fhAdjustHtml = `Room up to <strong>${fhSafeHr.toFixed(1)}%/hr</strong> <span class="dim">(~${Re(p.est5hReqsLeft)} avg reqs left)</span>`;
+    }
   }
 
-  const localW = Math.min(100, Math.max(0, p.localWkUsedPct));
-  const otherW = Math.min(100 - localW, Math.max(0, p.otherWkUsedPct));
-  const serverW = Math.min(100, Math.max(0, p.serverWkUsedPct));
-  const clockPos = Math.min(100, Math.max(0, p.wkElapsedPct));
-  const resetDisp = fmtResetIn(p.wkResetTime);
-  const burstUsed = Number(p.server5hUsedPct ?? 0).toFixed(1);
-  const burstAvail = Number(p.server5hRemPct ?? (100 - burstUsed)).toFixed(1);
-  const burstRefill = fmtResetIn(p.fhResetTime);
+  // Weekly Endurance metrics
+  const wkUsed = Number(p.serverWkUsedPct ?? 0);
+  const wkRem = Number(p.serverWkRemPct ?? Math.max(0, 100 - wkUsed));
+  const wkExhausted = wkRem <= 0.05;
+  const wkWarmup = !!p.wkWarmup && !wkExhausted;
+  const wkUnkillable = !!p.wkUnkillable && !wkExhausted;
+  const wkRunOut = !!p.wkWillRunOut && !wkExhausted;
+  const wkProjUnclipped = Number(p.serverWkUnclippedPct ?? wkUsed);
+  const wkProj = Number(p.serverWkProjectedPct ?? Math.min(100, wkProjUnclipped));
+  const wkRatio = Number(p.serverWkPaceRatio ?? 0);
+  const wkRemH = Number(p.wkRemainingHours ?? 24);
+  const useWkHr = wkRemH < 24.0;
+  const wkCurRate = Number(useWkHr ? p.serverWkRatePerHour : p.serverWkRatePerDay);
+  const wkSafeRate = Number(useWkHr ? p.safeHourlyBudgetLeft : p.safeDailyBudgetLeft);
+  const wkUnit = useWkHr ? "hr" : "day";
+  const wkDigits = useWkHr ? 2 : 1;
+  const wkCurStr = `~${wkCurRate.toFixed(wkDigits)}%/${wkUnit}`;
+  const wkTargetStr = `${wkSafeRate.toFixed(wkDigits)}%/${wkUnit}`;
+  const wkCutPct = Math.min(99, Math.max(1, Math.round((1 - (wkSafeRate / Math.max(0.01, wkCurRate))) * 100)));
+  const wkLocalW = Math.min(100, Math.max(0, Number(p.localWkUsedPct || 0)));
+  const wkOtherW = Math.min(100 - wkLocalW, Math.max(0, Number(p.otherWkUsedPct || 0)));
+  const wkHasDualSeg = wkLocalW > 0.05 && wkOtherW >= 1.0;
 
-  el.innerHTML = `
-    <div class="stack" style="gap:14px;">
-      <!-- Pacing Health Card Header -->
-      <div class="row" style="justify-content:space-between; flex-wrap:wrap; gap:10px; align-items:center;">
-        <div class="row" style="gap:10px; align-items:center; flex-wrap:wrap;">
-          <strong style="font-size:14px; letter-spacing:-.005em;">Weekly Quota Pacing & Runway</strong>
-          <span class="badge" data-tone="${paceTone}" style="font-weight:600; letter-spacing:0.03em; font-size:11px;">${esc(paceStatus)}</span>
-          <span class="mono dim micro">Cycle started ${esc(ov.wkCycleSince || "this week")}</span>
-        </div>
-        <div class="row mono micro" style="gap:8px; align-items:center; flex-wrap:wrap;">
-          <strong style="color:var(--ink-1); font-size:13px;">${paceRatio.toFixed(1)}x burn velocity</strong>
-          <span class="dim">(${esc(velocityDesc)})</span>
-        </div>
+  let wkTone = "ok";
+  let wkBadge = `SAFE · ${wkRatio.toFixed(1)}x`;
+  let wkBarColor = "var(--ok)";
+  let wkWillRunOutHtml = "";
+  let wkAdjustHtml = "";
+
+  if (wkExhausted) {
+    wkTone = "bad";
+    wkBadge = "EXHAUSTED";
+    wkBarColor = "var(--bad)";
+    wkWillRunOutHtml = `<strong style="color:var(--bad);">Exhausted (0% left)</strong> <span class="dim">· resets in ${esc(resetDisp)}</span>`;
+    wkAdjustHtml = `<strong>Wait for weekly reset</strong> <span class="dim">· or switch model pool</span>`;
+  } else if (wkWarmup) {
+    wkTone = "neutral";
+    wkBadge = "WARMING UP";
+    wkBarColor = "var(--ok)";
+    wkWillRunOutHtml = `<strong>Calibrating</strong> <span class="dim">· cycle started &lt; 6h ago</span>`;
+    wkAdjustHtml = `Ceiling <strong>&lt;= ${esc(wkTargetStr)}</strong> <span class="dim">· ~${Re(p.estReqsLeft)} reqs (~${p.burstTanksEquivLeft} tanks)</span>`;
+  } else if (wkUnkillable) {
+    wkTone = "ok";
+    wkBadge = "UNKILLABLE";
+    wkBarColor = "var(--ok)";
+    wkWillRunOutHtml = `<strong style="color:var(--ok);">Impossible before reset</strong> <span class="dim">(${p.maxReachableAddWkPct}% physical max in ${p.burstWindowsLeft} windows)</span>`;
+    wkAdjustHtml = `<strong>No weekly rationing needed</strong> <span class="dim">· 5h cap governs (~${Re(p.estReqsLeft)} reqs left)</span>`;
+  } else if (wkRunOut) {
+    wkTone = "bad";
+    wkBadge = `HIGH BURN · ${wkRatio.toFixed(1)}x`;
+    wkBarColor = "var(--bad)";
+    const wkTte = fmtHoursJS(p.wkTteHours);
+    const wkShort = fmtHoursJS(p.wkShortfallHours);
+    wkWillRunOutHtml = `<strong style="color:var(--bad);">Yes — in ~${esc(wkTte)}</strong> <span class="dim">(${esc(wkShort)} before reset)</span>`;
+    wkAdjustHtml = `<strong style="color:var(--bad);">Slow down by ${wkCutPct}%</strong> <span class="dim">(to &lt;= ${esc(wkTargetStr)}, now ${esc(wkCurStr)} · ~${Re(p.estReqsLeft)} reqs)</span>`;
+  } else if (wkProjUnclipped >= 85) {
+    wkTone = "warn";
+    wkBadge = `ON TARGET · ${wkRatio.toFixed(1)}x`;
+    wkBarColor = "var(--warn)";
+    const buf = Math.max(0, 100 - wkProj).toFixed(0);
+    wkWillRunOutHtml = `<strong>No</strong> <span class="dim">· lands near ~${wkProj.toFixed(0)}% at reset (~${buf}% buffer)</span>`;
+    wkAdjustHtml = `<strong>Hold steady</strong> <span class="dim">(${esc(wkCurStr)} vs ${esc(wkTargetStr)} ceiling · ~${Re(p.estReqsLeft)} reqs)</span>`;
+  } else {
+    wkTone = "ok";
+    wkBadge = `UNDER PACE · ${wkRatio.toFixed(1)}x`;
+    wkBarColor = "var(--ok)";
+    const unused = Math.max(0, 100 - wkProj).toFixed(0);
+    wkWillRunOutHtml = `<strong>No</strong> <span class="dim">· ~${wkProj.toFixed(0)}% at reset (~${unused}% unused)</span>`;
+    const minActive = useWkHr ? 0.12 : 1.2;
+    const wkMult = wkCurRate >= minActive ? (wkSafeRate / wkCurRate) : 99;
+    const wkDelta = Math.max(0, wkSafeRate - wkCurRate).toFixed(wkDigits);
+    if (wkMult >= 1.15 && wkMult <= 12.0) {
+      wkAdjustHtml = `<strong>Can step up ${wkMult.toFixed(1)}x</strong> <span class="dim">(+${wkDelta}%/${wkUnit} to ${esc(wkTargetStr)} · ~${Re(p.estReqsLeft)} reqs)</span>`;
+    } else {
+      wkAdjustHtml = `Room up to <strong>${esc(wkTargetStr)}</strong> <span class="dim">(~${Re(p.estReqsLeft)} reqs / ~${p.burstTanksEquivLeft} tanks left)</span>`;
+    }
+  }
+
+  // Header controls HTML (shared across all 3 display styles)
+  const headerHtml = `
+    <div class="row" style="justify-content:space-between; flex-wrap:wrap; gap:10px; align-items:center;">
+      <div class="row" style="gap:8px; align-items:center; flex-wrap:wrap;">
+        <strong style="font-size:14px; letter-spacing:-.005em;">Quota Pacing &amp; Runway</strong>
+        <span class="mono dim micro">Cycle started ${esc(p.wkCycleSince || ov.wkCycleSince || "this week")}</span>
       </div>
-
-      <!-- Dual Comparative Meter -->
-      <div style="display:flex; flex-direction:column; gap:10px; padding:12px 14px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control);">
-        <!-- Time elapsed bar (Neutral) -->
-        <div style="display:flex; flex-direction:column; gap:5px;">
-          <div class="row" style="justify-content:space-between; font-size:12px;">
-            <span style="color:var(--ink-2); display:flex; align-items:center; gap:6px;">
-              <span class="swatch" style="background:var(--ink-3); border-radius:2px;"></span>
-              <strong>Time elapsed in cycle</strong>
-            </span>
-            <span class="mono" style="color:var(--ink-2);">
-              <strong style="color:var(--ink-1);">${p.wkElapsedPct}%</strong> (${p.wkElapsedDays.toFixed(1)} of 7.0 days${resetDisp ? ` · resets in ${esc(resetDisp)}` : ""})
-            </span>
+      <div class="row" style="gap:8px; align-items:center; flex-wrap:wrap;">
+        ${has3p ? `
+          <div class="segmented" data-size="sm">
+            <button type="button" class="segmented-option" data-active="${G_PACING_POOL === 'gemini'}" onclick="setPacingPool('gemini')" title="Gemini weekly &amp; 5-hour quota pool">
+              <span class="dot" data-tone="${gemTone}" style="width:6px;height:6px;"></span>
+              <span>Gemini</span>
+              <span class="mono micro dim">${Math.round(Number(pools.gemini?.serverWkUsedPct || 0))}%</span>
+            </button>
+            <button type="button" class="segmented-option" data-active="${G_PACING_POOL === '3p'}" onclick="setPacingPool('3p')" title="Claude &amp; GPT weekly &amp; 5-hour quota pool">
+              <span class="dot" data-tone="${tpTone}" style="width:6px;height:6px;"></span>
+              <span>Claude/GPT</span>
+              <span class="mono micro dim">${Math.round(Number(pools['3p']?.serverWkUsedPct || 0))}%</span>
+            </button>
           </div>
-          <div style="height:8px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
-            <div style="width:${clockPos}%; height:100%; background:var(--ink-3); border-radius:var(--r-pill);" title="Week clock elapsed: ${p.wkElapsedPct}%"></div>
-          </div>
-        </div>
-
-        <!-- Quota used bar (Color-coded) -->
-        <div style="display:flex; flex-direction:column; gap:5px;">
-          <div class="row" style="justify-content:space-between; font-size:12px;">
-            <span style="color:var(--ink-2); display:flex; align-items:center; gap:6px;">
-              <span class="swatch" style="background:${quotaColor}; border-radius:2px;"></span>
-              <strong>Account quota used</strong>
-            </span>
-            <span class="mono">
-              <strong style="color:${quotaColor};">${p.serverWkUsedPct}%</strong>
-              <span style="color:var(--ink-3);">(${p.serverWkRemPct}% remaining)</span>
-            </span>
-          </div>
-          <div style="height:10px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
-            ${showSplit ? `
-              <div style="width:${localW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
-              <div style="width:${otherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
-            ` : `
-              <div style="width:${serverW}%; height:100%; background:${quotaColor}; border-radius:var(--r-pill);" title="Account quota used: ${p.serverWkUsedPct}%"></div>
-            `}
-          </div>
-          ${showSplit ? `
-            <div class="row micro dim" style="gap:12px; margin-top:2px;">
-              <span><span class="swatch" style="background:var(--chart-primary);"></span> This setup: <strong class="mono" style="color:var(--ink-1);">${p.localWkUsedPct}%</strong></span>
-              <span><span class="swatch" style="background:var(--chart-secondary);"></span> Other products / devices: <strong class="mono" style="color:var(--ink-1);">${p.otherWkUsedPct}%</strong></span>
-            </div>
-          ` : ""}
-        </div>
-      </div>
-
-      <!-- Daily Allowance & Runway Strip -->
-      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;">
-        <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:4px;">
-          <div class="section-label" style="margin-bottom:0; font-size:11.5px;">Safe daily speed limit</div>
-          <div class="mono" style="font-size:19px; font-weight:600; color:var(--ok);">${p.safeDailyBudgetLeft}% / day</div>
-          <div class="micro dim">Speed limit to last until reset</div>
-        </div>
-
-        <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:4px;">
-          <div class="section-label" style="margin-bottom:0; font-size:11.5px;">Current burn rate</div>
-          <div class="mono" style="font-size:19px; font-weight:600; color:var(--ink-1);">~${p.serverWkRatePerDay}% / day</div>
-          <div class="micro dim">${p.serverWkPaceRatio}x pace vs 7-day clock</div>
-        </div>
-
-        <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:4px;">
-          <div class="section-label" style="margin-bottom:0; font-size:11.5px;">Projected at reset</div>
-          <div class="mono" style="font-size:19px; font-weight:600; color:${paceTone === 'bad' ? 'var(--bad)' : 'var(--ink-1)'};">~${p.serverWkProjectedPct}%</div>
-          <div class="micro dim">${headroom}% headroom remaining</div>
-        </div>
-      </div>
-
-      <!-- Actionable Plain-English Verdict -->
-      <div style="padding:10px 12px; border-left:3px solid ${quotaColor}; background:var(--raised); border-radius:4px; font-size:12.5px; line-height:1.45; color:var(--ink-1);">
-        ${verdictHtml}
-      </div>
-
-      <!-- Clean Secondary 5-Hour Burst Strip -->
-      <div class="row micro" style="justify-content:space-between; flex-wrap:wrap; gap:8px; padding-top:2px; color:var(--ink-3);">
-        <div class="row" style="gap:6px; align-items:center;">
-          <span class="dot" data-tone="${p.server5hUsedPct > 80 ? 'bad' : 'ok'}"></span>
-          <span style="color:var(--ink-2); font-weight:500;">5-Hour Burst Pool:</span>
-          <span class="mono">${burstUsed}% used · ${burstAvail}% available · Refills in ${esc(burstRefill)}</span>
-          ${Number(p.local5hUsedPct || 0) > 0 && Number(p.other5hUsedPct || 0) >= 1.0 ? `<span class="dim">(${p.local5hUsedPct}% this setup)</span>` : ""}
+        ` : ""}
+        <div class="segmented" data-size="sm" title="Switch pacing guidance style">
+          <button type="button" class="segmented-option" data-active="${styleMode === 'fun'}" onclick="setPacingStyle('fun')">Fun</button>
+          <button type="button" class="segmented-option" data-active="${styleMode === 'straight'}" onclick="setPacingStyle('straight')">Straight</button>
+          <button type="button" class="segmented-option" data-active="${styleMode === 'minimal'}" onclick="setPacingStyle('minimal')">Minimal</button>
         </div>
       </div>
     </div>
   `;
+
+  if (styleMode === "minimal") {
+    const minFhW = Math.min(100, Math.max(0, fhUsed));
+    const minWkW = Math.min(100, Math.max(0, wkUsed));
+    el.innerHTML = `
+      <div class="stack" style="gap:12px;">
+        ${headerHtml}
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px;">
+          <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px;">
+            <div class="row" style="justify-content:space-between; font-size:12px;">
+              <span style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · 5-Hour Burst</span>
+              <span class="mono"><strong style="color:var(--ink-1);">${fhUsed.toFixed(1)}%</strong> <span class="dim">(${fhRem.toFixed(1)}% left · ${esc(burstRefill)})</span></span>
+            </div>
+            <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
+              <div style="width:${minFhW}%; height:100%; background:${fhUsed >= 90 ? 'var(--bad)' : 'var(--chart-primary)'}; border-radius:var(--r-pill);"></div>
+            </div>
+          </div>
+          <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px;">
+            <div class="row" style="justify-content:space-between; font-size:12px;">
+              <span style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · Weekly Pool</span>
+              <span class="mono"><strong style="color:var(--ink-1);">${wkUsed.toFixed(1)}%</strong> <span class="dim">(${wkRem.toFixed(1)}% left · ${esc(resetDisp)})</span></span>
+            </div>
+            <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
+              ${wkHasDualSeg ? `
+                <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
+                <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
+              ` : `
+                <div style="width:${minWkW}%; height:100%; background:${wkUsed >= 90 ? 'var(--bad)' : 'var(--chart-primary)'}; border-radius:var(--r-pill);"></div>
+              `}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    syncSegmentedThumbs();
+    return;
+  }
+
+  // Build Coach ("Fun") quips & "Straight" summary line
+  let coachTone = "ok";
+  let coachColor = "var(--ok)";
+  let quips = [];
+  let straightSummary = "";
+
+  if (wkExhausted || fhExhausted) {
+    coachTone = "bad";
+    coachColor = "var(--bad)";
+    const which = wkExhausted ? `weekly (${resetDisp})` : `5-hour burst (${burstRefill})`;
+    quips = [
+      `To squeeze another token out of ${poolLabel} right now, you have to wait out the ${which} clock — this tank is officially at 0.0%.`,
+      `To keep shipping while ${poolLabel} recharges (${which}), you have to flip over to your other model pool or grab a well-earned coffee.`,
+      `To get past a 0% ${poolLabel} gauge, you have to let time do its thing — fresh quota drops in ${wkExhausted ? resetDisp : burstRefill}.`
+    ];
+    straightSummary = `${poolLabel} ${wkExhausted ? "weekly" : "5-hour"} pool is at 0% remaining. Resets in ${wkExhausted ? resetDisp : burstRefill}.`;
+  } else if (wkRunOut) {
+    coachTone = "bad";
+    coachColor = "var(--bad)";
+    const wkTte = fmtHoursJS(p.wkTteHours);
+    const wkShort = fmtHoursJS(p.wkShortfallHours);
+    quips = [
+      `To survive until ${resetDay}'s ${poolLabel} reset without eating 429s, you have to trim burn by ${wkCutPct}% (down to <= ${wkTargetStr}) — otherwise the tank goes dry in ~${wkTte}.`,
+      `To keep ${poolLabel} alive for the next ${resetDisp}, you have to downshift from ${wkCurStr} to ${wkTargetStr}, or prepare to touch grass ~${wkShort} before reset.`,
+      `To make ${wkRem.toFixed(1)}% ${poolLabel} quota stretch across ${resetDisp}, you have to ration like a Mars rover (~${Re(p.estReqsLeft)} avg reqs left in the reserve tank).`,
+      `To dodge the ${poolLabel} quota wall arriving ~${wkShort} early, you have to route routine turns to lighter tiers and hold spend under ${wkTargetStr}.`
+    ];
+    straightSummary = `Weekly ${poolLabel} will exhaust in ~${wkTte} (${wkShort} before reset) at ${wkCurStr}. Reduce burn by ${wkCutPct}% to <= ${wkTargetStr}.`;
+  } else if (fhRunOut) {
+    coachTone = "bad";
+    coachColor = "var(--bad)";
+    const fhTte = fmtHoursJS(p.fhTteHours);
+    const fhShort = fmtHoursJS(p.fhShortfallHours);
+    quips = [
+      `To avoid a mandatory pit stop in ~${fhTte}, you have to cool your 5h ${poolLabel} burn by ${fhCutPct}% (<= ${fhSafeHr.toFixed(1)}%/hr until the ${burstRefill} refill).`,
+      `To reach the 5h ${poolLabel} refill without hitting the rev limiter, you have to ease off from ~${fhRateHr.toFixed(1)}%/hr to ${fhSafeHr.toFixed(1)}%/hr (weekly pool is still safe at ${wkRem.toFixed(1)}% left).`,
+      `To stop your 5h ${poolLabel} burst tank from zeroing out ~${fhShort} early, you have to pace the next ~${Re(p.est5hReqsLeft)} reqs until refill.`,
+      `To keep coding uninterrupted through the next ${burstRefill}, you have to dial 5h ${poolLabel} throughput back by ${fhCutPct}% — your sprint is outrunning the pit crew.`
+    ];
+    straightSummary = `5-hour ${poolLabel} burst will exhaust in ~${fhTte} (${fhShort} before refill). Reduce 5h burn by ${fhCutPct}% to <= ${fhSafeHr.toFixed(1)}%/hr; weekly pool remains safe (${wkRem.toFixed(1)}% left).`;
+  } else if (wkUnkillable) {
+    coachTone = "ok";
+    coachColor = "var(--ok)";
+    quips = [
+      `To actually hit 0% ${poolLabel} weekly before reset (${resetDisp}), you would have to bend spacetime — even redlining every 5h window left caps out at +${p.maxReachableAddWkPct}% (${wkRem.toFixed(1)}% remains).`,
+      `To drain this ${poolLabel} weekly tank in time, you have to spawn subagents in parallel dimensions. Your only real speed limit now is the 5h burst cap (${fhSafeHr.toFixed(1)}%/hr).`,
+      `To waste less ${poolLabel} quota before ${resetDay}'s reset, you have to stop rationing — weekly exhaustion is mathematically off the table (~${Re(p.estReqsLeft)} avg reqs left).`,
+      `To dent the remaining ${wkRem.toFixed(1)}% ${poolLabel} pool before the clock wipes it clean, you have to floor the pedal (~${p.burstTanksEquivLeft} full 5h tanks sitting on the table).`
+    ];
+    straightSummary = `Weekly ${poolLabel} exhaustion before reset is physically unreachable (${wkRem.toFixed(1)}% left vs ${p.maxReachableAddWkPct}% max spendable across ${p.burstWindowsLeft} burst windows). Pace solely against the 5h limit (<= ${fhSafeHr.toFixed(1)}%/hr).`;
+  } else if (wkWarmup) {
+    coachTone = "ok";
+    coachColor = "var(--ok)";
+    quips = [
+      `To get a real lock on this brand-new ${poolLabel} week, you have to ship a few commits first — your sustainable cruise speed is ${wkTargetStr} (~${Re(p.estReqsLeft)} avg reqs in the tank).`,
+      `To burn all 100% of this fresh ${poolLabel} cycle cleanly, you have to average ~14.3%/day from here to ${resetDay}.`,
+      `To wake up the pace car on a freshly reset ${poolLabel} tank, you have to give it a few hours of flight time (${wkRem.toFixed(1)}% remaining).`
+    ];
+    straightSummary = `Fresh ${poolLabel} weekly cycle (< 6h elapsed, ${wkRem.toFixed(1)}% remaining). Sustainable ceiling is ${wkTargetStr}; 5h burst ceiling is ${fhSafeHr.toFixed(1)}%/hr.`;
+  } else if (wkProjUnclipped >= 85) {
+    coachTone = "warn";
+    coachColor = "var(--warn)";
+    quips = [
+      `To land near 0% unused right as ${resetDay}'s ${poolLabel} reset hits, you have to touch nothing — ${wkRatio.toFixed(1)}x velocity (~${wkProj.toFixed(0)}% projected) is textbook precision.`,
+      `To stay inside the Goldilocks zone on ${poolLabel}, you have to hold steady around ${wkCurStr} (ceiling is ${wkTargetStr} over the final ${resetDisp}).`,
+      `To extract full value from your ${poolLabel} quota without hitting a single wall, you just have to cruise — ~${Re(p.estReqsLeft)} avg reqs left for the homestretch.`
+    ];
+    straightSummary = `${poolLabel} weekly pace is on target (${wkRatio.toFixed(1)}x, tracking ~${wkProj.toFixed(0)}% at reset). Hold <= ${wkTargetStr}; 5h burst is at ${fhUsed.toFixed(1)}% used.`;
+  } else {
+    coachTone = "ok";
+    coachColor = "var(--ok)";
+    const unused = Math.max(0, 100 - wkProj).toFixed(0);
+    const minActive = useWkHr ? 0.12 : 1.2;
+    const wkMult = wkCurRate >= minActive ? (wkSafeRate / wkCurRate) : 99;
+    const hasStepMult = wkMult >= 1.15 && wkMult <= 12.0;
+    const wkDelta = Math.max(0, wkSafeRate - wkCurRate).toFixed(wkDigits);
+    quips = [
+      `To use your full ${poolLabel} allowance before ${resetDay} wipes ~${unused}% away, you have to ${hasStepMult ? `step it up ${wkMult.toFixed(1)}x (+${wkDelta}%/${wkUnit}, up to ${wkTargetStr})` : `wake the agents up and push toward ${wkTargetStr}`}.`,
+      `To stop gifting ~${unused}% unused ${poolLabel} quota back to the server on ${resetDay}, you have to unleash ~${Re(p.estReqsLeft)} more avg reqs (~${p.burstTanksEquivLeft} full 5h tanks) over the next ${resetDisp}.`,
+      `To squeeze every drop out of this ${poolLabel} week, you have to ${hasStepMult ? `push ${wkMult.toFixed(1)}x harder` : `spin up that refactor you have been putting off`} — ${wkRem.toFixed(1)}% left with ${resetDisp} on the clock.`,
+      `To turn that ~${unused}% projected ${poolLabel} surplus into shipped features, you have to delegate bolder tasks (up to ${wkTargetStr} sustainable headroom).`
+    ];
+    straightSummary = `${poolLabel} weekly burn is under-paced (${wkRatio.toFixed(1)}x, ~${wkProj.toFixed(0)}% projected at reset, ~${unused}% unused). Room for up to ${wkTargetStr} (~${Re(p.estReqsLeft)} avg reqs left).`;
+  }
+
+  const chosenQuip = quips[G_PACING_QUIP_IDX % quips.length];
+  const fhClockPos = Math.min(100, Math.max(0, Number(p.fhElapsedPct || 0)));
+  const fhBarW = Math.min(100, Math.max(0, fhUsed));
+  const wkClockPos = Math.min(100, Math.max(0, Number(p.wkElapsedPct || 0)));
+  const wkBarW = Math.min(100, Math.max(0, wkUsed));
+
+  el.innerHTML = `
+    <div class="stack" style="gap:12px;">
+      ${headerHtml}
+
+      <!-- Coach / Summary Banner -->
+      <div class="row" style="justify-content:space-between; align-items:center; gap:10px; padding:10px 12px; border-left:3px solid ${coachColor}; background:var(--raised); border-radius:6px; font-size:12.5px; line-height:1.5; color:var(--ink-1);">
+        <div class="row" style="gap:8px; align-items:flex-start; min-width:0; flex:1;">
+          <span class="badge" data-tone="${coachTone}" data-mono="true" style="flex-shrink:0;">${styleMode === "fun" ? "COACH" : "SUMMARY"}</span>
+          <span style="min-width:0;">${esc(styleMode === "fun" ? chosenQuip : straightSummary)}</span>
+        </div>
+        ${styleMode === "fun" && quips.length > 1 ? `
+          <button type="button" class="btn" data-size="sm" data-variant="ghost" onclick="cyclePacingQuip()" title="Cycle another take" style="height:22px; padding:0 8px; font-size:11.5px; flex-shrink:0;">Next</button>
+        ` : ""}
+      </div>
+
+      <!-- Dual-Horizon Grid: 5-Hour Burst + Weekly Pool -->
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:12px;">
+        <!-- 5-Hour Burst Horizon -->
+        <div style="padding:12px 14px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:9px;">
+          <div class="row" style="justify-content:space-between; align-items:center; gap:8px;">
+            <div class="row" style="gap:6px; align-items:baseline;">
+              <strong style="font-size:13px; color:var(--ink-1);">5-Hour Burst</strong>
+              <span class="mono micro dim">refills in ${esc(burstRefill)}</span>
+            </div>
+            <span class="badge" data-tone="${fhTone}" data-mono="true">${esc(fhBadge)}</span>
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div class="row micro" style="justify-content:space-between;">
+              <span class="dim">Window clock</span>
+              <span class="mono" style="color:var(--ink-2);">${p.fhElapsedPct}% (${Number(p.fhElapsedHours || 0).toFixed(1)} of 5.0h)</span>
+            </div>
+            <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
+              <div style="width:${fhClockPos}%; height:100%; background:var(--ink-3); border-radius:var(--r-pill);"></div>
+            </div>
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div class="row micro" style="justify-content:space-between;">
+              <span style="color:var(--ink-2); font-weight:500;">Burst quota used</span>
+              <span class="mono"><strong style="color:${fhBarColor};">${fhUsed.toFixed(1)}%</strong> <span class="dim">(${fhRem.toFixed(1)}% left)</span></span>
+            </div>
+            <div style="height:8px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
+              ${fhHasDualSeg ? `
+                <div style="width:${fhLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.local5hUsedPct}%"></div>
+                <div style="width:${fhOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.other5hUsedPct}%"></div>
+              ` : `
+                <div style="width:${fhBarW}%; height:100%; background:${fhBarColor}; border-radius:var(--r-pill);"></div>
+              `}
+            </div>
+            ${fhHasDualSeg ? `
+              <div class="row micro dim" style="gap:10px;">
+                <span><span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.local5hUsedPct}%</strong></span>
+                <span><span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.other5hUsedPct}%</strong></span>
+              </div>
+            ` : (fhOtherW >= 1.0 ? `
+              <div class="micro dim">0% this setup · ${p.other5hUsedPct}% other products / devices</div>
+            ` : "")}
+          </div>
+
+          <div style="border-top:1px solid var(--line-1); padding-top:8px; margin-top:auto; display:flex; flex-direction:column; gap:5px; font-size:12px;">
+            <div class="row" style="justify-content:space-between; gap:8px; align-items:baseline;">
+              <span class="dim" style="flex-shrink:0;">Will it run out?</span>
+              <span style="text-align:right;">${fhWillRunOutHtml}</span>
+            </div>
+            <div class="row" style="justify-content:space-between; gap:8px; align-items:baseline;">
+              <span class="dim" style="flex-shrink:0;">Adjustment</span>
+              <span style="text-align:right;">${fhAdjustHtml}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Weekly Endurance Horizon -->
+        <div style="padding:12px 14px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:9px;">
+          <div class="row" style="justify-content:space-between; align-items:center; gap:8px;">
+            <div class="row" style="gap:6px; align-items:baseline;">
+              <strong style="font-size:13px; color:var(--ink-1);">Weekly Pool</strong>
+              <span class="mono micro dim">resets in ${esc(resetDisp)}</span>
+            </div>
+            <span class="badge" data-tone="${wkTone}" data-mono="true">${esc(wkBadge)}</span>
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div class="row micro" style="justify-content:space-between;">
+              <span class="dim">Week clock</span>
+              <span class="mono" style="color:var(--ink-2);">${p.wkElapsedPct}% (${Number(p.wkElapsedDays || 0).toFixed(1)} of 7.0d)</span>
+            </div>
+            <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
+              <div style="width:${wkClockPos}%; height:100%; background:var(--ink-3); border-radius:var(--r-pill);"></div>
+            </div>
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div class="row micro" style="justify-content:space-between;">
+              <span style="color:var(--ink-2); font-weight:500;">Account quota used</span>
+              <span class="mono"><strong style="color:${wkBarColor};">${wkUsed.toFixed(1)}%</strong> <span class="dim">(${wkRem.toFixed(1)}% left)</span></span>
+            </div>
+            <div style="height:8px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
+              ${wkHasDualSeg ? `
+                <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
+                <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
+              ` : `
+                <div style="width:${wkBarW}%; height:100%; background:${wkBarColor}; border-radius:var(--r-pill);"></div>
+              `}
+            </div>
+            ${wkHasDualSeg ? `
+              <div class="row micro dim" style="gap:10px;">
+                <span><span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.localWkUsedPct}%</strong></span>
+                <span><span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.otherWkUsedPct}%</strong></span>
+              </div>
+            ` : (wkOtherW >= 1.0 ? `
+              <div class="micro dim">0% this setup · ${p.otherWkUsedPct}% other products / devices</div>
+            ` : "")}
+          </div>
+
+          <div style="border-top:1px solid var(--line-1); padding-top:8px; margin-top:auto; display:flex; flex-direction:column; gap:5px; font-size:12px;">
+            <div class="row" style="justify-content:space-between; gap:8px; align-items:baseline;">
+              <span class="dim" style="flex-shrink:0;">Will it run out?</span>
+              <span style="text-align:right;">${wkWillRunOutHtml}</span>
+            </div>
+            <div class="row" style="justify-content:space-between; gap:8px; align-items:baseline;">
+              <span class="dim" style="flex-shrink:0;">Adjustment</span>
+              <span style="text-align:right;">${wkAdjustHtml}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  syncSegmentedThumbs();
 }
 
 function renderTopSessionsOverview() {
@@ -6456,13 +6999,16 @@ function renderFullViews() {
     const mEntries = Object.entries(d.models || {});
     document.getElementById("modelsFullTbody").innerHTML = mEntries.length ? mEntries.map(([m, v]) => `
       <tr>
-        <td class="mono"><strong>${esc(m)}</strong></td>
+        <td class="mono">
+          <strong>${esc(m)}</strong>
+          ${v.is3p ? `<span class="badge" data-tone="neutral" style="margin-left:6px; height:18px; font-size:10.5px;">Claude/GPT</span>` : ""}
+        </td>
         <td data-align="right" class="num">${B(v.steps)}</td>
         <td data-align="right" class="num">${Re(v.in)}</td>
         <td data-align="right" class="num">${Re(v.out)}</td>
         <td data-align="right" class="num">${Re(v.cache)}</td>
         <td data-align="right" class="num">${Rt(v.medianMs)} / ${Rt(v.p95Ms)}</td>
-        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;" title="≈ ${v.pct_5h}% of 5h limit">${v.pct_week}%</td>
+        <td data-align="right" class="num" style="color:var(--chart-primary); font-weight:600;" title="≈ ${v.pct_5h}% of 5h limit · ${v.is3p ? 'Claude & GPT pool' : 'Gemini pool'}">${v.pct_week}%</td>
       </tr>
     `).join("") : '<tr><td colspan="7" class="dim" style="text-align:center;padding:20px;">No models</td></tr>';
   } catch (e) { console.error("Models render error", e); }
@@ -6629,27 +7175,32 @@ function applyOnboardingPreset(presetKey) {
   let mode = "web";
   let openBrowser = true;
   let cliView = "overview";
+  let pacingStyle = "fun";
   let disabledSections = [];
 
   if (presetKey === "full_web") {
     mode = "web";
     openBrowser = true;
     cliView = "overview";
+    pacingStyle = "fun";
     disabledSections = [];
   } else if (presetKey === "minimalist") {
     mode = "web";
     openBrowser = true;
     cliView = "overview";
+    pacingStyle = "minimal";
     disabledSections = ["sessions", "requests", "tools", "frustration"];
   } else if (presetKey === "cli_minimalist") {
     mode = "cli";
     openBrowser = false;
     cliView = "overview";
+    pacingStyle = "straight";
     disabledSections = ["sessions", "requests", "tools", "frustration"];
   } else if (presetKey === "cli_tokens") {
     mode = "cli";
     openBrowser = false;
     cliView = "tokens";
+    pacingStyle = "minimal";
     disabledSections = [];
   }
 
@@ -6660,6 +7211,13 @@ function applyOnboardingPreset(presetKey) {
 
   const brCheck = document.getElementById("settingOpenBrowser");
   if (brCheck) brCheck.checked = openBrowser;
+
+  const rFun = document.getElementById("settingPacingFun");
+  const rStr = document.getElementById("settingPacingStraight");
+  const rMin = document.getElementById("settingPacingMinimal");
+  if (rFun) rFun.checked = (pacingStyle === "fun");
+  if (rStr) rStr.checked = (pacingStyle === "straight");
+  if (rMin) rMin.checked = (pacingStyle === "minimal");
 
   const selView = document.getElementById("settingCliView");
   if (selView) selView.value = cliView;
@@ -6687,6 +7245,15 @@ async function fetchSettings() {
 
 function applySettings(cfg) {
   if (!cfg) return;
+  const pStyle = cfg.web?.pacing_style;
+  if (pStyle === "fun" || pStyle === "straight" || pStyle === "minimal") {
+    G_PACING_STYLE = pStyle;
+    try { localStorage.setItem("agy-stats-pacing-style", pStyle); } catch (e) {}
+    if (G_OVERVIEW_DATA) {
+      renderPacingSection("overviewPacingBody");
+      renderPacingSection("quotaPacingBody");
+    }
+  }
   const disSec = (cfg.cli && Array.isArray(cfg.cli.disabled_sections)) ? cfg.cli.disabled_sections : [];
   applyOverviewDisplaySections(disSec);
 }
@@ -6752,6 +7319,14 @@ async function openSettingsModal(isFirstRun = false) {
 
   const brCheck = document.getElementById("settingOpenBrowser");
   if (brCheck) brCheck.checked = cfg.web?.open_browser !== false;
+
+  const pStyle = cfg.web?.pacing_style || G_PACING_STYLE || "fun";
+  const rFun = document.getElementById("settingPacingFun");
+  const rStr = document.getElementById("settingPacingStraight");
+  const rMin = document.getElementById("settingPacingMinimal");
+  if (rFun) rFun.checked = (pStyle === "fun");
+  if (rStr) rStr.checked = (pStyle === "straight");
+  if (rMin) rMin.checked = (pStyle === "minimal");
 
   const cliView = cfg.cli?.default_view || "overview";
   const selView = document.getElementById("settingCliView");
@@ -6854,6 +7429,10 @@ async function saveSettingsFromModal() {
   const autoChkChecked = autoUpdChecked || !!document.getElementById("settingAutoCheckUpdates")?.checked;
   const updUrlVal = document.getElementById("settingUpdateUrl")?.value?.trim() || "";
 
+  const pStyleVal = document.getElementById("settingPacingMinimal")?.checked ? "minimal"
+    : document.getElementById("settingPacingStraight")?.checked ? "straight"
+    : "fun";
+
   const payload = {
     onboarded: true,
     default_mode: document.getElementById("settingModeCli")?.checked ? "cli" : "web",
@@ -6862,6 +7441,7 @@ async function saveSettingsFromModal() {
     update_url: updUrlVal,
     web: {
       open_browser: !!document.getElementById("settingOpenBrowser")?.checked,
+      pacing_style: pStyleVal,
       disabled_tabs: []
     },
     cli: {
@@ -6906,7 +7486,7 @@ async function resetSettingsToDefault() {
         update_url: "",
         auto_check_updates: true,
         auto_update: false,
-        web: { open_browser: true, disabled_tabs: [] },
+        web: { open_browser: true, pacing_style: "fun", disabled_tabs: [] },
         cli: { default_view: "overview", days: 10, disabled_sections: [] }
       })
     });
