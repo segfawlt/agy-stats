@@ -176,10 +176,25 @@ def _discover_agy_roots():
     existing = [p for p in candidates if os.path.isdir(p)]
     return existing if existing else [candidates[0]]
 
-# Empirically calibrated dimensionless quota budgets & model cost weights
-# Solved directly from live Antigravity /usage 5-hour & weekly pool deltas (wk/5h = 7.6712x):
-QUOTA_BUDGET_5H = 78.10
-QUOTA_BUDGET_WEEK = 599.12
+# Empirically calibrated dimensionless quota budgets & server 5h-to-weekly conversion factors
+# Measured directly from IEEE-754 float32 /usage server remaining_fraction deltas:
+# - Gemini Models: 100% of 5h limit = 25.0% of Weekly quota (4.0 full 5h tanks/week)
+# - Claude & GPT:  100% of 5h limit = 50.0% of Weekly quota (2.0 full 5h tanks/week)
+POOL_BURST_TO_WEEK_PCT = {
+    "gemini": 25.0,
+    "3p": 50.0,
+}
+_CALIBRATED_BURST_TO_WK_PCT = {}
+
+QUOTA_BUDGET_5H = 52.0
+QUOTA_BUDGET_WEEK = 208.0
+
+def get_pool_burst_to_wk_pct(pool_key="gemini"):
+    pk = "3p" if pool_key == "3p" else "gemini"
+    val = _CALIBRATED_BURST_TO_WK_PCT.get(pk)
+    if isinstance(val, (int, float)) and 5.0 <= float(val) <= 100.0:
+        return float(val)
+    return POOL_BURST_TO_WEEK_PCT[pk]
 
 MODEL_QUOTA_WEIGHTS = {
     # (input_per_1M, output_per_1M, cache_read_per_1M)
@@ -227,8 +242,10 @@ def compute_quota_units(model_name, inp, out, cache):
         w = MODEL_QUOTA_WEIGHTS["other"]
     return (inp * w[0] + out * w[1] + cache * w[2]) / 1_000_000.0
 
-def units_to_pct_5h(u, digits=2):
-    return round((u / QUOTA_BUDGET_5H) * 100.0, digits)
+def units_to_pct_5h(u, digits=2, is_3p=False):
+    ratio = get_pool_burst_to_wk_pct("3p" if is_3p else "gemini") / 100.0
+    budget_5h = max(1.0, QUOTA_BUDGET_WEEK * ratio)
+    return round((u / budget_5h) * 100.0, digits)
 
 def units_to_pct_week(u, digits=2):
     return round((u / QUOTA_BUDGET_WEEK) * 100.0, digits)
@@ -650,21 +667,82 @@ def _is_3p_model(model_name):
 
 _LAST_QUOTA_REFRESH_ATTEMPT = 0.0
 
+def _update_quota_calibration(flat_pools, cal_state, now):
+    """Guarded anchor calibrator: only updates 5h->weekly ratio after >=30% 5h burn & >=30m elapsed in a single window."""
+    if not isinstance(cal_state, dict):
+        cal_state = {}
+    anchors = dict(cal_state.get("anchors") or {})
+    ratios = dict(cal_state.get("ratios") or {})
+    changed = False
+
+    by_id = {p.get("id"): p for p in (flat_pools or []) if isinstance(p, dict) and p.get("id")}
+    for pk, wk_id, fh_id in (("gemini", "gemini-weekly", "gemini-5h"), ("3p", "3p-weekly", "3p-5h")):
+        wb = by_id.get(wk_id)
+        fb = by_id.get(fh_id)
+        if not wb or not fb:
+            continue
+        wk_rt = wb.get("resetTime") or ""
+        fh_rt = fb.get("resetTime") or ""
+        if not wk_rt or not fh_rt:
+            continue
+        wk_rem_f = float(wb.get("remainingFraction", 1.0))
+        fh_rem_f = float(fb.get("remainingFraction", 1.0))
+        fh_used_f = 1.0 - fh_rem_f
+
+        anc = anchors.get(pk)
+        if not isinstance(anc, dict) or anc.get("fh_reset") != fh_rt or anc.get("wk_reset") != wk_rt:
+            if fh_used_f <= 0.05:
+                anchors[pk] = {
+                    "fh_rem": fh_rem_f,
+                    "wk_rem": wk_rem_f,
+                    "fh_reset": fh_rt,
+                    "wk_reset": wk_rt,
+                    "ts": now,
+                }
+                changed = True
+        else:
+            d_fh = float(anc.get("fh_rem", fh_rem_f)) - fh_rem_f
+            d_wk = float(anc.get("wk_rem", wk_rem_f)) - wk_rem_f
+            elapsed_s = now - float(anc.get("ts", now))
+            if d_fh >= 0.30 and elapsed_s >= 1800 and d_wk > 0.01:
+                obs = (d_wk / d_fh) * 100.0
+                if 8.0 <= obs <= 100.0:
+                    snapped = round(obs, 1)
+                    for clean in (12.5, 20.0, 25.0, 33.3, 50.0, 100.0):
+                        if abs(obs - clean) <= 0.9:
+                            snapped = clean
+                            break
+                    if ratios.get(pk) != snapped:
+                        ratios[pk] = snapped
+                        changed = True
+
+    for pk, rv in ratios.items():
+        if pk in ("gemini", "3p") and isinstance(rv, (int, float)) and 5.0 <= float(rv) <= 100.0:
+            _CALIBRATED_BURST_TO_WK_PCT[pk] = float(rv)
+
+    return {"anchors": anchors, "ratios": ratios}, changed
+
 def fetch_live_quota(force_refresh=False):
     global _LAST_QUOTA_REFRESH_ATTEMPT
     now = time.time()
     now_ms = int(now * 1000)
     raw_groups = None
-    if not force_refresh and os.path.exists(CACHE_FILE):
+    cal_state = {}
+    if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-                age = now - cached.get("timestamp", 0)
-                cand_groups = cached.get("groups", [])
-                cand_flat = flatten_quota_pools(cand_groups or [])
-                expired = _has_expired_pool(cand_flat, now_ms)
-                if age < 90 and (not expired or (now - _LAST_QUOTA_REFRESH_ATTEMPT) < 10):
-                    raw_groups = cand_groups
+                cal_state = cached.get("calibration") or {}
+                for pk, rv in (cal_state.get("ratios") or {}).items():
+                    if pk in ("gemini", "3p") and isinstance(rv, (int, float)) and 5.0 <= float(rv) <= 100.0:
+                        _CALIBRATED_BURST_TO_WK_PCT[pk] = float(rv)
+                if not force_refresh:
+                    age = now - cached.get("timestamp", 0)
+                    cand_groups = cached.get("groups", [])
+                    cand_flat = flatten_quota_pools(cand_groups or [])
+                    expired = _has_expired_pool(cand_flat, now_ms)
+                    if age < 90 and (not expired or (now - _LAST_QUOTA_REFRESH_ATTEMPT) < 10):
+                        raw_groups = cand_groups
         except Exception:
             pass
 
@@ -677,7 +755,10 @@ def fetch_live_quota(force_refresh=False):
                 if res.returncode == 0 and res.stdout.strip():
                     d = json.loads(res.stdout)
                     raw_groups = d.get("command", {}).get("data", {}).get("groups", [])
-                    _atomic_write_json(CACHE_FILE, {"timestamp": now, "groups": raw_groups})
+                    flat_now = flatten_quota_pools(raw_groups or [])
+                    cal_state, _ = _update_quota_calibration(flat_now, cal_state, now)
+                    _atomic_write_json(CACHE_FILE, {"timestamp": now, "groups": raw_groups, "calibration": cal_state})
+                    return flat_now
             except Exception:
                 pass
 
@@ -687,7 +768,9 @@ def fetch_live_quota(force_refresh=False):
                 raw_groups = json.load(f).get("groups", [])
         except Exception:
             raw_groups = []
-    return flatten_quota_pools(raw_groups or [])
+    flat_res = flatten_quota_pools(raw_groups or [])
+    _update_quota_calibration(flat_res, cal_state, now)
+    return flat_res
 
 # In-memory raw telemetry cache for instant range recalculation
 _TELEMETRY_CACHE = None
@@ -1066,7 +1149,7 @@ def load_raw_telemetry(force=False):
                             "cache": cch,
                             "total": tot,
                             "units": q_units,
-                            "pct_5h": units_to_pct_5h(q_units, 3),
+                            "pct_5h": units_to_pct_5h(q_units, 3, is_3p=_is_3p_model(current_model)),
                             "pct_week": units_to_pct_week(q_units, 3),
                             "durationMs": dur_ms,
                             "tools": tc_names_for_req,
@@ -1162,7 +1245,8 @@ def _build_pool_pacing(
 ):
     period_5h_ms = 5 * 3600 * 1000
     period_wk_ms = 7 * 86400 * 1000
-    burst_to_wk_pct = (QUOTA_BUDGET_5H / QUOTA_BUDGET_WEEK) * 100.0
+    is_3p_pool = (pool_key == "3p")
+    burst_to_wk_pct = get_pool_burst_to_wk_pct(pool_key)
     pool_reqs = pool_reqs or []
 
     wk_cycle_start_ms = (wk_reset_ms - period_wk_ms) if wk_reset_ms else (now_ms - period_wk_ms)
@@ -1177,6 +1261,11 @@ def _build_pool_pacing(
     wk_rem = round(float(wk_pool.get("remainingPct", max(0.0, 100.0 - wk_used))), 2) if wk_pool else round(max(0.0, 100.0 - wk_used), 2)
     fh_used = round(float(fh_pool.get("usedPct", local_5h_pct)), 2) if fh_pool else local_5h_pct
     fh_rem = round(float(fh_pool.get("remainingPct", max(0.0, 100.0 - fh_used))), 2) if fh_pool else round(max(0.0, 100.0 - fh_used), 2)
+
+    if wk_pool:
+        local_wk_pct = round(min(wk_used, local_wk_pct), 2)
+    if fh_pool:
+        local_5h_pct = round(min(fh_used, local_5h_pct), 2)
 
     other_wk = round(max(0.0, wk_used - local_wk_pct), 2)
     other_5h = round(max(0.0, fh_used - local_5h_pct), 2)
@@ -1209,7 +1298,7 @@ def _build_pool_pacing(
                 if rts >= cutoff_1h:
                     u_1h += ru
 
-    local_1h_5h_rate = units_to_pct_5h(u_1h, 2)
+    local_1h_5h_rate = units_to_pct_5h(u_1h, 2, is_3p=is_3p_pool)
     local_24h_wk_rate = units_to_pct_week(u_24h, 2)
     active_hr_src = hr_buckets_7d if len(hr_buckets_7d) >= 3 else hr_buckets_all
     peak_1h_wk_pct = round(units_to_pct_week(max(active_hr_src.values()), 3), 2) if active_hr_src else 0.0
@@ -1222,14 +1311,18 @@ def _build_pool_pacing(
     else:
         after_fh_hours = 0.0
 
-    extra_5h_windows = int(math.ceil(after_fh_hours / 5.0)) if after_fh_hours > 0.08 else 0
+    if after_fh_hours > 0.05:
+        full_extra = int(after_fh_hours // 5.0)
+        rem_sliver_h = after_fh_hours - (full_extra * 5.0)
+        extra_5h_windows = full_extra + (min(1.0, rem_sliver_h / 1.0) if rem_sliver_h > 0.05 else 0.0)
+    else:
+        extra_5h_windows = 0.0
     burst_windows_left = round((fh_rem / 100.0) + extra_5h_windows, 1)
     smooth_cal_windows_left = round(max(0.1, (fh_rem / 100.0) + (after_fh_hours / 5.0)), 1)
 
     max_reachable_add_wk = round(burst_windows_left * burst_to_wk_pct, 1)
     max_final_wk_pct = round(min(100.0, wk_used + max_reachable_add_wk), 1)
-    unkillable_cap_per_burst = burst_to_wk_pct if pool_key == "gemini" else 25.0
-    wk_unkillable = bool(wk_rem > (burst_windows_left * unkillable_cap_per_burst + 0.5) and wk_rem > 1.0)
+    wk_unkillable = bool(wk_rem > (burst_windows_left * burst_to_wk_pct + 0.5) and wk_rem > 1.0)
 
     # Recency-weighted Weekly daily pace: (60% recent 24h + 40% cycle avg) on local + other-devices cycle avg
     wk_cycle_rate_per_day = wk_used / wk_el_days
@@ -1329,6 +1422,11 @@ def _build_pool_pacing(
         "sessionsPerDay": round(sessions_per_day, 1),
         "smooth5hSessionPct": smooth_5h_session_pct,
         "smooth5h24x7Pct": smooth_5h_24x7_pct,
+        "burstToWkPct": round(burst_to_wk_pct, 1),
+        "wkTanksTotal": round(100.0 / burst_to_wk_pct, 1),
+        "fhUsedAsWkPct": round((fh_used / 100.0) * burst_to_wk_pct, 2),
+        "fhRemAsWkPct": round((fh_rem / 100.0) * burst_to_wk_pct, 2),
+        "burstRatioCalibrated": bool(pool_key in _CALIBRATED_BURST_TO_WK_PCT),
         "burstTanksEquivLeft": burst_tanks_equiv_left,
         "peak1hWkPct": peak_1h_wk_pct,
         "sprintHoursLeft": sprint_hours_left,
@@ -1562,7 +1660,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
             "tools": mv["tools"],
             "medianMs": mdurs[len(mdurs) // 2] if mdurs else 0,
             "p95Ms": mdurs[int(len(mdurs) * 0.95)] if mdurs else 0,
-            "pct_5h": units_to_pct_5h(mv["units"], 2),
+            "pct_5h": units_to_pct_5h(mv["units"], 2, is_3p=_is_3p_model(m_name)),
             "pct_week": units_to_pct_week(mv["units"], 2),
             "is3p": _is_3p_model(m_name),
             "frustrations": frust_by_model.get(m_name, 0)
@@ -1747,21 +1845,17 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
             "errors": ag_val["errors"]
         })
 
-    local_5h_cycle_pct = units_to_pct_5h(cycle_5h_units, 2)
+    local_5h_cycle_pct = units_to_pct_5h(cycle_5h_units, 2, is_3p=False)
     local_wk_cycle_pct = units_to_pct_week(cycle_wk_units, 2)
-    local_3p_5h_cycle_pct = units_to_pct_5h(cycle_3p_5h_units, 2)
+    local_3p_5h_cycle_pct = units_to_pct_5h(cycle_3p_5h_units, 2, is_3p=True)
     local_3p_wk_cycle_pct = units_to_pct_week(cycle_3p_wk_units, 2)
 
-    active_5h_in_range_units = sum(
-        r["units"] for r in in_range
-        if r["ts"] >= (tp_fh_cycle_start_ms if _is_3p_model(r["model"]) else fh_cycle_start_ms)
-    )
-    forgiven_5h_in_range_units = sum(
-        r["units"] for r in in_range
-        if r["ts"] < (tp_fh_cycle_start_ms if _is_3p_model(r["model"]) else fh_cycle_start_ms)
-    )
-    active_pct_5h_spent = units_to_pct_5h(active_5h_in_range_units, 2)
-    forgiven_pct_5h_spent = units_to_pct_5h(forgiven_5h_in_range_units, 2)
+    active_5h_gem_u = sum(r["units"] for r in in_range if not _is_3p_model(r["model"]) and r["ts"] >= fh_cycle_start_ms)
+    active_5h_3p_u = sum(r["units"] for r in in_range if _is_3p_model(r["model"]) and r["ts"] >= tp_fh_cycle_start_ms)
+    forgiven_5h_gem_u = sum(r["units"] for r in in_range if not _is_3p_model(r["model"]) and r["ts"] < fh_cycle_start_ms)
+    forgiven_5h_3p_u = sum(r["units"] for r in in_range if _is_3p_model(r["model"]) and r["ts"] < tp_fh_cycle_start_ms)
+    active_pct_5h_spent = round(units_to_pct_5h(active_5h_gem_u, 3, is_3p=False) + units_to_pct_5h(active_5h_3p_u, 3, is_3p=True), 2)
+    forgiven_pct_5h_spent = round(units_to_pct_5h(forgiven_5h_gem_u, 3, is_3p=False) + units_to_pct_5h(forgiven_5h_3p_u, 3, is_3p=True), 2)
 
     active_wk_in_range_units = sum(
         r["units"] for r in in_range
@@ -2018,7 +2112,7 @@ def build_session_trace(cid):
                             "ts": ts_ms,
                             "durationMs": dur_ms,
                             "in": inp, "out": out, "cache": cch, "total": tot,
-                            "pct5h": units_to_pct_5h(qu, 3),
+                            "pct5h": units_to_pct_5h(qu, 3, is_3p=_is_3p_model(cur_m)),
                             "pctWeek": units_to_pct_week(qu, 3),
                             "tools": tcalls,
                             "isError": is_err,
@@ -2192,7 +2286,10 @@ def print_cli_quota(data):
                 pace_100_str = f"{mult_s} your current pace (hold steady: ~{cur_day_rate:.1f}%/day vs {safe_day_rate:.1f}%/day target)"
                 smooth_str = (
                     f"Aim for ~{sm_sess}% per 5h session (~{aw_sess:.0f} awake sessions · ~{sm_24x7}% if 24/7)"
-                    if sm_sess <= 95 else f"Max ~100% per active 5h session (or ~{sm_24x7}% across all {cal_win:.1f} windows)"
+                    if sm_sess <= 95 else (
+                        f"Max 100% every 5h window (~{cal_win:.1f} windows left)"
+                        if sm_24x7 > 100 else f"Max ~100% per active 5h session (or ~{sm_24x7}% across all {cal_win:.1f} windows)"
+                    )
                 )
             else:
                 pace_pill = f"{C.BOLD}{C.GREEN}[UNDER PACE {pace_ratio:.1f}x]{C.RESET}"
@@ -2205,7 +2302,10 @@ def print_cli_quota(data):
                     pace_100_str = f"Idle pace — room for {safe_day_rate:.1f}%/day (~{p.get('estReqsLeft', 0):,} reqs left)"
                 smooth_str = (
                     f"Aim for ~{sm_sess}% per 5h session (~{aw_sess:.0f} awake sessions · no 100% maxing needed)"
-                    if sm_sess <= 95 else f"Max ~100% per active 5h session (or ~{sm_24x7}% across all {cal_win:.1f} windows)"
+                    if sm_sess <= 95 else (
+                        f"Max 100% every 5h window (~{cal_win:.1f} windows left)"
+                        if sm_24x7 > 100 else f"Max ~100% per active 5h session (or ~{sm_24x7}% across all {cal_win:.1f} windows)"
+                    )
                 )
 
             print(f"\n{C.BOLD}{C.CYAN}PACING & RUNWAY · {p.get('fullName', pk).upper()}{C.RESET}")
@@ -2227,6 +2327,9 @@ def print_cli_quota(data):
             else:
                 fh_note = f"ceiling {p['safe5hHourlyBudgetLeft']:.1f}%/hr"
             print(f"    {'5-Hour Burst:':<24} {p['server5hUsedPct']:.1f}% used · {p['server5hRemPct']:.1f}% left · refills in {fh_reset_disp} ({fh_note})")
+            b2w = float(p.get('burstToWkPct', 25.0))
+            t_tot = float(p.get('wkTanksTotal', round(100.0 / max(1.0, b2w), 1)))
+            print(f"    {'5h -> Weekly factor:':<24} {C.DIM}100% of 5h = {b2w:.1f}% of Weekly ({t_tot:.1f} full 5h tanks/wk · ~{p.get('burstTanksEquivLeft', 0):.1f} tanks left){C.RESET}")
             if p.get("sprintHoursLeft") and p.get("peak1hWkPct", 0) >= 0.05:
                 print(f"    {'Peak sprint benchmark:':<24} {C.DIM}~{p['sprintHoursLeft']:.1f}h of coding left at your {p['peak1hWkPct']:.2f}%/hr peak hour{C.RESET}")
             if p.get('otherWkUsedPct', 0) >= 1.0 or p.get('localWkUsedPct', 0) > 0:
@@ -5117,8 +5220,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     gap: 4px;
     min-width: 0;
   }
+  .pacing-score-cell[data-has-tip="true"] {
+    cursor: help;
+    transition: background var(--dur-1) var(--ease);
+  }
+  .pacing-score-cell[data-has-tip="true"]:hover {
+    background: color-mix(in srgb, var(--raised) 95%, var(--ink-1) 4%);
+  }
   .pacing-score-cell + .pacing-score-cell {
     border-left: 1px solid var(--line-1);
+  }
+  .pacing-score-head-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .pacing-score-label {
     font-size: 10.5px;
@@ -5126,6 +5243,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--ink-3);
+  }
+  .pacing-tip-pill {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--ink-3);
+    border-bottom: 1px dotted var(--line-3);
+    white-space: nowrap;
+    transition: color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+  }
+  .pacing-score-cell[data-has-tip="true"]:hover .pacing-tip-pill {
+    color: var(--ink-1);
+    border-bottom-color: var(--ink-2);
+  }
+  .pacing-tip-trigger {
+    cursor: help;
+    border-bottom: 1px dotted var(--line-3);
+    transition: color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+  }
+  .pacing-tip-trigger:hover {
+    color: var(--ink-1);
+    border-bottom-color: var(--ink-2);
+  }
+  .quota-hover-tip {
+    position: fixed;
+    z-index: 95;
+    min-width: 272px;
+    max-width: 340px;
+    padding: 10px 12px;
+  }
+  .quota-hover-tip .chart-tooltip-row[data-active-pool="true"] .chart-tooltip-label {
+    color: var(--ink-1);
+    font-weight: 600;
   }
   .pacing-score-big {
     font-family: var(--font-mono);
@@ -5762,6 +5913,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div class="chart-tooltip quota-hover-tip" id="quotaHoverTip"></div>
 
 <script>
 let G_FULL_DATA = null;
@@ -5946,6 +6098,7 @@ function fmtHoursJS(h) {
 }
 function setPacingPool(poolKey) {
   if (poolKey !== "gemini" && poolKey !== "3p") return;
+  hideQuotaConversionTip();
   G_PACING_POOL = poolKey;
   renderPacingSection("overviewPacingBody");
   renderPacingSection("quotaPacingBody");
@@ -5953,6 +6106,7 @@ function setPacingPool(poolKey) {
 }
 function setPacingStyle(styleKey, persist = true) {
   if (styleKey !== "fun" && styleKey !== "straight" && styleKey !== "minimal") return;
+  hideQuotaConversionTip();
   G_PACING_STYLE = styleKey;
   try { localStorage.setItem("agy-stats-pacing-style", styleKey); } catch (e) {}
   const rFun = document.getElementById("settingPacingFun");
@@ -5974,6 +6128,7 @@ function setPacingStyle(styleKey, persist = true) {
   syncSegmentedThumbs();
 }
 function setPacingBars(showBars, persist = true) {
+  hideQuotaConversionTip();
   G_PACING_BARS = !!showBars;
   try { localStorage.setItem("agy-stats-pacing-bars", G_PACING_BARS ? "true" : "false"); } catch (e) {}
   const cb = document.getElementById("settingPacingBars");
@@ -6044,6 +6199,7 @@ function initTheme() {
 }
 
 function navigateTab(tabId) {
+  hideQuotaConversionTip();
   document.querySelectorAll(".nav-row").forEach(b => b.dataset.active = (b.dataset.tab === tabId));
   document.querySelectorAll(".view-pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + tabId));
   window.scrollTo({ top: 0 });
@@ -6164,8 +6320,8 @@ function renderDynamicOverview() {
     : footWk;
 
   document.getElementById("primaryStatGrid").innerHTML = `
-    <div class="stat">
-      <div class="stat-label">Weekly quota</div>
+    <div class="stat" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, G_PACING_POOL)" onmouseleave="hideQuotaConversionTip()">
+      <div class="stat-label"><span class="pacing-tip-trigger">Weekly quota</span></div>
       <div class="stat-value" style="color:var(--chart-primary);">${ov.pctWeeklySpent}%</div>
       <div class="stat-foot"><span class="truncate" title="${esc(footWkTitle)}">${esc(footWk)}</span></div>
       <div class="stat-spark">${renderSparklineSVG(qWkSpark, "var(--chart-primary)")}</div>
@@ -6232,6 +6388,76 @@ function _clockPinHtml(pct) {
     </div>
   `;
 }
+
+function showQuotaConversionTip(e, poolKey) {
+  const tip = document.getElementById("quotaHoverTip");
+  const ov = G_OVERVIEW_DATA?.overall || G_FULL_DATA?.overall;
+  if (!tip || !ov?.pacing) return;
+  const pools = ov.pacing.pools || { gemini: ov.pacing };
+  const pk = (poolKey === "3p" && pools["3p"]) ? "3p" : "gemini";
+  const p = pools[pk] || pools.gemini || ov.pacing;
+  const gem = pools.gemini || p;
+  const tp = pools["3p"] || null;
+
+  const gemB2W = Number(gem?.burstToWkPct ?? 25.0);
+  const gemTanks = Number(gem?.wkTanksTotal ?? (100 / Math.max(1, gemB2W)));
+  const tpB2W = Number(tp?.burstToWkPct ?? 50.0);
+  const tpTanks = Number(tp?.wkTanksTotal ?? (100 / Math.max(1, tpB2W)));
+
+  const fhUsed = Number(p.server5hUsedPct ?? 0);
+  const fhRem = Number(p.server5hRemPct ?? Math.max(0, 100 - fhUsed));
+  const wkRem = Number(p.serverWkRemPct ?? 0);
+  const activeB2W = Number(p.burstToWkPct ?? (pk === "3p" ? 50.0 : 25.0));
+  const fhUsedWk = Number(p.fhUsedAsWkPct ?? ((fhUsed / 100) * activeB2W));
+  const fhRemWk = Number(p.fhRemAsWkPct ?? ((fhRem / 100) * activeB2W));
+  const tanksLeft = Number(p.burstTanksEquivLeft ?? (wkRem / Math.max(1, activeB2W)));
+  const activeLabel = p.label || (pk === "3p" ? "Claude / GPT" : "Gemini");
+
+  tip.innerHTML = `
+    <div class="chart-tooltip-title">100% OF 5H LIMIT IN WEEKLY QUOTA</div>
+    <div class="chart-tooltip-row" data-active-pool="${pk === 'gemini'}">
+      <span class="swatch" style="background:${pk === 'gemini' ? 'var(--chart-primary)' : 'var(--ink-3)'};"></span>
+      <span class="chart-tooltip-label">Gemini 100% 5h</span>
+      <span class="chart-tooltip-value">${gemB2W.toFixed(1)}% of Weekly <span class="dim">(${gemTanks.toFixed(0)}x)</span></span>
+    </div>
+    <div class="chart-tooltip-row" data-active-pool="${pk === '3p'}">
+      <span class="swatch" style="background:${pk === '3p' ? 'var(--chart-primary)' : 'var(--ink-3)'};"></span>
+      <span class="chart-tooltip-label">Claude/GPT 100% 5h</span>
+      <span class="chart-tooltip-value">${tpB2W.toFixed(1)}% of Weekly <span class="dim">(${tpTanks.toFixed(0)}x)</span></span>
+    </div>
+    <div class="chart-tooltip-row chart-tooltip-total">
+      <span class="chart-tooltip-label">${esc(activeLabel)} 5h used (${fhUsed.toFixed(1)}%)</span>
+      <span class="chart-tooltip-value">${fhUsedWk.toFixed(1)}% wk</span>
+    </div>
+    <div class="chart-tooltip-row">
+      <span class="chart-tooltip-label">${esc(activeLabel)} 5h left (${fhRem.toFixed(1)}%)</span>
+      <span class="chart-tooltip-value">${fhRemWk.toFixed(1)}% wk</span>
+    </div>
+    <div class="chart-tooltip-row">
+      <span class="chart-tooltip-label">${esc(activeLabel)} wk left (${wkRem.toFixed(1)}%)</span>
+      <span class="chart-tooltip-value">~${tanksLeft.toFixed(1)} 5h tanks</span>
+    </div>
+  `;
+
+  tip.style.display = "block";
+  const target = e.currentTarget || e.target;
+  const rect = target.getBoundingClientRect();
+  const tipRect = tip.getBoundingClientRect();
+  const left = Math.min(window.innerWidth - tipRect.width - 12, Math.max(12, rect.left + (rect.width / 2) - (tipRect.width / 2)));
+  let top = rect.bottom + 8;
+  if (top + tipRect.height > window.innerHeight - 12) {
+    top = Math.max(12, rect.top - tipRect.height - 8);
+  }
+  tip.style.left = `${Math.round(left)}px`;
+  tip.style.top = `${Math.round(top)}px`;
+}
+
+function hideQuotaConversionTip() {
+  const tip = document.getElementById("quotaHoverTip");
+  if (tip) tip.style.display = "none";
+}
+
+window.addEventListener("scroll", hideQuotaConversionTip, { passive: true });
 
 function renderPacingSection(targetId) {
   const el = document.getElementById(targetId);
@@ -6337,6 +6563,7 @@ function renderPacingSection(targetId) {
 
   const smoothSessPct = Number(p.smooth5hSessionPct ?? 0);
   const smooth24x7Pct = Number(p.smooth5h24x7Pct ?? 0);
+  const burstToWk = Number(p.burstToWkPct ?? (G_PACING_POOL === "3p" ? 50.0 : 25.0));
   const awakeSessions = Number(p.awake5hSessionsLeft ?? 1);
   const calWindows = Number(p.smoothCalWindowsLeft ?? p.burstWindowsLeft ?? 1);
   const maxFinalWk = Number(p.maxFinalWkPct ?? Math.min(100, wkUsed + Number(p.maxReachableAddWkPct || 0)));
@@ -6376,12 +6603,12 @@ function renderPacingSection(targetId) {
     <div class="pacing-controls">
       ${has3p ? `
         <div class="segmented" data-size="sm">
-          <button type="button" class="segmented-option" data-active="${G_PACING_POOL === 'gemini'}" onclick="setPacingPool('gemini')" title="Gemini weekly &amp; 5-hour quota pool">
+          <button type="button" class="segmented-option" data-active="${G_PACING_POOL === 'gemini'}" onclick="setPacingPool('gemini')" onmouseenter="showQuotaConversionTip(event, 'gemini')" onmouseleave="hideQuotaConversionTip()">
             <span class="dot" data-tone="${gemTone}" style="width:6px;height:6px;"></span>
             <span>Gemini</span>
             <span class="mono micro dim">${Math.round(Number(pools.gemini?.serverWkUsedPct || 0))}%</span>
           </button>
-          <button type="button" class="segmented-option" data-active="${G_PACING_POOL === '3p'}" onclick="setPacingPool('3p')" title="Claude &amp; GPT weekly &amp; 5-hour quota pool">
+          <button type="button" class="segmented-option" data-active="${G_PACING_POOL === '3p'}" onclick="setPacingPool('3p')" onmouseenter="showQuotaConversionTip(event, '3p')" onmouseleave="hideQuotaConversionTip()">
             <span class="dot" data-tone="${tpTone}" style="width:6px;height:6px;"></span>
             <span>Claude/GPT</span>
             <span class="mono micro dim">${Math.round(Number(pools['3p']?.serverWkUsedPct || 0))}%</span>
@@ -6408,9 +6635,9 @@ function renderPacingSection(targetId) {
           ${controlsHtml}
         </div>
         <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px;">
-          <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px;">
+          <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px; cursor:help;" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">
             <div class="row" style="justify-content:space-between; font-size:12px;">
-              <span style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · 5-Hour Burst</span>
+              <span class="pacing-tip-trigger" style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · 5-Hour Burst</span>
               <span class="mono"><strong style="color:var(--ink-1);">${fhUsed.toFixed(1)}%</strong> <span class="dim">(${fhRem.toFixed(1)}% left · ${esc(burstRefill)})</span></span>
             </div>
             <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
@@ -6638,7 +6865,7 @@ function renderPacingSection(targetId) {
             <button type="button" class="pacing-pill-btn" data-active="${G_PACING_BARS}" onclick="togglePacingBars()" title="Show or hide the 5-hour and weekly progress bars (saved to config)">
               ${G_PACING_BARS ? "Hide 5h &amp; wk bars" : "Show 5h &amp; wk bars"}
             </button>
-            <span class="mono dim" style="font-size:11.5px;">${esc(compactMetaTxt)}</span>
+            <span class="mono dim pacing-tip-trigger" style="font-size:11.5px;" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">${esc(compactMetaTxt)}</span>
           </div>
         </div>
 
@@ -6650,8 +6877,8 @@ function renderPacingSection(targetId) {
               <div class="pacing-score-big" data-tone="accent">${esc(scorePaceBig)}</div>
               <span class="pacing-score-sub">${scorePaceSub}</span>
             </div>
-            <div class="pacing-score-cell">
-              <span class="pacing-score-label">Smooth 5h Strategy</span>
+            <div class="pacing-score-cell" data-has-tip="true" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">
+              <span class="pacing-score-label"><span class="pacing-tip-trigger">Smooth 5h Strategy</span></span>
               <div class="pacing-score-big">${esc(scoreSmoothBig)}</div>
               <span class="pacing-score-sub">${scoreSmoothSub}</span>
             </div>
@@ -6663,9 +6890,9 @@ function renderPacingSection(targetId) {
         <div class="pacing-tracks">
           <!-- 5-Hour Burst Track -->
           <div class="pacing-track-col">
-            <div class="pacing-track-head">
+            <div class="pacing-track-head" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">
               <div class="pacing-track-title">
-                <strong>5-Hour Burst</strong>
+                <strong class="pacing-tip-trigger">5-Hour Burst</strong>
                 <span class="mono dim truncate" style="font-size:11.5px;">${fhSubTitleHtml}</span>
               </div>
               <div class="pacing-track-pct-wrap">
@@ -7508,9 +7735,10 @@ function renderFullViews() {
         : 0;
       const localCycleStr = localPct > 0 ? ` · ${localPct}% here` : "";
       const fullFoot = `${rem}% left · resets ${fmtResetIn(g.resetTime)}${localCycleStr}`;
+      const qTipPool = (is3pWk || is3p5h) ? "3p" : "gemini";
       return `
-        <div class="stat">
-          <div class="stat-label">${esc(g.groupName)} · ${esc(g.windowLabel)}</div>
+        <div class="stat" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, '${qTipPool}')" onmouseleave="hideQuotaConversionTip()">
+          <div class="stat-label"><span class="pacing-tip-trigger">${esc(g.groupName)} · ${esc(g.windowLabel)}</span></div>
           <div class="stat-value">${used}%</div>
           <div class="stat-foot"><span class="truncate" title="${esc(fullFoot)}">${esc(fullFoot)}</span></div>
         </div>
