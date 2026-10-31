@@ -778,8 +778,41 @@ _TELEMETRY_CACHE_TIME = 0
 
 MODEL_SELECTION_RE = re.compile(r"setting `?Model Selection`? from (.+?) to (.+?)\.\s*No need")
 SUBAGENT_CID_RE = re.compile(r'"conversationId":\s*"([0-9a-fA-F-]+)"')
+WORKER_TAG_RE = re.compile(r"\[AGY_INTERNAL_WORKER\]\s*(?:\[([A-Za-z0-9_-]+?)(?:_UPDATE)?\])?")
+WORKER_WATCHED_CID_RE = re.compile(r"^Watched-CID:\s*([0-9a-fA-F-]+)\s*$", re.MULTILINE)
+WORKER_WATCHED_ROLE_RE = re.compile(r"^Watched-Role:\s*(\S+)\s*$", re.MULTILINE)
+WORKER_MODEL_RE = re.compile(r"^(?:[A-Za-z0-9_-]+-)?Model:\s*(\S+)\s*$", re.MULTILINE)
+WORKER_WORKSPACE_RE = re.compile(r"^Workspace:\s*(.+?)\s*$", re.MULTILINE)
+WORKER_LEGACY_HDR_RE = re.compile(r"Watched Session Role:\s*`([^`]+)`\s*\(`([0-9a-fA-F]{8,})`\)")
+INTERNAL_SUBAGENTS_PATH = os.path.expanduser("~/.agents/internal_subagents.json")
 
-def _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, visited=None):
+def _map_model_slug_to_display(mod):
+    ml = (mod or "").strip().lower()
+    if not ml or ml == "inherit":
+        return None
+    if "argon" in ml or ml == "pro" or "pro-" in ml:
+        return "Gemini 4 Argon (High)" if ("high" in ml or ml == "pro") else "Gemini 4 Argon (Medium)"
+    if "flash_lite" in ml or ("flash" in ml and "low" in ml):
+        return "Gemini 3.8 Flash (Low)"
+    if "flash" in ml and "medium" in ml:
+        return "Gemini 3.8 Flash (Medium)"
+    if "flash" in ml:
+        return "Gemini 3.8 Flash (High)"
+    if "opus" in ml:
+        return "Claude Opus 5.5 (Medium)" if "medium" in ml else "Claude Opus 5.5 (High)"
+    if "sonnet" in ml or "claude" in ml:
+        if "low" in ml:
+            return "Claude Sonnet 5.5 (Low)"
+        if "medium" in ml:
+            return "Claude Sonnet 5.5 (Medium)"
+        return "Claude Sonnet 5.5 (High)"
+    if "haiku" in ml:
+        return "Claude Haiku 4.5"
+    if "gpt" in ml:
+        return "GPT-OSS 120B (Medium)"
+    return None
+
+def _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, internal_worker_cids=None, visited=None):
     if visited is None:
         visited = set()
     if cid in visited:
@@ -787,34 +820,27 @@ def _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, visit
     if cid in conv_first_from:
         return conv_first_from[cid]
     ag = (conv_meta.get(cid, {}).get("agent") or "").strip()
+    is_iw = bool(internal_worker_cids and cid in internal_worker_cids)
     sub = subagent_info.get(cid)
     if sub:
         tname, mod, pcid = sub
-        ml = (mod or "").lower()
-        if "flash_lite" in ml:
-            return "Gemini 3.8 Flash (Low)"
-        if "flash" in ml:
-            return "Gemini 3.8 Flash (High)"
-        if "pro" in ml:
-            return "Gemini 4 Argon (High)"
-        if "opus" in ml:
-            return "Claude Opus 5.5 (High)"
-        if "sonnet" in ml or "claude" in ml:
-            return "Claude Sonnet 5.5 (High)"
-        if "haiku" in ml:
-            return "Claude Haiku 4.5"
-        if "gpt" in ml:
-            return "GPT-OSS 120B (Medium)"
+        mapped = _map_model_slug_to_display(mod)
+        if mapped:
+            return mapped
         if tname == "research":
             return "Gemini 3.8 Flash (Medium)"
         if tname == "image-generator":
             return "Gemini 3.8 Flash (High)"
+        if is_iw:
+            return "Gemini 4 Argon (High)"
         if pcid:
-            return _resolve_initial_model(pcid, conv_first_from, subagent_info, conv_meta, visited | {cid})
+            return _resolve_initial_model(pcid, conv_first_from, subagent_info, conv_meta, internal_worker_cids, visited | {cid})
     if ag == "research":
         return "Gemini 3.8 Flash (Medium)"
     if ag == "image-generator":
         return "Gemini 3.8 Flash (High)"
+    if is_iw:
+        return "Gemini 4 Argon (High)"
     return "Gemini 4 Argon (Medium)"
 
 def load_raw_telemetry(force=False):
@@ -874,17 +900,102 @@ def load_raw_telemetry(force=False):
             transcript_paths[cid] = p
 
     paths_items = list(transcript_paths.items())
+    prefix_to_cid = {c[:8]: c for c in transcript_paths}
 
-    # Pass 1: Discover initial models and subagent -> parent/model mappings
+    # Pass 1: Discover initial models, native subagents, and internal worker sessions
     conv_first_from = {}
     subagent_info = {}
+    internal_worker_cids = set()
+    attached_internal_children = defaultdict(set)
+
+    if os.path.isfile(INTERNAL_SUBAGENTS_PATH):
+        try:
+            with open(INTERNAL_SUBAGENTS_PATH, "r", encoding="utf-8") as rf:
+                reg_data = json.load(rf)
+            if isinstance(reg_data, dict):
+                for icid, entry in reg_data.items():
+                    if not isinstance(entry, dict) or not _VALID_CID_RE.match(str(icid)):
+                        continue
+                    i_ag = str(entry.get("agent") or "internal-worker").strip()
+                    i_mod = str(entry.get("model") or "").strip()
+                    i_par = str(entry.get("parent") or "").strip()
+                    i_ws = str(entry.get("workspace") or "").strip()
+                    if "/.gemini/config/plugins/" in i_ws:
+                        i_ws = ""
+                    i_lbl = i_ag.replace("-", " ").replace("_", " ").title()
+                    i_title = str(entry.get("title") or f"{i_lbl} ({i_mod or 'auto'})").strip()
+                    internal_worker_cids.add(icid)
+                    subagent_info[icid] = (i_ag, i_mod or "inherit", i_par)
+                    prev_m = conv_meta.get(icid, {})
+                    conv_meta[icid] = {
+                        "title": i_title,
+                        "preview": prev_m.get("preview", ""),
+                        "step_count": prev_m.get("step_count", 1),
+                        "last_modified": entry.get("updated_at") or prev_m.get("last_modified", ""),
+                        "workspace": i_ws,
+                        "agent": i_ag,
+                        "parent": i_par,
+                        "killed": bool(prev_m.get("killed", False)),
+                    }
+                    if i_par:
+                        attached_internal_children[i_par].add(icid)
+        except Exception:
+            pass
+
     for cid, p in paths_items:
         pending_sub = []
         try:
             with open(p, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
+                for l_idx, line in enumerate(f):
                     if not line.strip():
                         continue
+                    if l_idx == 0 and "[AGY_INTERNAL_WORKER]" in line:
+                        internal_worker_cids.add(cid)
+                        if cid not in subagent_info:
+                            try:
+                                d0 = json.loads(line)
+                                c0 = str(d0.get("content") or "")
+                                m_tag = WORKER_TAG_RE.search(c0)
+                                tag_raw = (m_tag.group(1).strip() if (m_tag and m_tag.group(1)) else "internal-worker")
+                                w_ag = tag_raw.lower()
+                                w_lbl = tag_raw.replace("-", " ").replace("_", " ").title()
+                                m_cid = WORKER_WATCHED_CID_RE.search(c0)
+                                m_role = WORKER_WATCHED_ROLE_RE.search(c0)
+                                m_mod = WORKER_MODEL_RE.search(c0)
+                                m_ws = WORKER_WORKSPACE_RE.search(c0)
+                                par_cid = m_cid.group(1).strip() if m_cid else ""
+                                role_lbl = m_role.group(1).strip() if m_role else "Lead"
+                                mod_slug = m_mod.group(1).strip() if m_mod else ""
+                                ws_hdr = m_ws.group(1).strip() if m_ws else ""
+                                if ws_hdr == "(unassigned)" or "/.gemini/config/plugins/" in ws_hdr:
+                                    ws_hdr = ""
+                                if not par_cid:
+                                    m_leg = WORKER_LEGACY_HDR_RE.search(c0)
+                                    if m_leg:
+                                        role_lbl = m_leg.group(1).strip()
+                                        short_p = m_leg.group(2).strip()
+                                        par_cid = short_p if len(short_p) > 8 else prefix_to_cid.get(short_p[:8], "")
+                                subagent_info[cid] = (w_ag, mod_slug or "gemini-4-argon-high", par_cid)
+                                prev_m = conv_meta.get(cid, {})
+                                title_fb = (
+                                    f"{w_lbl} [{role_lbl}] ({mod_slug or w_ag})"
+                                    if role_lbl != "Lead"
+                                    else f"{w_lbl} ({mod_slug or w_ag})"
+                                )
+                                conv_meta[cid] = {
+                                    "title": title_fb,
+                                    "preview": prev_m.get("preview", ""),
+                                    "step_count": prev_m.get("step_count", 1),
+                                    "last_modified": prev_m.get("last_modified", ""),
+                                    "workspace": ws_hdr,
+                                    "agent": w_ag,
+                                    "parent": par_cid,
+                                    "killed": bool(prev_m.get("killed", False)),
+                                }
+                                if par_cid:
+                                    attached_internal_children[par_cid].add(cid)
+                            except Exception:
+                                pass
                     if "Model Selection" in line and cid not in conv_first_from:
                         try:
                             d0 = json.loads(line)
@@ -914,7 +1025,7 @@ def load_raw_telemetry(force=False):
 
     initial_models = {}
     for cid, _ in paths_items:
-        initial_models[cid] = _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta)
+        initial_models[cid] = _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, internal_worker_cids)
 
     all_requests = []
     daily = defaultdict(lambda: {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "steps": 0, "errors": 0, "tools": 0})
@@ -938,8 +1049,11 @@ def load_raw_telemetry(force=False):
         meta_ws = meta_entry.get("workspace", "")
         sub_tuple = subagent_info.get(cid)
         agent_type = meta_entry.get("agent") or (sub_tuple[0] if sub_tuple and sub_tuple[0] else ("subagent" if meta_entry.get("parent") else "Lead"))
+        is_internal_worker = cid in internal_worker_cids
 
         ws_proj = infer_project_from_path(meta_ws) if meta_ws else None
+        if ws_proj and ws_proj.startswith("~/.gemini/"):
+            ws_proj = None
         inferred_proj = ws_proj if (ws_proj and ws_proj != "~") else None
         fallback_tool_proj = None
 
@@ -1015,7 +1129,7 @@ def load_raw_telemetry(force=False):
                             "title": meta_entry.get("title", "Untitled Session")
                         })
                     else:
-                        if consecutive_errors >= 2:
+                        if consecutive_errors >= 2 and not is_internal_worker:
                             frustrations.append({
                                 "cid": cid,
                                 "category": "error_loop",
@@ -1031,30 +1145,31 @@ def load_raw_telemetry(force=False):
                     if source == "USER_EXPLICIT" and stype == "USER_INPUT":
                         last_req_for_session = None
                         pending_tool_events = []
-                        req_m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", content, re.DOTALL)
-                        user_text = req_m.group(1).strip() if req_m else content.strip()
+                        if not is_internal_worker:
+                            req_m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", content, re.DOTALL)
+                            user_text = req_m.group(1).strip() if req_m else content.strip()
 
-                        if user_text and not user_text.startswith("This is a side question"):
-                            turns_cnt += 1
-                            user_turn_events.append((cid, ts_ms))
-                            found_for_turn = set()
-                            for cat, rx in FRUSTRATION_PATTERNS.items():
-                                m = rx.search(user_text)
-                                if m:
-                                    found_for_turn.add((cat, m.group(0).strip()))
+                            if user_text and not user_text.startswith("This is a side question") and "[AGY_INTERNAL_WORKER]" not in user_text:
+                                turns_cnt += 1
+                                user_turn_events.append((cid, ts_ms))
+                                found_for_turn = set()
+                                for cat, rx in FRUSTRATION_PATTERNS.items():
+                                    m = rx.search(user_text)
+                                    if m:
+                                        found_for_turn.add((cat, m.group(0).strip()))
 
-                            first_line = user_text.split("\n")[0][:100]
-                            for cat, matched_str in found_for_turn:
-                                frustrations.append({
-                                    "cid": cid,
-                                    "category": cat,
-                                    "model": current_model,
-                                    "matched": matched_str,
-                                    "detail": f'"{matched_str}" — {first_line}',
-                                    "time": raw_dt,
-                                    "ts": ts_ms,
-                                    "title": meta_entry.get("title", "Untitled Session")
-                                })
+                                first_line = user_text.split("\n")[0][:100]
+                                for cat, matched_str in found_for_turn:
+                                    frustrations.append({
+                                        "cid": cid,
+                                        "category": cat,
+                                        "model": current_model,
+                                        "matched": matched_str,
+                                        "detail": f'"{matched_str}" — {first_line}',
+                                        "time": raw_dt,
+                                        "ts": ts_ms,
+                                        "title": meta_entry.get("title", "Untitled Session")
+                                    })
 
                     if stype == "PLANNER_RESPONSE" and "input_tokens" in d:
                         inp = int(d.get("input_tokens", 0) or 0)
@@ -1182,10 +1297,41 @@ def load_raw_telemetry(force=False):
                 "last_ts": last_ts or 0,
                 "turns": turns_cnt,
                 "subagents": subagents_cnt,
+                "is_internal_worker": is_internal_worker,
                 "initial_model": initial_models.get(cid, "Gemini 4 Argon (Medium)")
             }
         except Exception:
             pass
+
+    # Link attached internal worker children & inherit parent project workspaces transitively
+    for pcid, child_set in attached_internal_children.items():
+        if pcid in session_base:
+            valid_children = sum(1 for ch in child_set if ch in session_base)
+            session_base[pcid]["subagents"] += valid_children
+
+    reqs_by_cid = defaultdict(list)
+    for r in all_requests:
+        reqs_by_cid[r["cid"]].append(r)
+
+    def _needs_parent_proj(proj_val):
+        return (not proj_val) or proj_val in ("(unassigned)", "~") or str(proj_val).startswith("~/.gemini/")
+
+    for cid, sb in session_base.items():
+        if sb.get("parent") and _needs_parent_proj(sb.get("workspace")):
+            cur_p = sb.get("parent")
+            hops = 0
+            while cur_p and hops < 4:
+                psb = session_base.get(cur_p)
+                if not psb:
+                    break
+                cand_w = psb.get("workspace")
+                if not _needs_parent_proj(cand_w):
+                    sb["workspace"] = cand_w
+                    for req_item in reqs_by_cid.get(cid, ()):
+                        req_item["project"] = cand_w
+                    break
+                cur_p = psb.get("parent")
+                hops += 1
 
     all_requests.sort(key=lambda x: x["ts"], reverse=True)
     errors.sort(key=lambda x: x["ts"], reverse=True)
@@ -2016,7 +2162,26 @@ def build_session_trace(cid):
     telemetry = load_raw_telemetry()
     session_base = telemetry["session_base"]
     sb = session_base.get(cid, {})
-    children = [v for v in session_base.values() if v.get("parent") == cid]
+    children_by_parent = defaultdict(list)
+    for v in session_base.values():
+        p_id = v.get("parent")
+        if p_id:
+            children_by_parent[p_id].append(v)
+
+    children = []
+    seen_desc = {cid}
+    frontier = [(cid, 0)]
+    while frontier:
+        cur_id, depth = frontier.pop(0)
+        if depth >= 3:
+            continue
+        for ch in sorted(children_by_parent.get(cur_id, ()), key=lambda x: x.get("first_ts", 0)):
+            ch_id = ch["cid"]
+            if ch_id not in seen_desc:
+                seen_desc.add(ch_id)
+                children.append(ch)
+                frontier.append((ch_id, depth + 1))
+
     target_cids = [cid] + [c["cid"] for c in children]
 
     raw_spans = []
@@ -2068,6 +2233,8 @@ def build_session_trace(cid):
 
                     is_err = _is_step_error(d, stype, source, content)
                     if stype == "USER_INPUT" and source == "USER_EXPLICIT":
+                        if t_cid != cid and t_sb.get("is_internal_worker"):
+                            continue
                         req_m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", content, re.DOTALL)
                         utxt = (req_m.group(1).strip() if req_m else content.strip())
                         if not utxt:
@@ -4057,84 +4224,90 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root, html[data-theme="dark"] {
-    --bg: #000000;
-    --panel: #09090a;
-    --card: #0e0e10;
-    --raised: #17171a;
-    --overlay: rgba(14, 14, 16, 0.78);
-    --hover: rgba(255, 255, 255, 0.035);
-    --press: rgba(255, 255, 255, 0.06);
-    --selected: rgba(255, 255, 255, 0.075);
-    --line-1: rgba(255, 255, 255, 0.06);
-    --line-2: rgba(255, 255, 255, 0.09);
-    --line-3: rgba(255, 255, 255, 0.14);
-    --line-4: rgba(255, 255, 255, 0.22);
-    --ink-1: #ededef;
-    --ink-2: #a0a0a8;
-    --ink-3: #6c6c74;
-    --ink-4: #46464c;
-    --ink-inverse: #0a0a0b;
-    --accent-a: #5ad8e6;
-    --accent-b: #ed4abf;
-    --accent: #f068c8;
-    --accent-soft: rgba(237, 74, 191, 0.14);
-    --accent-line: rgba(237, 74, 191, 0.35);
-    --accent-gradient: linear-gradient(100deg, var(--accent-a), var(--accent-b));
-    --focus: #5ad8e6;
-    --ok: #3ecf8e;
-    --ok-soft: rgba(62, 207, 142, 0.13);
-    --warn: #f5a524;
-    --warn-soft: rgba(245, 165, 36, 0.13);
-    --bad: #ff6166;
-    --bad-soft: rgba(255, 97, 102, 0.13);
-    --live: #3ecf8e;
-    --chart-grid: rgba(255, 255, 255, 0.055);
-    --chart-axis: #5c5c64;
+    color-scheme: dark;
+    --bg: #0b0b0c;
+    --panel: #111113;
+    --card: #161619;
+    --raised: #1e1e22;
+    --overlay: rgba(20, 20, 23, 0.94);
+    --hover: rgba(255, 255, 255, 0.04);
+    --press: rgba(255, 255, 255, 0.065);
+    --selected: rgba(255, 255, 255, 0.08);
+    --line-1: #202024;
+    --line-2: #2a2a30;
+    --line-3: #383840;
+    --line-4: #4c4c57;
+    --ink-1: #f2f2f4;
+    --ink-2: #b4b4bc;
+    --ink-3: #8c8c96;
+    --ink-4: #5a5a64;
+    --ink-inverse: #0b0b0c;
+    --accent-a: #4796ff;
+    --accent-b: #3186ff;
+    --accent: #4796ff;
+    --accent-soft: rgba(71, 150, 255, 0.13);
+    --accent-line: rgba(71, 150, 255, 0.32);
+    --accent-gradient: #4796ff;
+    --focus: #4796ff;
+    --ok: #3fc07a;
+    --ok-soft: rgba(63, 192, 122, 0.13);
+    --warn: #e59922;
+    --warn-soft: rgba(229, 153, 34, 0.13);
+    --bad: #e5566f;
+    --bad-soft: rgba(229, 86, 111, 0.13);
+    --live: #3fc07a;
+    --chart-grid: rgba(255, 255, 255, 0.06);
+    --chart-axis: #8c8c96;
     --chart-cursor: rgba(255, 255, 255, 0.05);
-    --chart-primary: #5ad8e6;
-    --chart-secondary: #ed4abf;
-    --shadow-1: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 1px 2px rgba(0, 0, 0, 0.5);
-    --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.55), 0 1px 0 rgba(255, 255, 255, 0.05) inset;
-    --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.7), 0 1px 0 rgba(255, 255, 255, 0.06) inset;
+    --chart-primary: #4796ff;
+    --chart-secondary: #68707d;
+    --chart-tertiary: #9aa1ad;
+    --chart-quaternary: #c6cbd4;
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.32);
+    --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.48);
+    --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.65);
   }
 
   html[data-theme="light"] {
-    --bg: #f2f2f3;
+    color-scheme: light;
+    --bg: #f6f7f8;
     --panel: #ffffff;
     --card: #ffffff;
-    --raised: #f6f6f7;
-    --overlay: rgba(255, 255, 255, 0.8);
-    --hover: rgba(0, 0, 0, 0.031);
-    --press: rgba(0, 0, 0, 0.05);
-    --selected: rgba(0, 0, 0, 0.06);
-    --line-1: rgba(0, 0, 0, 0.06);
-    --line-2: rgba(0, 0, 0, 0.09);
-    --line-3: rgba(0, 0, 0, 0.14);
-    --line-4: rgba(0, 0, 0, 0.22);
-    --ink-1: #151518;
-    --ink-2: #5a5a63;
-    --ink-3: #8b8b94;
-    --ink-4: #b9b9c0;
+    --raised: #f3f4f6;
+    --overlay: rgba(255, 255, 255, 0.96);
+    --hover: rgba(0, 0, 0, 0.032);
+    --press: rgba(0, 0, 0, 0.052);
+    --selected: rgba(0, 0, 0, 0.062);
+    --line-1: #e9ebee;
+    --line-2: #d6dae0;
+    --line-3: #bcc2cc;
+    --line-4: #99a1af;
+    --ink-1: #111214;
+    --ink-2: #52555d;
+    --ink-3: #6b6e77;
+    --ink-4: #9ca0aa;
     --ink-inverse: #ffffff;
-    --accent-a: #1fa9bb;
-    --accent-b: #d42ea3;
-    --accent: #c42596;
-    --accent-soft: rgba(212, 46, 163, 0.1);
-    --accent-line: rgba(212, 46, 163, 0.3);
-    --accent-gradient: linear-gradient(100deg, var(--accent-a), var(--accent-b));
-    --focus: #1fa9bb;
-    --ok: #12a36b;
-    --ok-soft: rgba(18, 163, 107, 0.11);
-    --warn: #c77c02;
-    --warn-soft: rgba(199, 124, 2, 0.11);
-    --bad: #dc3a40;
-    --bad-soft: rgba(220, 58, 64, 0.1);
-    --live: #12a36b;
-    --chart-grid: rgba(0, 0, 0, 0.06);
-    --chart-axis: #9a9aa2;
+    --accent-a: #2563eb;
+    --accent-b: #1d4ed8;
+    --accent: #2563eb;
+    --accent-soft: rgba(37, 99, 235, 0.1);
+    --accent-line: rgba(37, 99, 235, 0.28);
+    --accent-gradient: #2563eb;
+    --focus: #2563eb;
+    --ok: #1f8850;
+    --ok-soft: rgba(31, 136, 80, 0.1);
+    --warn: #b86e00;
+    --warn-soft: rgba(184, 110, 0, 0.11);
+    --bad: #c93348;
+    --bad-soft: rgba(201, 51, 72, 0.1);
+    --live: #1f8850;
+    --chart-grid: rgba(0, 0, 0, 0.065);
+    --chart-axis: #6b6e77;
     --chart-cursor: rgba(0, 0, 0, 0.04);
-    --chart-primary: #1fa9bb;
-    --chart-secondary: #d42ea3;
+    --chart-primary: #2563eb;
+    --chart-secondary: #7b8391;
+    --chart-tertiary: #a5acb8;
+    --chart-quaternary: #cfd4dd;
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.04);
     --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.1);
     --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.16);
@@ -4209,7 +4382,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-bottom: 1px solid transparent;
     align-items: center;
     gap: 12px;
-    padding: 0 14px 0 18px;
+    padding: 0 18px;
     top: 0; left: 0; right: 0;
   }
   .topbar[data-scrolled="true"] {
@@ -4291,7 +4464,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .nav-row-label { flex: 1; }
   .nav-row kbd {
-    font-size: 10px;
+    font-size: 11px;
     color: var(--ink-4);
     opacity: 0;
     transition: opacity var(--dur-1) var(--ease);
@@ -4320,7 +4493,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border: 1px solid var(--line-2);
     background: var(--line-1);
     color: var(--ink-2);
-    font-size: 10.5px;
+    font-size: 11px;
   }
 
   /* Main Shell */
@@ -4332,7 +4505,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: var(--panel);
     border-radius: var(--r-panel);
     border: 1px solid var(--line-1);
-    box-shadow: var(--shadow-1);
     overflow: clip;
   }
   .page {
@@ -4472,16 +4644,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .stat-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(var(--stat-min, 170px), 1fr));
+    gap: 1px;
     border-radius: var(--r-card);
-    background: linear-gradient(var(--card), var(--card)) padding-box, linear-gradient(180deg, var(--line-3), var(--line-1) 40%) border-box;
-    box-shadow: var(--shadow-1);
+    background: var(--line-1);
     overflow: hidden;
-    border: 1px solid transparent;
+    border: 1px solid var(--line-1);
   }
   .stat {
     position: relative;
     display: flex;
-    box-shadow: 1px 0 0 var(--line-1), 0 1px 0 var(--line-1);
+    background: var(--card);
     flex-direction: column;
     gap: 6px;
     min-width: 0;
@@ -4492,7 +4664,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12.5px;
+    font-size: 13px;
     font-weight: 500;
   }
   .stat-value {
@@ -4535,10 +4707,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .card {
     position: relative;
     border-radius: var(--r-card);
-    background: linear-gradient(var(--card), var(--card)) padding-box, linear-gradient(180deg, var(--line-3), var(--line-1) 40%) border-box;
-    box-shadow: var(--shadow-1);
+    background: var(--card);
     display: flex;
-    border: 1px solid transparent;
+    border: 1px solid var(--line-1);
     flex-direction: column;
     min-width: 0;
   }
@@ -4575,6 +4746,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .grid-main-side { grid-template-columns: 1fr; }
     .sidebar { display: none; }
     .shell-main { margin-left: 8px; }
+    .topbar-brand { min-width: 0; }
+  }
+  @media (max-width: 960px) {
+    #primaryStatGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    #secondaryStatGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    #liveScanInfo, .topbar-hide-md { display: none !important; }
+    #settingsBtn svg { margin-right: 0 !important; }
+  }
+  @media (max-width: 720px) {
+    #timeRangeSeg, #themeToggleBtn { display: none; }
+  }
+  @media (max-width: 520px) {
+    #primaryStatGrid { grid-template-columns: 1fr; }
+    #secondaryStatGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (min-width: 961px) {
+    #primaryStatGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    #secondaryStatGrid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
   }
 
   /* Share Bar / Proportion Stack */
@@ -4714,7 +4903,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .chart-axis text {
     fill: var(--chart-axis, var(--ink-3));
     font-family: var(--font-mono);
-    font-size: 10.5px;
+    font-size: 11px;
     letter-spacing: -0.01em;
   }
   .chart-bar {
@@ -4764,14 +4953,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: var(--overlay);
     backdrop-filter: blur(20px) saturate(170%);
     -webkit-backdrop-filter: blur(20px) saturate(170%);
-    box-shadow: var(--shadow-3);
+    box-shadow: none;
     overflow: hidden;
     flex-direction: column;
     top: 8px; bottom: 8px; right: 8px;
     transform: translateX(110%);
     transition: transform var(--dur-3) var(--ease-out);
   }
-  .drawer.open { transform: translateX(0); }
+  .drawer.open { transform: translateX(0); box-shadow: var(--shadow-3); }
   .drawer-header {
     display: flex;
     border-bottom: 1px solid var(--line-1);
@@ -4861,8 +5050,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     to { opacity: 1; transform: none; }
   }
   @keyframes shimmer {
-    from { background-position: 200% 0; }
-    to { background-position: -200% 0; }
+    0%, 100% { opacity: 0.45; }
+    50% { opacity: 0.9; }
   }
   @keyframes indeterminate {
     from { transform: translateX(-100%); }
@@ -4903,8 +5092,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: block;
   }
   .topbar-progress-fill {
-    background: var(--accent-gradient);
-    box-shadow: 0 0 12px var(--accent-b);
+    background: var(--accent);
     height: 100%;
     width: 40%;
     animation: indeterminate 1.2s var(--ease) infinite;
@@ -4933,9 +5121,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     color: var(--ink-3);
   }
   .skeleton {
-    background: linear-gradient(90deg, var(--line-1) 0%, var(--line-2) 50%, var(--line-1) 100%);
-    background-size: 200% 100%;
-    animation: shimmer 1.6s linear infinite;
+    background: var(--raised);
+    animation: shimmer 1.5s var(--ease) infinite;
     border-radius: 6px;
   }
   .table-skeleton {
@@ -5229,7 +5416,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .pacing-tip-pill {
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 500;
     color: var(--ink-3);
     border-bottom: 1px dotted var(--line-3);
@@ -5327,7 +5514,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .pacing-race-wrap {
     position: relative;
-    padding-top: 14px;
+    padding-top: 15px;
     padding-bottom: 2px;
   }
   .pacing-race-track {
@@ -5349,7 +5536,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .pacing-clock-tag {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 500;
     color: var(--ink-2);
     letter-spacing: -0.01em;
@@ -5470,9 +5657,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <button class="btn" data-size="sm" data-variant="ghost" onclick="applyCustomRange()">Apply</button>
     </div>
     <button class="btn" data-variant="ghost" id="themeToggleBtn" onclick="toggleTheme()" title="Toggle theme">Light</button>
-    <button class="btn" data-variant="ghost" id="settingsBtn" onclick="openSettingsModal()" title="Preferences & defaults">
+    <button class="btn" data-variant="ghost" id="settingsBtn" aria-label="Settings" onclick="openSettingsModal()" title="Preferences & defaults">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:5px; vertical-align:-2px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      Settings
+      <span class="topbar-hide-md">Settings</span>
     </button>
     <button class="btn" data-variant="primary" onclick="refreshCurrentRange()">Refresh</button>
   </div>
@@ -6304,7 +6491,7 @@ function renderDynamicOverview() {
   document.getElementById("primaryStatGrid").innerHTML = `
     <div class="stat" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, G_PACING_POOL)" onmouseleave="hideQuotaConversionTip()">
       <div class="stat-label"><span class="pacing-tip-trigger">Weekly quota</span></div>
-      <div class="stat-value" style="color:var(--chart-primary);">${ov.pctWeeklySpent}%</div>
+      <div class="stat-value">${ov.pctWeeklySpent}%</div>
       <div class="stat-foot"><span class="truncate" title="${esc(footWkTitle)}">${esc(footWk)}</span></div>
       <div class="stat-spark">${renderSparklineSVG(qWkSpark, "var(--chart-primary)")}</div>
     </div>
@@ -6313,7 +6500,7 @@ function renderDynamicOverview() {
       <div class="stat-label">Requests</div>
       <div class="stat-value">${B(ov.totalRequests)}</div>
       <div class="stat-foot"><span class="truncate">${B(ov.failedRequests)} failed · ${He(ov.errorRate, 1)}</span></div>
-      <div class="stat-spark">${renderSparklineSVG(reqSpark, "var(--accent-a)")}</div>
+      <div class="stat-spark">${renderSparklineSVG(reqSpark, "var(--chart-primary)")}</div>
     </div>
 
     <div class="stat">
@@ -6327,7 +6514,7 @@ function renderDynamicOverview() {
       <div class="stat-label">Cache rate</div>
       <div class="stat-value">${He(ov.cacheRate)}</div>
       <div class="stat-foot"><span class="truncate">${Re(ov.totalCacheReadTokens)} cached</span></div>
-      <div class="stat-spark">${renderSparklineSVG(cacheSpark, "var(--ok)")}</div>
+      <div class="stat-spark">${renderSparklineSVG(cacheSpark, "var(--chart-primary)")}</div>
     </div>
   `;
 
@@ -7158,20 +7345,20 @@ function renderDynamicTokenMix() {
   const totalConv = ov.conversationTokens || 1;
 
   const segments = [
-    { key: "input", label: "Uncached input", value: ov.totalInputTokens, color: "#5b8cff" },
     { key: "cacheRead", label: "Cache read", value: ov.totalCacheReadTokens, color: "var(--chart-primary)" },
-    { key: "cacheWrite", label: "Cache write", value: ov.totalCacheWriteTokens, color: "#f5b54a" },
-    { key: "output", label: "Output", value: ov.totalOutputTokens, color: "var(--chart-secondary)" }
+    { key: "input", label: "Uncached input", value: ov.totalInputTokens, color: "var(--chart-tertiary)" },
+    { key: "output", label: "Output", value: ov.totalOutputTokens, color: "var(--chart-secondary)" },
+    { key: "cacheWrite", label: "Cache write", value: ov.totalCacheWriteTokens, color: "var(--chart-quaternary)" }
   ];
 
   const agentColors = {
-    "Lead": "#5ad8e6",
-    "self": "#9d7bff",
-    "research": "#f5a524",
-    "image-generator": "#2dd4bf",
-    "subagent": "#4ade80"
+    "Lead": "var(--chart-primary)",
+    "self": "#7cb3ff",
+    "research": "var(--chart-tertiary)",
+    "image-generator": "#a8ccff",
+    "subagent": "var(--chart-secondary)"
   };
-  const fallbackAgentPalette = ["#5b8cff", "#ed4abf", "#38bdf8", "#a3e635", "#fb923c"];
+  const fallbackAgentPalette = ["var(--chart-primary)", "#7cb3ff", "var(--chart-tertiary)", "var(--chart-secondary)", "var(--chart-quaternary)"];
   function colorForAgent(name) {
     if (agentColors[name]) return agentColors[name];
     let h = 0;
@@ -7564,8 +7751,8 @@ async function openSessionTrace(cid) {
 
     const spanColor = sp => {
       if (sp.isError) return "var(--bad)";
-      if (sp.kind === "user") return "#5b8cff";
-      if (sp.kind === "subagent" || sp.agent !== "Lead") return "#4ade80";
+      if (sp.kind === "user") return "var(--chart-tertiary)";
+      if (sp.kind === "subagent" || sp.agent !== "Lead") return "var(--chart-secondary)";
       return "var(--chart-primary)";
     };
 
@@ -7606,9 +7793,9 @@ async function openSessionTrace(cid) {
         <header class="card-header">
           <h2 class="card-title">Timeline</h2>
           <div class="legend">
-            <span class="legend-item"><span class="swatch" style="background:#5b8cff;"></span> User</span>
+            <span class="legend-item"><span class="swatch" style="background:var(--chart-tertiary);"></span> User</span>
             <span class="legend-item"><span class="swatch" style="background:var(--chart-primary);"></span> Lead</span>
-            <span class="legend-item"><span class="swatch" style="background:#4ade80;"></span> Subagent</span>
+            <span class="legend-item"><span class="swatch" style="background:var(--chart-secondary);"></span> Subagent</span>
             <span class="legend-item"><span class="swatch" style="background:var(--bad);"></span> Error</span>
           </div>
         </header>
@@ -7687,7 +7874,7 @@ function renderFullViews() {
       <tr>
         <td class="mono">
           <strong>${esc(m)}</strong>
-          ${v.is3p ? `<span class="badge" data-tone="neutral" style="margin-left:6px; height:18px; font-size:10.5px;">Claude/GPT</span>` : ""}
+          ${v.is3p ? `<span class="badge" data-tone="neutral" style="margin-left:6px; height:18px; font-size:11px;">Claude/GPT</span>` : ""}
         </td>
         <td data-align="right" class="num">${B(v.steps)}</td>
         <td data-align="right" class="num">${Re(v.in)}</td>

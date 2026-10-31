@@ -4,6 +4,8 @@ Zero-dependency, single-file telemetry, live quota pacing, and session trace ana
 
 Ships as a standalone Python 3 stdlib executable (`agy-stats`) with an interactive Web Dashboard (`http://localhost:3872`) and rich terminal CLI reports (`agy stats --cli`). Zero `pip` packages, zero Node/npm dependencies, zero `sudo`, and zero global `PATH` bloat.
 
+![agy-stats Web Dashboard](assets/dashboard.png)
+
 ---
 
 ## Platform & Surface Support
