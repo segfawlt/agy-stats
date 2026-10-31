@@ -4054,7 +4054,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;550;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root, html[data-theme="dark"] {
     --bg: #000000;
@@ -4141,7 +4141,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   :root {
-    --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     --font-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
     --r-chip: 6px;
     --r-control: 8px;
@@ -4166,7 +4166,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-family: var(--font-sans);
     color: var(--ink-1);
     background: var(--bg);
-    font-feature-settings: "cv11", "ss01";
+    font-optical-sizing: auto;
     min-height: 100vh;
     font-size: 13.5px;
     line-height: 1.5;
@@ -4195,13 +4195,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   /* Ambient Glow & Topbar */
   .shell-ambient {
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 0;
-    background:
-      radial-gradient(60rem 28rem at 12% -10%, color-mix(in srgb, var(--accent-a) 7%, transparent), transparent 70%),
-      radial-gradient(50rem 26rem at 95% -12%, color-mix(in srgb, var(--accent-b) 6%, transparent), transparent 70%);
+    display: none;
   }
   .topbar {
     position: fixed;
@@ -4258,10 +4252,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .nav-group { display: flex; flex-direction: column; gap: 1px; }
   .nav-heading {
     color: var(--ink-3);
-    text-transform: uppercase;
-    letter-spacing: .08em;
+    letter-spacing: -.005em;
     padding: 6px 10px 4px;
-    font-size: 10.5px;
+    font-size: 11.5px;
     font-weight: 600;
   }
   .nav-row {
@@ -5118,16 +5111,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --p-tone: var(--chart-primary);
     --p-tone-soft: color-mix(in srgb, var(--chart-primary) 11%, transparent);
   }
-  .card.pacing-deck:not([data-minimal="true"])::before {
-    content: "";
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    z-index: 0;
-    background:
-      radial-gradient(46rem 18rem at 5% -10%, var(--p-tone-soft), transparent 68%),
-      linear-gradient(90deg, var(--p-tone) 0%, transparent 56%) top / 100% 2px no-repeat;
-  }
   .pacing-hero {
     position: relative;
     z-index: 1;
@@ -5238,11 +5221,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     flex-wrap: wrap;
   }
   .pacing-score-label {
-    font-size: 10.5px;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--ink-3);
+    font-size: 12.5px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    color: var(--ink-2);
   }
   .pacing-tip-pill {
     font-family: var(--font-mono);
@@ -5279,10 +5261,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-weight: 600;
   }
   .pacing-score-big {
-    font-family: var(--font-mono);
+    font-family: var(--font-sans);
     font-variant-numeric: tabular-nums;
-    font-size: clamp(24px, 2.3vw, 31px);
-    line-height: 1.08;
+    font-size: clamp(24px, 2.3vw, 30px);
+    line-height: 1.12;
     font-weight: 700;
     letter-spacing: -0.03em;
     color: var(--ink-1);
@@ -5337,11 +5319,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     flex-shrink: 0;
   }
   .pacing-track-pct {
-    font-family: var(--font-mono);
+    font-family: var(--font-sans);
     font-variant-numeric: tabular-nums;
     font-size: 19px;
     font-weight: 700;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.025em;
   }
   .pacing-race-wrap {
     position: relative;
@@ -5367,10 +5349,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .pacing-clock-tag {
     font-family: var(--font-mono);
-    font-size: 9.5px;
-    font-weight: 600;
+    font-size: 10px;
+    font-weight: 500;
     color: var(--ink-2);
-    letter-spacing: 0.02em;
+    letter-spacing: -0.01em;
     line-height: 1;
     margin-bottom: 3px;
     white-space: nowrap;
@@ -5753,7 +5735,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="drawer-header">
     <div class="drawer-titles">
       <div class="row" style="gap:6px; margin-bottom:4px;">
-        <span class="badge" id="drawerToneBadge">REQUEST</span>
+        <span class="badge" id="drawerToneBadge">Request</span>
       </div>
       <h3 class="drawer-title" id="drawerTitle">Details</h3>
       <div class="drawer-subtitle mono" id="drawerSubtitle"></div>
@@ -6383,7 +6365,7 @@ function _clockPinHtml(pct) {
   const tagShift = clamped < 9 ? "translateX(-10%)" : (clamped > 91 ? "translateX(-90%)" : "translateX(-50%)");
   return `
     <div style="position:absolute; top:0; left:${clamped}%; pointer-events:none;">
-      <div class="pacing-clock-tag" style="position:absolute; top:0; left:0; transform:${tagShift};">NOW · ${Math.round(clamped)}%</div>
+      <div class="pacing-clock-tag" style="position:absolute; top:0; left:0; transform:${tagShift};">Now · ${Math.round(clamped)}%</div>
       <div class="pacing-clock-line" style="position:absolute; top:13px; left:-1px;"></div>
     </div>
   `;
@@ -6414,7 +6396,7 @@ function showQuotaConversionTip(e, poolKey) {
   const activeLabel = p.label || (pk === "3p" ? "Claude / GPT" : "Gemini");
 
   tip.innerHTML = `
-    <div class="chart-tooltip-title">100% OF 5H LIMIT IN WEEKLY QUOTA</div>
+    <div class="chart-tooltip-title" style="font-family:var(--font-sans); font-weight:600; color:var(--ink-2); font-size:11.5px;">5h burst → weekly quota</div>
     <div class="chart-tooltip-row" data-active-pool="${pk === 'gemini'}">
       <span class="swatch" style="background:${pk === 'gemini' ? 'var(--chart-primary)' : 'var(--ink-3)'};"></span>
       <span class="chart-tooltip-label">Gemini 100% 5h</span>
@@ -6873,12 +6855,12 @@ function renderPacingSection(targetId) {
           ${controlsHtml}
           <div class="pacing-scoreboard">
             <div class="pacing-score-cell">
-              <span class="pacing-score-label">Pace to Finish 100%</span>
+              <span class="pacing-score-label">Pace to finish 100%</span>
               <div class="pacing-score-big" data-tone="accent">${esc(scorePaceBig)}</div>
               <span class="pacing-score-sub">${scorePaceSub}</span>
             </div>
             <div class="pacing-score-cell" data-has-tip="true" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">
-              <span class="pacing-score-label"><span class="pacing-tip-trigger">Smooth 5h Strategy</span></span>
+              <span class="pacing-score-label"><span class="pacing-tip-trigger">Smooth 5h strategy</span></span>
               <div class="pacing-score-big">${esc(scoreSmoothBig)}</div>
               <span class="pacing-score-sub">${scoreSmoothSub}</span>
             </div>
