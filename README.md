@@ -110,12 +110,12 @@ agy stats --uninstall --purge # Also delete ~/.config/agy-stats/config.json
 Keep your 32-byte Ed25519 private seed strictly outside Git at `~/.config/agy-stats/keys/release_ed25519.key` (`chmod 600`).
 
 ```sh
-# 1. Build & cross-verify agy-stats.sha256 + agy-stats.sig locally (Python + OpenSSL)
+# 1. Run pre-flight gates & sign agy-stats.sha256 + agy-stats.sig locally
 ./release.sh --local
 
-# 2. Preview a tagged GitHub Release (verifies __version__ matches tag)
-./release.sh v1.0.0
+# 2. Dry-run preview of next release (patch | minor | major | vX.Y.Z)
+./release.sh minor
 
-# 3. Publish signed release assets to GitHub Releases via gh CLI
-./release.sh v1.0.0 --publish
+# 3. Bump version, sign, commit, tag, push & publish GitHub Release via gh CLI
+./release.sh minor --publish
 ```
