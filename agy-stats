@@ -254,6 +254,7 @@ DEFAULT_CONFIG = {
         "open_browser": True,
         "quota_mode": "server",
         "pacing_style": "fun",
+        "pacing_bars": True,
         "disabled_tabs": []
     },
     "cli": {
@@ -340,6 +341,7 @@ def _read_config_with_status():
                 res["web"]["quota_mode"] = w["quota_mode"]
             if w.get("pacing_style") in ("fun", "straight", "minimal"):
                 res["web"]["pacing_style"] = w["pacing_style"]
+            res["web"]["pacing_bars"] = _safe_bool(w.get("pacing_bars"), True)
             if isinstance(w.get("disabled_tabs"), list):
                 res["web"]["disabled_tabs"] = [str(t).lower() for t in w["disabled_tabs"] if t]
         if isinstance(cfg.get("cli"), dict):
@@ -393,6 +395,8 @@ def save_config(updates):
                 cur["web"]["quota_mode"] = "multi" if v == "multi" else "server"
             elif k == "pacing_style" and v in ("fun", "straight", "minimal"):
                 cur["web"]["pacing_style"] = v
+            elif k == "pacing_bars":
+                cur["web"]["pacing_bars"] = _safe_bool(v, cur["web"]["pacing_bars"])
             elif k == "disabled_tabs" and isinstance(v, list):
                 cur["web"]["disabled_tabs"] = [str(t).lower() for t in v if t]
     if "cli" in updates and isinstance(updates["cli"], dict):
@@ -3872,6 +3876,11 @@ def handle_settings_cli(args_list):
             except Exception: pass
         elif k in ("quota_mode", "web.quota_mode"):
             updates.setdefault("web", {})["quota_mode"] = "multi" if v.lower() == "multi" else "server"
+        elif k in ("pacing_style", "web.pacing_style"):
+            if v.lower() in ("fun", "straight", "minimal"):
+                updates.setdefault("web", {})["pacing_style"] = v.lower()
+        elif k in ("pacing_bars", "web.pacing_bars"):
+            updates.setdefault("web", {})["pacing_bars"] = v.lower() in ("1", "true", "yes", "on")
         elif k in ("cli.view", "view", "default_view"):
             updates.setdefault("cli", {})["default_view"] = v.lower()
         elif k in ("display", "preset"):
@@ -4986,6 +4995,280 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     accent-color: var(--accent);
     margin: 0;
   }
+
+  /* Quota Pacing Hero Deck */
+  .card.pacing-deck {
+    position: relative;
+    overflow: hidden;
+    --p-tone: var(--ok);
+    --p-tone-soft: var(--ok-soft);
+  }
+  .card.pacing-deck[data-tone="warn"] {
+    --p-tone: var(--warn);
+    --p-tone-soft: var(--warn-soft);
+  }
+  .card.pacing-deck[data-tone="bad"] {
+    --p-tone: var(--bad);
+    --p-tone-soft: var(--bad-soft);
+  }
+  .card.pacing-deck[data-tone="neutral"] {
+    --p-tone: var(--chart-primary);
+    --p-tone-soft: color-mix(in srgb, var(--chart-primary) 11%, transparent);
+  }
+  .card.pacing-deck:not([data-minimal="true"])::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background:
+      radial-gradient(46rem 18rem at 5% -10%, var(--p-tone-soft), transparent 68%),
+      linear-gradient(90deg, var(--p-tone) 0%, transparent 56%) top / 100% 2px no-repeat;
+  }
+  .pacing-hero {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1.3fr) minmax(320px, 1fr);
+    gap: 26px;
+    padding: 22px 24px;
+    align-items: stretch;
+  }
+  .pacing-copy {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 10px;
+    min-width: 0;
+  }
+  .pacing-headline {
+    font-size: clamp(21px, 2.15vw, 28px);
+    line-height: 1.16;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    color: var(--ink-1);
+  }
+  .pacing-headline .hl-accent {
+    color: var(--p-tone);
+  }
+  .pacing-sub {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--ink-2);
+    max-width: 60ch;
+  }
+  .pacing-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 2px;
+  }
+  .pacing-pill-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding: 0 11px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--ink-2);
+    background: var(--hover);
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-pill);
+    transition: all var(--dur-1) var(--ease);
+  }
+  .pacing-pill-btn:hover {
+    color: var(--ink-1);
+    border-color: var(--line-3);
+    background: var(--press);
+  }
+  .pacing-pill-btn[data-active="true"] {
+    color: var(--ink-1);
+    background: var(--selected);
+    border-color: var(--line-3);
+  }
+  .pacing-right {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    justify-content: space-between;
+    min-width: 0;
+  }
+  .pacing-controls {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .pacing-scoreboard {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    background: color-mix(in srgb, var(--raised) 65%, transparent);
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-card);
+    overflow: hidden;
+  }
+  .pacing-score-cell {
+    padding: 15px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .pacing-score-cell + .pacing-score-cell {
+    border-left: 1px solid var(--line-1);
+  }
+  .pacing-score-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .pacing-score-big {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(24px, 2.3vw, 31px);
+    line-height: 1.08;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    color: var(--ink-1);
+    margin-top: 2px;
+  }
+  .pacing-score-big[data-tone="accent"] {
+    color: var(--p-tone);
+  }
+  .pacing-score-sub {
+    font-size: 12px;
+    color: var(--ink-2);
+    line-height: 1.35;
+  }
+  .pacing-tracks {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border-top: 1px solid var(--line-1);
+    background: color-mix(in srgb, var(--bg) 28%, var(--card));
+  }
+  .pacing-track-col {
+    padding: 15px 24px 17px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    min-width: 0;
+  }
+  .pacing-track-col + .pacing-track-col {
+    border-left: 1px solid var(--line-1);
+  }
+  .pacing-track-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .pacing-track-title {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+  }
+  .pacing-track-title strong {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-1);
+    white-space: nowrap;
+  }
+  .pacing-track-pct-wrap {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .pacing-track-pct {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .pacing-race-wrap {
+    position: relative;
+    padding-top: 14px;
+    padding-bottom: 2px;
+  }
+  .pacing-race-track {
+    height: 9px;
+    width: 100%;
+    background: var(--line-2);
+    border-radius: var(--r-pill);
+    overflow: hidden;
+    display: flex;
+  }
+  .pacing-clock-pin {
+    position: absolute;
+    top: 0;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: none;
+  }
+  .pacing-clock-tag {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    font-weight: 600;
+    color: var(--ink-2);
+    letter-spacing: 0.02em;
+    line-height: 1;
+    margin-bottom: 3px;
+    white-space: nowrap;
+  }
+  .pacing-clock-line {
+    width: 2px;
+    height: 13px;
+    background: var(--ink-1);
+    border-radius: 2px;
+    box-shadow: 0 0 5px rgba(0, 0, 0, 0.55);
+  }
+  .pacing-track-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+  @media (max-width: 960px) {
+    .pacing-hero {
+      grid-template-columns: 1fr;
+      gap: 18px;
+      padding: 18px;
+    }
+    .pacing-controls {
+      justify-content: flex-start;
+    }
+    .pacing-tracks {
+      grid-template-columns: 1fr;
+    }
+    .pacing-track-col {
+      padding: 14px 18px 16px;
+    }
+    .pacing-track-col + .pacing-track-col {
+      border-left: none;
+      border-top: 1px solid var(--line-1);
+    }
+  }
+  @media (max-width: 520px) {
+    .pacing-scoreboard {
+      grid-template-columns: 1fr;
+    }
+    .pacing-score-cell + .pacing-score-cell {
+      border-left: none;
+      border-top: 1px solid var(--line-1);
+    }
+  }
 </style>
 </head>
 <body>
@@ -5135,9 +5418,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="stat-grid rise" style="--stat-min:140px;" id="secondaryStatGrid"></div>
       </div>
 
-      <section class="card rise" style="--i:1" id="overviewPacingCard">
-        <div class="card-body" id="overviewPacingBody" data-stale-target="true" data-stale="false">
-          <div class="skeleton" style="width:100%;height:96px;border-radius:8px;"></div>
+      <section class="card pacing-deck rise" style="--i:1" id="overviewPacingCard">
+        <div class="card-body" data-flush="true" id="overviewPacingBody" data-stale-target="true" data-stale="false">
+          <div style="padding:18px;"><div class="skeleton" style="width:100%;height:96px;border-radius:8px;"></div></div>
         </div>
       </section>
 
@@ -5241,7 +5524,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="skeleton rise" data-grid-skel="true" style="width:100%;height:96px;border-radius:12px;"></div>
       <div class="stat-grid rise" style="--stat-min:220px;" id="quotaPoolsGrid" data-stale-target="true" data-stale="false" hidden></div>
-      <section class="card rise" style="--i:1"><div class="card-body" id="quotaPacingBody" data-stale-target="true" data-stale="false"><div class="skeleton" style="width:100%;height:96px;border-radius:8px;"></div></div></section>
+      <section class="card pacing-deck rise" style="--i:1" id="quotaPacingCard"><div class="card-body" data-flush="true" id="quotaPacingBody" data-stale-target="true" data-stale="false"><div style="padding:18px;"><div class="skeleton" style="width:100%;height:96px;border-radius:8px;"></div></div></div></section>
       <div class="card rise" style="--i:2"><header class="card-header"><h2 class="card-title">Daily ledger</h2></header><div class="card-body" data-flush="true" data-stale-target="true" data-stale="false"><div class="table-skeleton" data-table-skel="10"></div><div class="table-wrap" hidden><table class="table"><thead><tr><th>Date</th><th data-align="right">Requests</th><th data-align="right">Input</th><th data-align="right">Output</th><th data-align="right">Cache read</th><th data-align="right">Tokens</th><th data-align="right">Weekly quota</th></tr></thead><tbody id="quotaLedgerTbody"></tbody></table></div></div></div>
     </section>
 
@@ -5404,6 +5687,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <span>Minimal (Zero Pressure)</span>
           </label>
         </div>
+        <label class="checkbox-row" style="margin-top:4px;">
+          <input type="checkbox" id="settingPacingBars" checked>
+          <span>Show 5-hour &amp; weekly progress bars below the pacing headline</span>
+        </label>
       </div>
 
       <!-- Overview & Summary Display Sections -->
@@ -5494,6 +5781,12 @@ let G_PACING_STYLE = (() => {
     const s = localStorage.getItem("agy-stats-pacing-style");
     return (s === "fun" || s === "straight" || s === "minimal") ? s : "fun";
   } catch (e) { return "fun"; }
+})();
+let G_PACING_BARS = (() => {
+  try {
+    const b = localStorage.getItem("agy-stats-pacing-bars");
+    return b === null ? true : (b !== "false" && b !== "0");
+  } catch (e) { return true; }
 })();
 let G_PACING_QUIP_IDX = 0;
 
@@ -5679,6 +5972,26 @@ function setPacingStyle(styleKey, persist = true) {
   renderPacingSection("overviewPacingBody");
   renderPacingSection("quotaPacingBody");
   syncSegmentedThumbs();
+}
+function setPacingBars(showBars, persist = true) {
+  G_PACING_BARS = !!showBars;
+  try { localStorage.setItem("agy-stats-pacing-bars", G_PACING_BARS ? "true" : "false"); } catch (e) {}
+  const cb = document.getElementById("settingPacingBars");
+  if (cb) cb.checked = G_PACING_BARS;
+  if (persist) {
+    if (G_SETTINGS && G_SETTINGS.web) G_SETTINGS.web.pacing_bars = G_PACING_BARS;
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Stats": "1" },
+      body: JSON.stringify({ web: { pacing_bars: G_PACING_BARS } })
+    }).catch(() => {});
+  }
+  renderPacingSection("overviewPacingBody");
+  renderPacingSection("quotaPacingBody");
+  syncSegmentedThumbs();
+}
+function togglePacingBars() {
+  setPacingBars(!G_PACING_BARS, true);
 }
 function cyclePacingQuip() {
   G_PACING_QUIP_IDX = (G_PACING_QUIP_IDX + 1) % 12;
@@ -5909,11 +6222,24 @@ function _poolHealthTone(po) {
   return "ok";
 }
 
+function _clockPinHtml(pct) {
+  const clamped = Math.min(100, Math.max(0, Number(pct || 0)));
+  const tagShift = clamped < 9 ? "translateX(-10%)" : (clamped > 91 ? "translateX(-90%)" : "translateX(-50%)");
+  return `
+    <div style="position:absolute; top:0; left:${clamped}%; pointer-events:none;">
+      <div class="pacing-clock-tag" style="position:absolute; top:0; left:0; transform:${tagShift};">NOW · ${Math.round(clamped)}%</div>
+      <div class="pacing-clock-line" style="position:absolute; top:13px; left:-1px;"></div>
+    </div>
+  `;
+}
+
 function renderPacingSection(targetId) {
   const el = document.getElementById(targetId);
   if (!el || !G_OVERVIEW_DATA?.overall) return;
+  const cardEl = el.closest(".pacing-deck");
   if (!G_OVERVIEW_DATA.overall.pacing) {
-    el.innerHTML = `<div class="dim micro" style="padding:8px 0;">Live server quota pacing unavailable.</div>`;
+    if (cardEl) { cardEl.dataset.tone = "neutral"; cardEl.dataset.minimal = "true"; }
+    el.innerHTML = `<div class="dim micro" style="padding:16px 20px;">Live server quota pacing unavailable.</div>`;
     return;
   }
   const ov = G_OVERVIEW_DATA.overall;
@@ -5938,7 +6264,7 @@ function renderPacingSection(targetId) {
   const burstRefill = fmtResetIn(p.fhResetTime);
   const poolLabel = p.label || (G_PACING_POOL === "3p" ? "Claude / GPT" : "Gemini");
 
-  // 5-Hour Burst metrics (live baseline: max of 5h window avg vs last-1h sprint)
+  // 5-Hour Burst metrics
   const fhUsed = Number(p.server5hUsedPct ?? 0);
   const fhRem = Number(p.server5hRemPct ?? Math.max(0, 100 - fhUsed));
   const fhExhausted = fhRem <= 0.05;
@@ -5946,7 +6272,6 @@ function renderPacingSection(targetId) {
   const fhRunOut = !!p.fhWillRunOut && !fhExhausted;
   const fhProjUnclipped = Number(p.server5hUnclippedPct ?? fhUsed);
   const fhProj = Number(p.server5hProjectedPct ?? Math.min(100, fhProjUnclipped));
-  const fhRatio = Number(p.server5hPaceRatio ?? 0);
   const fhRateHr = Number(p.server5hRatePerHour ?? 0);
   const fhSafeHr = Number(p.safe5hHourlyBudgetLeft ?? 20);
   const fhRateSrc = p.fhRateSource || "5h window";
@@ -5956,42 +6281,37 @@ function renderPacingSection(targetId) {
   const fhOtherW = Math.min(100 - fhLocalW, Math.max(0, Number(p.other5hUsedPct || 0)));
   const fhHasDualSeg = fhLocalW > 0.05 && fhOtherW >= 1.0;
 
-  let fhTone = "ok";
-  let fhBadge = `SAFE · ${fhRatio.toFixed(1)}x`;
   let fhBarColor = "var(--ok)";
-  let fhFooterHtml = "";
-
+  let fhSubTitleHtml = "";
+  let fhRightMetaHtml = "";
   if (fhExhausted) {
-    fhTone = "bad";
-    fhBadge = "EXHAUSTED";
     fhBarColor = "var(--bad)";
-    fhFooterHtml = `<strong style="color:var(--bad);">0% left</strong> <span class="dim">· refills in ${esc(burstRefill)}</span>`;
+    fhSubTitleHtml = `exhausted · refills in ${esc(burstRefill)}`;
+    fhRightMetaHtml = `<span class="mono" style="color:var(--bad);">Paused until refill</span>`;
   } else if (fhWarmup) {
-    fhTone = "neutral";
-    fhBadge = "FRESH WINDOW";
     fhBarColor = "var(--ok)";
-    fhFooterHtml = `<strong>Fresh 5h tank</strong> <span class="dim">· ~${Re(p.est5hReqsLeft)} avg reqs available</span>`;
+    fhSubTitleHtml = `fresh window · refills in ${esc(burstRefill)}`;
+    fhRightMetaHtml = `<span class="mono">~${Re(p.est5hReqsLeft)} avg reqs in 5h tank</span>`;
   } else if (fhRunOut) {
-    fhTone = "bad";
-    fhBadge = `HOT · ${fhRatio.toFixed(1)}x`;
     fhBarColor = "var(--bad)";
     const fhTte = fmtHoursJS(p.fhTteHours);
-    const fhMultTxt = fhMultVal != null ? `${fhMultVal.toFixed(2)}x pace` : `slow by ${fhCutPct}%`;
-    fhFooterHtml = `<strong style="color:var(--bad);">Dry in ~${esc(fhTte)}</strong> <span class="dim">(${esc(fhRateSrc)}) · drop to <strong>${esc(fhMultTxt)}</strong> (&lt;= ${fhSafeHr.toFixed(1)}%/hr)</span>`;
+    fhSubTitleHtml = `dry in ~${esc(fhTte)} · refills in ${esc(burstRefill)}`;
+    const fhMultTxt = fhMultVal != null ? `${fhMultVal.toFixed(2)}x pace` : `-${fhCutPct}%`;
+    fhRightMetaHtml = `<span class="mono" style="color:var(--bad);">Drop to ${esc(fhMultTxt)} (&lt;= ${fhSafeHr.toFixed(1)}%/hr)</span>`;
   } else if (fhProjUnclipped >= 85) {
-    fhTone = "warn";
-    fhBadge = `ACTIVE · ${fhRatio.toFixed(1)}x`;
     fhBarColor = "var(--warn)";
-    fhFooterHtml = `<strong>Lands ~${fhProj.toFixed(0)}% at refill</strong> <span class="dim">(${esc(fhRateSrc)}) · ~${Re(p.est5hReqsLeft)} reqs left</span>`;
+    fhSubTitleHtml = `refills in ${esc(burstRefill)} · active sprint`;
+    fhRightMetaHtml = `<span class="mono">Tracks ~${fhProj.toFixed(0)}% by refill (${esc(fhRateSrc)})</span>`;
   } else {
-    fhTone = "ok";
-    fhBadge = `SAFE · ${fhRatio.toFixed(1)}x`;
     fhBarColor = "var(--ok)";
-    const fhStep = (fhMultVal != null && fhMultVal >= 1.15 && fhMultVal <= 15) ? `can go <strong>${fhMultVal.toFixed(1)}x</strong> faster` : `room up to ${fhSafeHr.toFixed(1)}%/hr`;
-    fhFooterHtml = `<strong>~${fhProj.toFixed(0)}% by refill</strong> <span class="dim">(${esc(fhRateSrc)}) · ${fhStep} (~${Re(p.est5hReqsLeft)} reqs)</span>`;
+    const fhStep = (fhMultVal != null && fhMultVal >= 1.15 && fhMultVal <= 15)
+      ? ` · can go <strong style="color:var(--ink-1);">${fhMultVal.toFixed(1)}x</strong> faster`
+      : "";
+    fhSubTitleHtml = `refills in ${esc(burstRefill)}${fhStep}`;
+    fhRightMetaHtml = `<span class="mono">Tracks ~${fhProj.toFixed(0)}% by refill (${esc(fhRateSrc)})</span>`;
   }
 
-  // Weekly Endurance & Smooth 5h metrics (recency-weighted 24h + cycle baseline)
+  // Weekly Endurance & Smooth 5h metrics
   const wkUsed = Number(p.serverWkUsedPct ?? 0);
   const wkRem = Number(p.serverWkRemPct ?? Math.max(0, 100 - wkUsed));
   const wkExhausted = wkRem <= 0.05;
@@ -6023,135 +6343,70 @@ function renderPacingSection(targetId) {
   const peak1hWk = Number(p.peak1hWkPct ?? 0);
   const sprintHrs = p.sprintHoursLeft != null ? Number(p.sprintHoursLeft) : null;
 
-  let wkTone = "ok";
-  let wkBadge = `SAFE · ${wkRatio.toFixed(1)}x`;
+  const wkClockPos = Math.min(100, Math.max(0, Number(p.wkElapsedPct || 0)));
+  const clockDelta = Math.round(wkUsed - wkClockPos);
+
   let wkBarColor = "var(--ok)";
+  let wkSubTitleHtml = "";
+  let wkRightMetaHtml = "";
   if (wkExhausted) {
-    wkTone = "bad"; wkBadge = "EXHAUSTED"; wkBarColor = "var(--bad)";
-  } else if (wkWarmup) {
-    wkTone = "neutral"; wkBadge = "WARMING UP"; wkBarColor = "var(--ok)";
+    wkBarColor = "var(--bad)";
+    wkSubTitleHtml = `exhausted · resets in ${esc(resetDisp)}`;
+    wkRightMetaHtml = `<span class="mono" style="color:var(--bad);">0% remaining</span>`;
   } else if (wkUnkillable) {
-    wkTone = "ok"; wkBadge = "UNKILLABLE"; wkBarColor = "var(--ok)";
+    wkBarColor = "var(--ok)";
+    wkSubTitleHtml = `resets in ${esc(resetDisp)} · impossible to exhaust`;
+    wkRightMetaHtml = `<span class="mono">${Math.max(0, -clockDelta)}% behind clock = safe surplus</span>`;
   } else if (wkRunOut) {
-    wkTone = "bad"; wkBadge = `HIGH BURN · ${wkRatio.toFixed(1)}x`; wkBarColor = "var(--bad)";
+    wkBarColor = "var(--bad)";
+    wkSubTitleHtml = `resets in ${esc(resetDisp)} · ${wkRatio.toFixed(1)}x burn`;
+    wkRightMetaHtml = `<span class="mono" style="color:var(--bad);">${clockDelta >= 0 ? `+${clockDelta}% ahead of clock` : `empties in ~${esc(fmtHoursJS(p.wkTteHours))}`}</span>`;
   } else if (wkProjUnclipped >= 85) {
-    wkTone = "warn"; wkBadge = `ON TARGET · ${wkRatio.toFixed(1)}x`; wkBarColor = "var(--warn)";
+    wkBarColor = "var(--warn)";
+    wkSubTitleHtml = `resets in ${esc(resetDisp)} · on target`;
+    wkRightMetaHtml = `<span class="mono">Lands ~${wkProj.toFixed(0)}% at reset</span>`;
   } else {
-    wkTone = "ok"; wkBadge = `UNDER PACE · ${wkRatio.toFixed(1)}x`; wkBarColor = "var(--ok)";
+    wkBarColor = "var(--ok)";
+    wkSubTitleHtml = `resets in ${esc(resetDisp)} · ${wkRem.toFixed(1)}% left`;
+    wkRightMetaHtml = `<span class="mono">Tracks ~${wkProj.toFixed(0)}% at reset</span>`;
   }
 
-  const sprintNote = (sprintHrs != null && peak1hWk > 0)
-    ? `~${sprintHrs.toFixed(1)}h at ${peak1hWk.toFixed(2)}%/hr peak sprint`
-    : `~${p.burstTanksEquivLeft} full 5h tanks`;
-  const wkFooterHtml = `<strong>~${Re(p.estReqsLeft)} avg reqs left</strong> <span class="dim">· ${esc(sprintNote)}</span>`;
-
-  // 3-Tile Action Strip values: (1) Will it run out? (2) Pace to finish 100% (3) Smooth 5h strategy
-  let tileRunMain = "", tileRunSub = "";
-  if (wkExhausted) {
-    tileRunMain = `<span style="color:var(--bad);">Exhausted (0% left)</span>`;
-    tileRunSub = `Weekly resets in ${esc(resetDisp)}`;
-  } else if (fhExhausted) {
-    tileRunMain = `<span style="color:var(--bad);">5h tank at 0%</span>`;
-    tileRunSub = `Refills in ${esc(burstRefill)} · ${wkRem.toFixed(1)}% wk left`;
-  } else if (wkUnkillable) {
-    tileRunMain = `<span style="color:var(--ok);">Impossible before reset</span>`;
-    tileRunSub = `5h caps max total at ~${maxFinalWk.toFixed(0)}% in ${esc(resetDisp)}`;
-  } else if (wkWarmup) {
-    tileRunMain = `<span>Calibrating (&lt; 6h)</span>`;
-    tileRunSub = `${wkRem.toFixed(1)}% left across ${esc(resetDisp)}`;
-  } else if (wkRunOut) {
-    tileRunMain = `<span style="color:var(--bad);">Yes — in ~${esc(fmtHoursJS(p.wkTteHours))}</span>`;
-    tileRunSub = `Runs dry ${esc(fmtHoursJS(p.wkShortfallHours))} before ${esc(resetDay)} reset`;
-  } else if (fhRunOut) {
-    tileRunMain = `<span style="color:var(--warn);">5h burst in ~${esc(fmtHoursJS(p.fhTteHours))}</span>`;
-    tileRunSub = `Weekly pool is safe (~${wkProj.toFixed(0)}% at reset)`;
-  } else if (wkProjUnclipped >= 85) {
-    tileRunMain = `<span style="color:var(--warn);">No — lands ~${wkProj.toFixed(0)}%</span>`;
-    tileRunSub = `~${Math.max(0, 100 - wkProj).toFixed(0)}% buffer at ${esc(resetDay)} reset`;
-  } else {
-    tileRunMain = `<span style="color:var(--ok);">No (~${wkProj.toFixed(0)}% at reset)</span>`;
-    tileRunSub = `~${Math.max(0, 100 - wkProj).toFixed(0)}% would go unused`;
-  }
-
-  let tilePaceMain = "", tilePaceSub = "";
-  if (wkExhausted) {
-    tilePaceMain = `<span style="color:var(--bad);">0x — wait for reset</span>`;
-    tilePaceSub = `Fresh 100% drops in ${esc(resetDisp)}`;
-  } else if (wkUnkillable) {
-    const multTag = (wkMultVal != null && wkMultVal <= 25) ? ` (${wkMultVal.toFixed(1)}x pace)` : "";
-    tilePaceMain = `<span style="color:var(--ok);">All-out${esc(multTag)}</span>`;
-    tilePaceSub = `No rationing needed · use freely`;
-  } else if (wkWarmup) {
-    tilePaceMain = `<span>&lt;= ${esc(wkTargetStr)}</span>`;
-    tilePaceSub = `~${Re(p.estReqsLeft)} avg reqs in tank`;
-  } else if (wkMultVal != null) {
-    if (wkRunOut) {
-      tilePaceMain = `<span style="color:var(--bad);">${wkMultVal.toFixed(2)}x your pace</span>`;
-      tilePaceSub = `Slow down by ${wkCutPct}% (${esc(wkCurStr)} → ${esc(wkTargetStr)})`;
-    } else if (wkProjUnclipped >= 85) {
-      tilePaceMain = `<span style="color:var(--warn);">${wkMultVal.toFixed(1)}x (hold steady)</span>`;
-      tilePaceSub = `Now ${esc(wkCurStr)} · ceiling ${esc(wkTargetStr)}`;
-    } else {
-      tilePaceMain = `<span style="color:var(--ok);">${wkMultVal.toFixed(1)}x your pace</span>`;
-      tilePaceSub = `Step up ${esc(wkCurStr)} → ${esc(wkTargetStr)}`;
-    }
-  } else {
-    tilePaceMain = `<span style="color:var(--ok);">Up to ${esc(wkTargetStr)}</span>`;
-    tilePaceSub = `Light recent burn · ~${Re(p.estReqsLeft)} reqs left`;
-  }
-
-  let tileSmoothMain = "", tileSmoothSub = "";
-  if (wkExhausted) {
-    tileSmoothMain = `<span style="color:var(--bad);">0% per 5h session</span>`;
-    tileSmoothSub = `Resets in ${esc(resetDisp)}`;
-  } else if (wkUnkillable || smooth24x7Pct > 100) {
-    tileSmoothMain = `<span style="color:var(--ok);">Max 100% every 5h</span>`;
-    tileSmoothSub = `Safe to max every window (~${maxFinalWk.toFixed(0)}% wk max)`;
-  } else if (smoothSessPct > 100) {
-    tileSmoothMain = `<span style="color:var(--ok);">100% per awake 5h</span>`;
-    tileSmoothSub = `Or ~${smooth24x7Pct}% per 5h if 24/7 (${calWindows.toFixed(1)} win)`;
-  } else {
-    tileSmoothMain = `<span>~${smoothSessPct}% per 5h session</span>`;
-    tileSmoothSub = `Across ~${awakeSessions.toFixed(1)} awake sessions · ~${smooth24x7Pct}% if 24/7`;
-  }
-
-  // Header controls HTML (shared across all 3 display styles)
-  const headerHtml = `
-    <div class="row" style="justify-content:space-between; flex-wrap:wrap; gap:10px; align-items:center;">
-      <div class="row" style="gap:8px; align-items:center; flex-wrap:wrap;">
-        <strong style="font-size:14px; letter-spacing:-.005em;">Quota Pacing &amp; Runway</strong>
-        <span class="mono dim micro">Cycle started ${esc(p.wkCycleSince || ov.wkCycleSince || "this week")}</span>
-      </div>
-      <div class="row" style="gap:8px; align-items:center; flex-wrap:wrap;">
-        ${has3p ? `
-          <div class="segmented" data-size="sm">
-            <button type="button" class="segmented-option" data-active="${G_PACING_POOL === 'gemini'}" onclick="setPacingPool('gemini')" title="Gemini weekly &amp; 5-hour quota pool">
-              <span class="dot" data-tone="${gemTone}" style="width:6px;height:6px;"></span>
-              <span>Gemini</span>
-              <span class="mono micro dim">${Math.round(Number(pools.gemini?.serverWkUsedPct || 0))}%</span>
-            </button>
-            <button type="button" class="segmented-option" data-active="${G_PACING_POOL === '3p'}" onclick="setPacingPool('3p')" title="Claude &amp; GPT weekly &amp; 5-hour quota pool">
-              <span class="dot" data-tone="${tpTone}" style="width:6px;height:6px;"></span>
-              <span>Claude/GPT</span>
-              <span class="mono micro dim">${Math.round(Number(pools['3p']?.serverWkUsedPct || 0))}%</span>
-            </button>
-          </div>
-        ` : ""}
-        <div class="segmented" data-size="sm" title="Switch pacing guidance style">
-          <button type="button" class="segmented-option" data-active="${styleMode === 'fun'}" onclick="setPacingStyle('fun')">Fun</button>
-          <button type="button" class="segmented-option" data-active="${styleMode === 'straight'}" onclick="setPacingStyle('straight')">Straight</button>
-          <button type="button" class="segmented-option" data-active="${styleMode === 'minimal'}" onclick="setPacingStyle('minimal')">Minimal</button>
+  // Controls cluster (Pool switcher + Fun/Straight/Minimal switcher)
+  const controlsHtml = `
+    <div class="pacing-controls">
+      ${has3p ? `
+        <div class="segmented" data-size="sm">
+          <button type="button" class="segmented-option" data-active="${G_PACING_POOL === 'gemini'}" onclick="setPacingPool('gemini')" title="Gemini weekly &amp; 5-hour quota pool">
+            <span class="dot" data-tone="${gemTone}" style="width:6px;height:6px;"></span>
+            <span>Gemini</span>
+            <span class="mono micro dim">${Math.round(Number(pools.gemini?.serverWkUsedPct || 0))}%</span>
+          </button>
+          <button type="button" class="segmented-option" data-active="${G_PACING_POOL === '3p'}" onclick="setPacingPool('3p')" title="Claude &amp; GPT weekly &amp; 5-hour quota pool">
+            <span class="dot" data-tone="${tpTone}" style="width:6px;height:6px;"></span>
+            <span>Claude/GPT</span>
+            <span class="mono micro dim">${Math.round(Number(pools['3p']?.serverWkUsedPct || 0))}%</span>
+          </button>
         </div>
+      ` : ""}
+      <div class="segmented" data-size="sm" title="Switch pacing guidance style">
+        <button type="button" class="segmented-option" data-active="${styleMode === 'fun'}" onclick="setPacingStyle('fun')">Fun</button>
+        <button type="button" class="segmented-option" data-active="${styleMode === 'straight'}" onclick="setPacingStyle('straight')">Straight</button>
+        <button type="button" class="segmented-option" data-active="${styleMode === 'minimal'}" onclick="setPacingStyle('minimal')">Minimal</button>
       </div>
     </div>
   `;
 
+  // Minimal (zero-pressure) mode: compact calm 2-bar view, no big coach headline
   if (styleMode === "minimal") {
+    if (cardEl) { cardEl.dataset.tone = "neutral"; cardEl.dataset.minimal = "true"; }
     const minFhW = Math.min(100, Math.max(0, fhUsed));
     const minWkW = Math.min(100, Math.max(0, wkUsed));
     el.innerHTML = `
-      <div class="stack" style="gap:12px;">
-        ${headerHtml}
+      <div class="stack" style="gap:12px; padding:16px 20px;">
+        <div class="row" style="justify-content:space-between; flex-wrap:wrap; gap:10px; align-items:center;">
+          <span class="muted" style="font-size:13px; font-weight:600;">${esc(poolLabel)} Quota</span>
+          ${controlsHtml}
+        </div>
         <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px;">
           <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px;">
             <div class="row" style="justify-content:space-between; font-size:12px;">
@@ -6183,227 +6438,304 @@ function renderPacingSection(targetId) {
     return;
   }
 
-  // Build Coach ("Fun") quips & "Straight" summary line in intuitive human multipliers + smooth 5h session %
-  let coachTone = "ok";
-  let coachColor = "var(--ok)";
-  let quips = [];
-  let straightSummary = "";
+  // Scoreboard cells: (1) Pace to Finish 100%  (2) Smooth 5h Strategy
   const wkMultTxt = wkMultVal != null ? `${wkMultVal < 1 ? wkMultVal.toFixed(2) : wkMultVal.toFixed(1)}x` : null;
-
-  if (wkExhausted || fhExhausted) {
-    coachTone = "bad";
-    coachColor = "var(--bad)";
-    const which = wkExhausted ? `weekly (${resetDisp})` : `5-hour burst (${burstRefill})`;
-    quips = [
-      `To squeeze another token out of ${poolLabel} right now, you have to wait out the ${which} clock — this tank is officially at 0.0%.`,
-      `To keep shipping while ${poolLabel} recharges (${which}), you have to flip over to your other model pool or grab a well-earned coffee.`,
-      `To get past a 0% ${poolLabel} gauge, you have to let time do its thing — fresh quota drops in ${wkExhausted ? resetDisp : burstRefill}.`
-    ];
-    straightSummary = `${poolLabel} ${wkExhausted ? "weekly" : "5-hour"} pool is at 0% remaining. Resets in ${wkExhausted ? resetDisp : burstRefill}.`;
-  } else if (wkRunOut) {
-    coachTone = "bad";
-    coachColor = "var(--bad)";
-    const wkTte = fmtHoursJS(p.wkTteHours);
-    const wkShort = fmtHoursJS(p.wkShortfallHours);
-    const paceLead = wkMultTxt ? `run at ${wkMultTxt} your current pace` : `trim burn by ${wkCutPct}%`;
-    quips = [
-      `To survive until ${resetDay}'s ${poolLabel} reset without 429s, you have to ${paceLead} — or smoothly cap each 5h coding session near ~${smoothSessPct}%.`,
-      `To keep ${poolLabel} alive for the next ${resetDisp} (instead of running dry in ~${wkTte}), you have to dial down to ${wkMultTxt || `-${wkCutPct}%`} (~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(0)} awake sessions).`,
-      `To stretch ${wkRem.toFixed(1)}% ${poolLabel} quota across ${resetDisp}, you have to ration like a Mars rover: ~${smoothSessPct}% per 5h session (~${Re(p.estReqsLeft)} avg reqs left).`,
-      `To dodge the ${poolLabel} wall arriving ~${wkShort} early, you have to drop to ${wkMultTxt || wkTargetStr} and route routine turns to lighter tiers.`
-    ];
-    straightSummary = `Weekly ${poolLabel} runs out in ~${wkTte} (${wkShort} before reset). Finish cleanly at ${wkMultTxt ? `${wkMultTxt} your pace` : `<=${wkTargetStr}`}, or ~${smoothSessPct}% per 5h session (~${awakeSessions.toFixed(1)} awake sessions).`;
-  } else if (fhRunOut) {
-    coachTone = "bad";
-    coachColor = "var(--bad)";
-    const fhTte = fmtHoursJS(p.fhTteHours);
-    const fhMultTxt = fhMultVal != null ? `${fhMultVal.toFixed(2)}x` : null;
-    quips = [
-      `To avoid a 5h pit stop in ~${fhTte}, you have to ${fhMultTxt ? `drop to ${fhMultTxt} your ${fhRateSrc} burst pace` : `cool 5h burn by ${fhCutPct}%`} until the ${burstRefill} refill (weekly pool is still safe at ${wkRem.toFixed(1)}% left).`,
-      `To reach the 5h ${poolLabel} refill without hitting the rev limiter, you have to ease off to <= ${fhSafeHr.toFixed(1)}%/hr — after refill, ~${smoothSessPct}% per 5h session finishes the week smoothly.`,
-      `To keep coding uninterrupted through the next ${burstRefill}, you have to pace the remaining ~${Re(p.est5hReqsLeft)} reqs in this 5h tank.`
-    ];
-    straightSummary = `5-hour ${poolLabel} burst exhausts in ~${fhTte} (${fhRateSrc} pace). Drop to ${fhMultTxt ? `${fhMultTxt} burst pace` : `<=${fhSafeHr.toFixed(1)}%/hr`} until ${burstRefill}; weekly pool remains safe (${wkRem.toFixed(1)}% left).`;
+  let scorePaceBig = "", scorePaceSub = "";
+  if (wkExhausted) {
+    scorePaceBig = `0x`;
+    scorePaceSub = `wait for reset in ${esc(resetDisp)}`;
   } else if (wkUnkillable) {
-    coachTone = "ok";
-    coachColor = "var(--ok)";
-    quips = [
-      `To finish as much ${poolLabel} weekly quota as physically possible before ${resetDay}'s reset (${resetDisp}), you can go all-out and max 100% of every 5h window — weekly still finishes near ~${maxFinalWk.toFixed(0)}%.`,
-      `To drain this ${poolLabel} weekly tank in ${resetDisp}, you would have to bend spacetime (${wkMultTxt ? `${wkMultTxt} your current pace` : `${wkRem.toFixed(1)}% left`}). Zero weekly rationing needed — only the 5h cap applies.`,
-      `To waste as little ${poolLabel} quota as possible before reset, you have to floor the pedal — maxing every 5h tank left (~${p.burstWindowsLeft} windows) is 100% safe (~${Re(p.estReqsLeft)} avg reqs left).`,
-      `To dent the remaining ${wkRem.toFixed(1)}% ${poolLabel} pool before the clock wipes it clean, unleash parallel subagents freely — you cannot break the weekly bank from here.`
-    ];
-    straightSummary = `Safe to use freely: even maxing 100% of every remaining 5h window (${p.burstWindowsLeft} windows) reaches at most ~${maxFinalWk.toFixed(0)}% weekly by reset (${wkMultTxt ? `${wkMultTxt} current pace` : "no weekly rationing needed"}).`;
+    scorePaceBig = (wkMultVal != null && wkMultVal <= 25) ? `${wkMultVal.toFixed(1)}x` : `All-out`;
+    scorePaceSub = `your current pace · zero weekly rationing`;
   } else if (wkWarmup) {
-    coachTone = "ok";
-    coachColor = "var(--ok)";
-    quips = [
-      `To burn all 100% of this fresh ${poolLabel} week smoothly without hitting walls, aim for ~${ Math.min(100, smoothSessPct) }% per 5h coding session across ~${awakeSessions.toFixed(0)} awake sessions (~${Re(p.estReqsLeft)} avg reqs left).`,
-      `To get a live multiplier lock on this brand-new ${poolLabel} cycle, ship a few commits first — smooth target is ~${Math.min(100, smoothSessPct)}% per 5h session.`,
-      `To pace this fresh ${poolLabel} tank cleanly to ${resetDay}, distribute ~${Math.min(100, smoothSessPct)}% per awake 5h session (or ~${Math.min(100, smooth24x7Pct)}% if running 24/7).`
-    ];
-    straightSummary = `Fresh ${poolLabel} weekly cycle (< 6h elapsed, ${wkRem.toFixed(1)}% left). Smooth 100% target: ~${Math.min(100, smoothSessPct)}% per 5h session across ~${awakeSessions.toFixed(1)} awake sessions.`;
-  } else if (wkProjUnclipped >= 85) {
-    coachTone = "warn";
-    coachColor = "var(--warn)";
-    quips = [
-      `To land right near 100% used as ${resetDay}'s ${poolLabel} reset hits, hold steady at ${wkMultTxt || "1.0x"} your current pace (~${Math.min(100, smoothSessPct)}% per 5h coding session).`,
-      `To stay inside the Goldilocks zone on ${poolLabel}, keep cruising around ~${Math.min(100, smoothSessPct)}% per 5h session across your ~${awakeSessions.toFixed(0)} remaining awake sessions.`,
-      `To extract full value from ${poolLabel} without hitting a single wall, touch nothing — tracking ~${wkProj.toFixed(0)}% by reset (~${Re(p.estReqsLeft)} avg reqs left).`
-    ];
-    straightSummary = `${poolLabel} weekly pace is on target (${wkMultTxt ? `${wkMultTxt} pace` : `~${wkProj.toFixed(0)}% projected`}). Hold ~${Math.min(100, smoothSessPct)}% per 5h session across ~${awakeSessions.toFixed(1)} awake sessions.`;
+    scorePaceBig = `Calibrating`;
+    scorePaceSub = `&lt;= ${esc(wkTargetStr)} sustainable ceiling`;
+  } else if (wkMultVal != null) {
+    scorePaceBig = wkMultTxt;
+    if (wkRunOut) {
+      scorePaceSub = `your pace · slow down by ${wkCutPct}% (${esc(wkCurStr)} → ${esc(wkTargetStr)})`;
+    } else if (wkProjUnclipped >= 85) {
+      scorePaceSub = `your pace · hold steady (${esc(wkCurStr)} vs ${esc(wkTargetStr)})`;
+    } else {
+      scorePaceSub = `your pace · can step up (${esc(wkCurStr)} → ${esc(wkTargetStr)})`;
+    }
   } else {
-    coachTone = "ok";
-    coachColor = "var(--ok)";
-    const unused = Math.max(0, 100 - wkProj).toFixed(0);
-    const smoothDesc = smoothSessPct > 100 ? `maxing 100% per awake 5h session` : `~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(0)} awake sessions`;
-    quips = [
-      `To use 100% of your ${poolLabel} quota before ${resetDay} wipes ~${unused}% away, ${wkMultTxt ? `step up to ${wkMultTxt} your current pace` : `ramp up throughput`} — or target ${smoothDesc}.`,
-      `To stop gifting ~${unused}% unused ${poolLabel} quota back on ${resetDay}, distribute ${smoothDesc} (~${Re(p.estReqsLeft)} avg reqs / ~${p.burstTanksEquivLeft} full 5h tanks left).`,
-      `To squeeze every drop out of this ${poolLabel} week, ${wkMultTxt ? `push ${wkMultTxt} harder` : `spin up bigger refactors`} (${smoothDesc}, ~${smooth24x7Pct}% if 24/7).`,
-      `To turn that ~${unused}% projected ${poolLabel} surplus into shipped code, you have ~${sprintHrs != null ? `${sprintHrs.toFixed(1)}h of peak-sprint` : `${p.burstTanksEquivLeft} 5h tanks of`} runway waiting.`
-    ];
-    straightSummary = `${poolLabel} is under-paced (~${wkProj.toFixed(0)}% projected at reset, ~${unused}% unused). To finish 100%: ${wkMultTxt ? `${wkMultTxt} your pace` : `up to ${wkTargetStr}`}, or ${smoothDesc}.`;
+    scorePaceBig = `Up to ${esc(wkTargetStr)}`;
+    scorePaceSub = `light recent burn · ~${Re(p.estReqsLeft)} reqs left`;
   }
 
-  const chosenQuip = quips[G_PACING_QUIP_IDX % quips.length];
+  let scoreSmoothBig = "", scoreSmoothSub = "";
+  if (wkExhausted) {
+    scoreSmoothBig = `0%`;
+    scoreSmoothSub = `per 5h session · resets in ${esc(resetDisp)}`;
+  } else if (wkUnkillable || smooth24x7Pct > 100) {
+    scoreSmoothBig = `Max 100%`;
+    scoreSmoothSub = `every 5h window (~${p.burstWindowsLeft} left · ~${maxFinalWk.toFixed(0)}% wk max)`;
+  } else if (smoothSessPct > 100) {
+    scoreSmoothBig = `100%`;
+    scoreSmoothSub = `per awake 5h session · ~${smooth24x7Pct}% if 24/7`;
+  } else {
+    scoreSmoothBig = `~${smoothSessPct}%`;
+    scoreSmoothSub = `per 5h session (~${awakeSessions.toFixed(0)} awake · ~${smooth24x7Pct}% if 24/7)`;
+  }
+
+  // Editorial Hero Headlines + Sub-copy (Fun coach takes vs Straight factual mode)
+  let deckTone = "ok";
+  let funTakes = [];
+  let straightHeadHtml = "";
+  let straightSubTxt = "";
+
+  if (wkExhausted || fhExhausted) {
+    deckTone = "bad";
+    const waitClock = wkExhausted ? resetDisp : burstRefill;
+    const which = wkExhausted ? "weekly" : "5-hour burst";
+    funTakes = [
+      {
+        h: `${esc(poolLabel)} tank is at <span class="hl-accent">0.0%</span> — recharge drops in ${esc(waitClock)}.`,
+        s: `To squeeze another token out of ${poolLabel}, you have to wait out the ${which} clock or flip over to your other model pool.`
+      },
+      {
+        h: `Pit stop time — <span class="hl-accent">fresh quota lands in ${esc(waitClock)}</span>.`,
+        s: `To keep shipping right now while ${poolLabel} ${which} refills, switch model pools or grab a well-earned coffee.`
+      }
+    ];
+    straightHeadHtml = `${esc(poolLabel)} ${which} pool exhausted — <span class="hl-accent">resets in ${esc(waitClock)}</span>.`;
+    straightSubTxt = `0.0% remaining in ${which} window. Switch model pool or wait ${waitClock} for refill.`;
+  } else if (wkRunOut) {
+    deckTone = "bad";
+    const wkTte = fmtHoursJS(p.wkTteHours);
+    const wkShort = fmtHoursJS(p.wkShortfallHours);
+    const multHl = wkMultTxt ? `${wkMultTxt} your pace` : `-${wkCutPct}% burn`;
+    funTakes = [
+      {
+        h: `Hit the brakes — drop to <span class="hl-accent">${esc(multHl)}</span> or run dry ${esc(wkShort)} early.`,
+        s: `To keep ${poolLabel} alive until ${resetDay}'s reset (${resetDisp} left instead of emptying in ~${wkTte}), ration ~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(0)} awake sessions.`
+      },
+      {
+        h: `Whoa — this tank empties in <span class="hl-accent">~${esc(wkTte)}</span> at your current speed.`,
+        s: `To survive until ${resetDay} without eating 429s, cap each 5h coding session near ~${smoothSessPct}% (~${Re(p.estReqsLeft)} avg reqs left in reserve).`
+      },
+      {
+        h: `Ration like a Mars rover: aim for <span class="hl-accent">~${smoothSessPct}% per 5h session</span>.`,
+        s: `To stretch ${wkRem.toFixed(1)}% ${poolLabel} quota across the next ${resetDisp}, dial pace down to ${wkMultTxt || wkTargetStr} and route routine turns to lighter tiers.`
+      }
+    ];
+    straightHeadHtml = `Reduce ${esc(poolLabel)} pace to <span class="hl-accent">${esc(multHl)}</span> — runs dry in ~${esc(wkTte)}.`;
+    straightSubTxt = `Projected to exhaust ${wkShort} before ${resetDay}'s reset (${resetDisp} left). Smooth target: ~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(1)} awake sessions.`;
+  } else if (fhRunOut) {
+    deckTone = "bad";
+    const fhTte = fmtHoursJS(p.fhTteHours);
+    const fhMultTxt = fhMultVal != null ? `${fhMultVal.toFixed(2)}x burst pace` : `-${fhCutPct}% burst burn`;
+    funTakes = [
+      {
+        h: `Cool the sprint — 5h burst runs dry in <span class="hl-accent">~${esc(fhTte)}</span>.`,
+        s: `To reach the ${burstRefill} refill without hitting the rev limiter, ease off to ${fhMultTxt} (<= ${fhSafeHr.toFixed(1)}%/hr). Weekly ${poolLabel} pool is still safe at ${wkRem.toFixed(1)}% left.`
+      },
+      {
+        h: `Ease off to <span class="hl-accent">${esc(fhMultTxt)}</span> until the ${esc(burstRefill)} refill.`,
+        s: `To avoid a mandatory 5h pit stop, pace the remaining ~${Re(p.est5hReqsLeft)} reqs in this tank — after refill, ~${smoothSessPct}% per 5h session finishes the week smoothly.`
+      }
+    ];
+    straightHeadHtml = `5-hour ${esc(poolLabel)} burst exhausts in <span class="hl-accent">~${esc(fhTte)}</span> (${esc(fhRateSrc)} pace).`;
+    straightSubTxt = `Drop to ${fhMultTxt} (<= ${fhSafeHr.toFixed(1)}%/hr) until refill in ${burstRefill}. Weekly pool remains safe (${wkRem.toFixed(1)}% left).`;
+  } else if (wkUnkillable) {
+    deckTone = "ok";
+    funTakes = [
+      {
+        h: `Go all-out. <span class="hl-accent">You can't kill this tank</span> before ${esc(resetDay)}'s reset.`,
+        s: `To finish as much ${poolLabel} quota as physically possible in the next ${resetDisp}, max 100% of every 5h window — even redlining non-stop still lands near ~${maxFinalWk.toFixed(0)}% weekly.`
+      },
+      {
+        h: `Floor the pedal — <span class="hl-accent">zero weekly rationing</span> needed from here.`,
+        s: `To drain ${wkRem.toFixed(1)}% ${poolLabel} weekly in ${resetDisp}, you would have to bend spacetime (${wkMultTxt ? `${wkMultTxt} your pace` : `${p.burstWindowsLeft} windows left`}). Only the 5h burst cap applies.`
+      },
+      {
+        h: `Unleash the subagents — <span class="hl-accent">maxing every 5h window</span> is 100% safe.`,
+        s: `To waste as little ${poolLabel} quota as possible before ${resetDay} wipes the slate clean, use ~${Re(p.estReqsLeft)} remaining avg reqs freely.`
+      }
+    ];
+    straightHeadHtml = `Safe to use freely — <span class="hl-accent">weekly exhaustion is unreachable</span> before reset.`;
+    straightSubTxt = `Even maxing 100% of every remaining 5h window (${p.burstWindowsLeft} windows in ${resetDisp}) caps weekly total near ~${maxFinalWk.toFixed(0)}%.`;
+  } else if (wkWarmup) {
+    deckTone = "ok";
+    const sPct = Math.min(100, smoothSessPct);
+    funTakes = [
+      {
+        h: `Fresh ${esc(poolLabel)} week — aim for <span class="hl-accent">~${sPct}% per 5h session</span>.`,
+        s: `To burn all 100% of this brand-new cycle smoothly without hitting walls, distribute usage across ~${awakeSessions.toFixed(0)} awake sessions (~${Re(p.estReqsLeft)} avg reqs in tank).`
+      },
+      {
+        h: `New cycle unlocked — <span class="hl-accent">${wkRem.toFixed(1)}% runway</span> ready for takeoff.`,
+        s: `To lock in a live pace multiplier on ${poolLabel}, ship a few commits first (sustainable cruise speed is ${wkTargetStr} to ${resetDay}).`
+      }
+    ];
+    straightHeadHtml = `Fresh ${esc(poolLabel)} cycle — target <span class="hl-accent">~${sPct}% per 5h session</span>.`;
+    straightSubTxt = `Cycle started < 6h ago (${wkRem.toFixed(1)}% left, resets in ${resetDisp}). Sustainable ceiling is ${wkTargetStr}.`;
+  } else if (wkProjUnclipped >= 85) {
+    deckTone = "warn";
+    const sPct = Math.min(100, smoothSessPct);
+    funTakes = [
+      {
+        h: `Right in the pocket — <span class="hl-accent">hold ${esc(wkMultTxt || "1.0x")} pace</span> to land near 100%.`,
+        s: `To finish almost every drop of ${poolLabel} right as ${resetDay}'s reset hits (${resetDisp}), keep cruising near ~${sPct}% per 5h session (~${Re(p.estReqsLeft)} reqs left).`
+      },
+      {
+        h: `Goldilocks velocity — tracking <span class="hl-accent">~${wkProj.toFixed(0)}% used</span> by ${esc(resetDay)}.`,
+        s: `To extract full value from ${poolLabel} without hitting a single wall, touch nothing across your ~${awakeSessions.toFixed(0)} remaining awake sessions.`
+      }
+    ];
+    straightHeadHtml = `${esc(poolLabel)} pace is on target — tracking <span class="hl-accent">~${wkProj.toFixed(0)}% at reset</span>.`;
+    straightSubTxt = `Hold near ${wkMultTxt || "1.0x"} current pace (~${sPct}% per 5h session across ~${awakeSessions.toFixed(1)} awake sessions · ${resetDisp} left).`;
+  } else {
+    deckTone = "ok";
+    const unused = Math.max(0, 100 - wkProj).toFixed(0);
+    const stepHl = wkMultTxt ? `step up ${wkMultTxt}` : `push ~${Math.min(100, smoothSessPct)}% per 5h`;
+    const smoothDesc = smoothSessPct > 100 ? `maxing 100% per awake 5h session` : `~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(0)} awake sessions`;
+    funTakes = [
+      {
+        h: `Plenty of headroom — <span class="hl-accent">${esc(stepHl)}</span> to use all 100%.`,
+        s: `To stop gifting ~${unused}% unused ${poolLabel} quota back on ${resetDay} (${resetDisp} left), ramp up or distribute ${smoothDesc}.`
+      },
+      {
+        h: `~${unused}% ${esc(poolLabel)} surplus on the table — <span class="hl-accent">spin up bigger tasks</span>.`,
+        s: `To burn your remaining ${wkRem.toFixed(1)}% cleanly before ${resetDay}, target ${smoothDesc} (~${Re(p.estReqsLeft)} avg reqs waiting).`
+      }
+    ];
+    straightHeadHtml = `${esc(poolLabel)} is under-paced — <span class="hl-accent">${esc(wkMultTxt ? `${wkMultTxt} your pace` : `~${unused}% surplus`)}</span> to reach 100%.`;
+    straightSubTxt = `Tracking ~${wkProj.toFixed(0)}% by reset (${resetDisp} left). Smooth 100% target: ${smoothDesc}.`;
+  }
+
+  if (cardEl) {
+    cardEl.dataset.tone = deckTone;
+    cardEl.dataset.minimal = "false";
+  }
+
+  const chosenTake = funTakes[G_PACING_QUIP_IDX % funTakes.length];
+  const heroHeadHtml = styleMode === "fun" ? chosenTake.h : straightHeadHtml;
+  const heroSubTxt = styleMode === "fun" ? chosenTake.s : straightSubTxt;
+
+  const sprintMeta = (sprintHrs != null && peak1hWk > 0)
+    ? `~${sprintHrs.toFixed(1)}h at ${peak1hWk.toFixed(2)}%/hr peak sprint`
+    : `~${p.burstTanksEquivLeft} full 5h tanks`;
+  const compactMetaTxt = G_PACING_BARS
+    ? `~${Re(p.estReqsLeft)} avg reqs left · ${sprintMeta}`
+    : `${wkRem.toFixed(1)}% wk left · resets in ${resetDisp} · ${sprintMeta}`;
+
   const fhClockPos = Math.min(100, Math.max(0, Number(p.fhElapsedPct || 0)));
   const fhBarW = Math.min(100, Math.max(0, fhUsed));
-  const wkClockPos = Math.min(100, Math.max(0, Number(p.wkElapsedPct || 0)));
   const wkBarW = Math.min(100, Math.max(0, wkUsed));
 
   el.innerHTML = `
-    <div class="stack" style="gap:12px;">
-      ${headerHtml}
-
-      <!-- Coach / Summary Banner -->
-      <div class="row" style="justify-content:space-between; align-items:center; gap:10px; padding:10px 12px; border-left:3px solid ${coachColor}; background:var(--raised); border-radius:6px; font-size:12.5px; line-height:1.5; color:var(--ink-1);">
-        <div class="row" style="gap:8px; align-items:flex-start; min-width:0; flex:1;">
-          <span class="badge" data-tone="${coachTone}" data-mono="true" style="flex-shrink:0;">${styleMode === "fun" ? "COACH" : "SUMMARY"}</span>
-          <span style="min-width:0;">${esc(styleMode === "fun" ? chosenQuip : straightSummary)}</span>
-        </div>
-        ${styleMode === "fun" && quips.length > 1 ? `
-          <button type="button" class="btn" data-size="sm" data-variant="ghost" onclick="cyclePacingQuip()" title="Cycle another take" style="height:22px; padding:0 8px; font-size:11.5px; flex-shrink:0;">Next</button>
-        ` : ""}
-      </div>
-
-      <!-- 3-Tile Human Action Strip -->
-      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px;">
-        <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:3px;">
-          <span class="micro dim" style="text-transform:uppercase; letter-spacing:.04em; font-weight:600;">Will it run out?</span>
-          <strong style="font-size:14px; letter-spacing:-.01em;">${tileRunMain}</strong>
-          <span class="micro dim">${tileRunSub}</span>
-        </div>
-        <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:3px;">
-          <span class="micro dim" style="text-transform:uppercase; letter-spacing:.04em; font-weight:600;">Pace to finish 100%</span>
-          <strong class="mono" style="font-size:14px; letter-spacing:-.01em;">${tilePaceMain}</strong>
-          <span class="micro dim">${tilePaceSub}</span>
-        </div>
-        <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:3px;">
-          <span class="micro dim" style="text-transform:uppercase; letter-spacing:.04em; font-weight:600;">Smooth 5h strategy</span>
-          <strong class="mono" style="font-size:14px; letter-spacing:-.01em;">${tileSmoothMain}</strong>
-          <span class="micro dim">${tileSmoothSub}</span>
-        </div>
-      </div>
-
-      <!-- Dual-Horizon Grid: 5-Hour Burst + Weekly Pool -->
-      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px;">
-        <!-- 5-Hour Burst Horizon -->
-        <div style="padding:11px 14px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:8px;">
-          <div class="row" style="justify-content:space-between; align-items:center; gap:8px;">
-            <div class="row" style="gap:6px; align-items:baseline;">
-              <strong style="font-size:13px; color:var(--ink-1);">5-Hour Burst</strong>
-              <span class="mono micro dim">refills in ${esc(burstRefill)}</span>
-            </div>
-            <span class="badge" data-tone="${fhTone}" data-mono="true">${esc(fhBadge)}</span>
+    <div>
+      <div class="pacing-hero">
+        <div class="pacing-copy">
+          <h2 class="pacing-headline">${heroHeadHtml}</h2>
+          <p class="pacing-sub">${esc(heroSubTxt)}</p>
+          <div class="pacing-actions">
+            ${styleMode === "fun" && funTakes.length > 1 ? `
+              <button type="button" class="pacing-pill-btn" onclick="cyclePacingQuip()" title="Cycle another coach headline">Next take</button>
+            ` : ""}
+            <button type="button" class="pacing-pill-btn" data-active="${G_PACING_BARS}" onclick="togglePacingBars()" title="Show or hide the 5-hour and weekly progress bars (saved to config)">
+              ${G_PACING_BARS ? "Hide 5h &amp; wk bars" : "Show 5h &amp; wk bars"}
+            </button>
+            <span class="mono dim" style="font-size:11.5px;">${esc(compactMetaTxt)}</span>
           </div>
+        </div>
 
-          <div style="display:flex; flex-direction:column; gap:4px;">
-            <div class="row micro" style="justify-content:space-between;">
-              <span class="dim">Window clock</span>
-              <span class="mono" style="color:var(--ink-2);">${p.fhElapsedPct}% (${Number(p.fhElapsedHours || 0).toFixed(1)} of 5.0h)</span>
+        <div class="pacing-right">
+          ${controlsHtml}
+          <div class="pacing-scoreboard">
+            <div class="pacing-score-cell">
+              <span class="pacing-score-label">Pace to Finish 100%</span>
+              <div class="pacing-score-big" data-tone="accent">${esc(scorePaceBig)}</div>
+              <span class="pacing-score-sub">${scorePaceSub}</span>
             </div>
-            <div style="height:5px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
-              <div style="width:${fhClockPos}%; height:100%; background:var(--ink-3); border-radius:var(--r-pill);"></div>
+            <div class="pacing-score-cell">
+              <span class="pacing-score-label">Smooth 5h Strategy</span>
+              <div class="pacing-score-big">${esc(scoreSmoothBig)}</div>
+              <span class="pacing-score-sub">${scoreSmoothSub}</span>
             </div>
           </div>
+        </div>
+      </div>
 
-          <div style="display:flex; flex-direction:column; gap:4px;">
-            <div class="row micro" style="justify-content:space-between;">
-              <span style="color:var(--ink-2); font-weight:500;">Burst quota used</span>
-              <span class="mono"><strong style="color:${fhBarColor};">${fhUsed.toFixed(1)}%</strong> <span class="dim">(${fhRem.toFixed(1)}% left)</span></span>
-            </div>
-            <div style="height:7px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
-              ${fhHasDualSeg ? `
-                <div style="width:${fhLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.local5hUsedPct}%"></div>
-                <div style="width:${fhOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.other5hUsedPct}%"></div>
-              ` : `
-                <div style="width:${fhBarW}%; height:100%; background:${fhBarColor}; border-radius:var(--r-pill);"></div>
-              `}
-            </div>
-            ${fhHasDualSeg ? `
-              <div class="row micro dim" style="gap:10px;">
-                <span><span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.local5hUsedPct}%</strong></span>
-                <span><span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.other5hUsedPct}%</strong></span>
+      ${G_PACING_BARS ? `
+        <div class="pacing-tracks">
+          <!-- 5-Hour Burst Track -->
+          <div class="pacing-track-col">
+            <div class="pacing-track-head">
+              <div class="pacing-track-title">
+                <strong>5-Hour Burst</strong>
+                <span class="mono dim truncate" style="font-size:11.5px;">${fhSubTitleHtml}</span>
               </div>
-            ` : (fhOtherW >= 1.0 ? `
-              <div class="micro dim">0% this setup · ${p.other5hUsedPct}% other products / devices</div>
-            ` : "")}
-          </div>
-
-          <div style="border-top:1px solid var(--line-1); padding-top:7px; margin-top:auto; font-size:12px;">
-            ${fhFooterHtml}
-          </div>
-        </div>
-
-        <!-- Weekly Endurance Horizon -->
-        <div style="padding:11px 14px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:8px;">
-          <div class="row" style="justify-content:space-between; align-items:center; gap:8px;">
-            <div class="row" style="gap:6px; align-items:baseline;">
-              <strong style="font-size:13px; color:var(--ink-1);">Weekly Pool</strong>
-              <span class="mono micro dim">resets in ${esc(resetDisp)}</span>
-            </div>
-            <span class="badge" data-tone="${wkTone}" data-mono="true">${esc(wkBadge)}</span>
-          </div>
-
-          <div style="display:flex; flex-direction:column; gap:4px;">
-            <div class="row micro" style="justify-content:space-between;">
-              <span class="dim">Week clock</span>
-              <span class="mono" style="color:var(--ink-2);">${p.wkElapsedPct}% (${Number(p.wkElapsedDays || 0).toFixed(1)} of 7.0d)</span>
-            </div>
-            <div style="height:5px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
-              <div style="width:${wkClockPos}%; height:100%; background:var(--ink-3); border-radius:var(--r-pill);"></div>
-            </div>
-          </div>
-
-          <div style="display:flex; flex-direction:column; gap:4px;">
-            <div class="row micro" style="justify-content:space-between;">
-              <span style="color:var(--ink-2); font-weight:500;">Account quota used</span>
-              <span class="mono"><strong style="color:${wkBarColor};">${wkUsed.toFixed(1)}%</strong> <span class="dim">(${wkRem.toFixed(1)}% left)</span></span>
-            </div>
-            <div style="height:7px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
-              ${wkHasDualSeg ? `
-                <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
-                <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
-              ` : `
-                <div style="width:${wkBarW}%; height:100%; background:${wkBarColor}; border-radius:var(--r-pill);"></div>
-              `}
-            </div>
-            ${wkHasDualSeg ? `
-              <div class="row micro dim" style="gap:10px;">
-                <span><span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.localWkUsedPct}%</strong></span>
-                <span><span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.otherWkUsedPct}%</strong></span>
+              <div class="pacing-track-pct-wrap">
+                <span class="pacing-track-pct" style="color:${fhBarColor};">${fhUsed.toFixed(1)}%</span>
+                <span class="mono dim" style="font-size:12px;"> / ${fhRem.toFixed(1)}% left</span>
               </div>
-            ` : (wkOtherW >= 1.0 ? `
-              <div class="micro dim">0% this setup · ${p.otherWkUsedPct}% other products / devices</div>
-            ` : "")}
+            </div>
+            <div class="pacing-race-wrap">
+              ${_clockPinHtml(fhClockPos)}
+              <div class="pacing-race-track">
+                ${fhHasDualSeg ? `
+                  <div style="width:${fhLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.local5hUsedPct}%"></div>
+                  <div style="width:${fhOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.88;" title="Other products / devices: ${p.other5hUsedPct}%"></div>
+                ` : `
+                  <div style="width:${fhBarW}%; height:100%; background:${fhBarColor}; border-radius:var(--r-pill);"></div>
+                `}
+              </div>
+            </div>
+            <div class="pacing-track-meta">
+              <span>
+                ${fhHasDualSeg ? `
+                  <span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.local5hUsedPct}%</strong>
+                  &nbsp;·&nbsp;
+                  <span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.other5hUsedPct}%</strong>
+                ` : (fhOtherW >= 1.0 ? `
+                  0% this setup · <strong class="mono" style="color:var(--ink-2);">${p.other5hUsedPct}%</strong> other products / devices
+                ` : (fhUsed <= 0.05 ? `Fresh 5h burst tank ready` : `This setup <strong class="mono" style="color:var(--ink-2);">${p.local5hUsedPct}%</strong>`))}
+              </span>
+              ${fhRightMetaHtml}
+            </div>
           </div>
 
-          <div style="border-top:1px solid var(--line-1); padding-top:7px; margin-top:auto; font-size:12px;">
-            ${wkFooterHtml}
+          <!-- Weekly Pool Track -->
+          <div class="pacing-track-col">
+            <div class="pacing-track-head">
+              <div class="pacing-track-title">
+                <strong>Weekly Pool</strong>
+                <span class="mono dim truncate" style="font-size:11.5px;">${wkSubTitleHtml}</span>
+              </div>
+              <div class="pacing-track-pct-wrap">
+                <span class="pacing-track-pct" style="color:${wkBarColor};">${wkUsed.toFixed(1)}%</span>
+                <span class="mono dim" style="font-size:12px;"> / ${wkRem.toFixed(1)}% left</span>
+              </div>
+            </div>
+            <div class="pacing-race-wrap">
+              ${_clockPinHtml(wkClockPos)}
+              <div class="pacing-race-track">
+                ${wkHasDualSeg ? `
+                  <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
+                  <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.88;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
+                ` : `
+                  <div style="width:${wkBarW}%; height:100%; background:${wkBarColor}; border-radius:var(--r-pill);"></div>
+                `}
+              </div>
+            </div>
+            <div class="pacing-track-meta">
+              <span>
+                ${wkHasDualSeg ? `
+                  <span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.localWkUsedPct}%</strong>
+                  &nbsp;·&nbsp;
+                  <span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.otherWkUsedPct}%</strong>
+                ` : (wkOtherW >= 1.0 ? `
+                  0% this setup · <strong class="mono" style="color:var(--ink-2);">${p.otherWkUsedPct}%</strong> other products / devices
+                ` : `This setup <strong class="mono" style="color:var(--ink-2);">${p.localWkUsedPct}%</strong>`)}
+              </span>
+              ${wkRightMetaHtml}
+            </div>
           </div>
         </div>
-      </div>
+      ` : ""}
     </div>
   `;
   syncSegmentedThumbs();
@@ -7390,14 +7722,23 @@ async function fetchSettings() {
 
 function applySettings(cfg) {
   if (!cfg) return;
+  let needPacingRender = false;
   const pStyle = cfg.web?.pacing_style;
   if (pStyle === "fun" || pStyle === "straight" || pStyle === "minimal") {
     G_PACING_STYLE = pStyle;
     try { localStorage.setItem("agy-stats-pacing-style", pStyle); } catch (e) {}
-    if (G_OVERVIEW_DATA) {
-      renderPacingSection("overviewPacingBody");
-      renderPacingSection("quotaPacingBody");
-    }
+    needPacingRender = true;
+  }
+  if (typeof cfg.web?.pacing_bars === "boolean") {
+    G_PACING_BARS = cfg.web.pacing_bars;
+    try { localStorage.setItem("agy-stats-pacing-bars", G_PACING_BARS ? "true" : "false"); } catch (e) {}
+    const cb = document.getElementById("settingPacingBars");
+    if (cb) cb.checked = G_PACING_BARS;
+    needPacingRender = true;
+  }
+  if (needPacingRender && G_OVERVIEW_DATA) {
+    renderPacingSection("overviewPacingBody");
+    renderPacingSection("quotaPacingBody");
   }
   const disSec = (cfg.cli && Array.isArray(cfg.cli.disabled_sections)) ? cfg.cli.disabled_sections : [];
   applyOverviewDisplaySections(disSec);
@@ -7472,6 +7813,8 @@ async function openSettingsModal(isFirstRun = false) {
   if (rFun) rFun.checked = (pStyle === "fun");
   if (rStr) rStr.checked = (pStyle === "straight");
   if (rMin) rMin.checked = (pStyle === "minimal");
+  const pBarsCb = document.getElementById("settingPacingBars");
+  if (pBarsCb) pBarsCb.checked = (cfg.web?.pacing_bars !== undefined) ? !!cfg.web.pacing_bars : G_PACING_BARS;
 
   const cliView = cfg.cli?.default_view || "overview";
   const selView = document.getElementById("settingCliView");
@@ -7587,6 +7930,7 @@ async function saveSettingsFromModal() {
     web: {
       open_browser: !!document.getElementById("settingOpenBrowser")?.checked,
       pacing_style: pStyleVal,
+      pacing_bars: document.getElementById("settingPacingBars") ? !!document.getElementById("settingPacingBars").checked : true,
       disabled_tabs: []
     },
     cli: {
@@ -7631,7 +7975,7 @@ async function resetSettingsToDefault() {
         update_url: "",
         auto_check_updates: true,
         auto_update: false,
-        web: { open_browser: true, pacing_style: "fun", disabled_tabs: [] },
+        web: { open_browser: true, pacing_style: "fun", pacing_bars: true, disabled_tabs: [] },
         cli: { default_view: "overview", days: 10, disabled_sections: [] }
       })
     });
