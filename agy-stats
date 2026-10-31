@@ -4263,6 +4263,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --chart-secondary: #68707d;
     --chart-tertiary: #9aa1ad;
     --chart-quaternary: #c6cbd4;
+    --cat-1: #4796ff;
+    --cat-2: #2cc4b6;
+    --cat-3: #e5a93c;
+    --cat-4: #e07850;
+    --cat-5: #6cc5f0;
+    --cat-6: #8ec96a;
+    --cat-7: #d48ca6;
+    --cat-8: #94a3b8;
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.32);
     --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.48);
     --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.65);
@@ -4308,6 +4316,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --chart-secondary: #7b8391;
     --chart-tertiary: #a5acb8;
     --chart-quaternary: #cfd4dd;
+    --cat-1: #2563eb;
+    --cat-2: #0d9488;
+    --cat-3: #ca8a04;
+    --cat-4: #c85a2b;
+    --cat-5: #0284c7;
+    --cat-6: #5c9a31;
+    --cat-7: #b84a75;
+    --cat-8: #64748b;
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.04);
     --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.1);
     --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.16);
@@ -7345,32 +7361,52 @@ function renderDynamicTokenMix() {
   const totalConv = ov.conversationTokens || 1;
 
   const segments = [
-    { key: "cacheRead", label: "Cache read", value: ov.totalCacheReadTokens, color: "var(--chart-primary)" },
-    { key: "input", label: "Uncached input", value: ov.totalInputTokens, color: "var(--chart-tertiary)" },
-    { key: "output", label: "Output", value: ov.totalOutputTokens, color: "var(--chart-secondary)" },
-    { key: "cacheWrite", label: "Cache write", value: ov.totalCacheWriteTokens, color: "var(--chart-quaternary)" }
+    { key: "cacheRead", label: "Cache read", value: ov.totalCacheReadTokens, color: "var(--cat-1)" },
+    { key: "input", label: "Uncached input", value: ov.totalInputTokens, color: "var(--cat-2)" },
+    { key: "output", label: "Output", value: ov.totalOutputTokens, color: "var(--cat-3)" },
+    { key: "cacheWrite", label: "Cache write", value: ov.totalCacheWriteTokens, color: "var(--cat-4)" }
   ];
 
-  const agentColors = {
-    "Lead": "var(--chart-primary)",
-    "self": "#7cb3ff",
-    "research": "var(--chart-tertiary)",
-    "image-generator": "#a8ccff",
-    "subagent": "var(--chart-secondary)"
+  const knownAgentColors = {
+    "Lead": "var(--cat-1)",
+    "self": "var(--cat-2)",
+    "research": "var(--cat-3)",
+    "image-generator": "var(--cat-4)",
+    "subagent": "var(--cat-5)"
   };
-  const fallbackAgentPalette = ["var(--chart-primary)", "#7cb3ff", "var(--chart-tertiary)", "var(--chart-secondary)", "var(--chart-quaternary)"];
-  function colorForAgent(name) {
-    if (agentColors[name]) return agentColors[name];
-    let h = 0;
-    const s = String(name || "");
-    for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-    return fallbackAgentPalette[Math.abs(h) % fallbackAgentPalette.length];
+  const extraAgentPalette = [
+    "var(--cat-6)", "var(--cat-7)", "var(--cat-8)",
+    "var(--cat-5)", "var(--cat-4)", "var(--cat-3)", "var(--cat-2)"
+  ];
+  const rawAgents = ovData.byAgentType || [];
+  const headAgents = rawAgents.length > 6 ? rawAgents.slice(0, 5) : rawAgents;
+  const tailAgents = rawAgents.length > 6 ? rawAgents.slice(5) : [];
+  const usedAgentColors = new Set();
+  for (const ag of headAgents) {
+    const c = knownAgentColors[ag.agentType];
+    if (c) usedAgentColors.add(c);
   }
-
-  const agentSegments = (ovData.byAgentType || []).map(ag => ({
-    ...ag,
-    color: colorForAgent(ag.agentType)
-  }));
+  const agentSegments = headAgents.map(ag => {
+    let color = knownAgentColors[ag.agentType];
+    if (!color) {
+      color = extraAgentPalette.find(c => !usedAgentColors.has(c)) || "var(--cat-6)";
+      usedAgentColors.add(color);
+    }
+    return { ...ag, color, tip: ag.agentType };
+  });
+  if (tailAgents.length) {
+    const tailReqs = tailAgents.reduce((s, a) => s + (a.totalRequests || 0), 0);
+    const tailToks = tailAgents.reduce((s, a) => s + (a.totalTokens || 0), 0);
+    const tailShare = tailAgents.reduce((s, a) => s + (a.share || 0), 0);
+    agentSegments.push({
+      agentType: `other (${tailAgents.length})`,
+      totalRequests: tailReqs,
+      totalTokens: tailToks,
+      share: tailShare,
+      color: "var(--cat-8)",
+      tip: tailAgents.map(a => a.agentType).join(", ")
+    });
+  }
 
   document.getElementById("tokenMixBody").innerHTML = `
     <div class="stack" style="gap:18px;">
@@ -7394,18 +7430,18 @@ function renderDynamicTokenMix() {
         <div class="section-label">By agent</div>
         <div class="share-bar" role="img">
           ${agentSegments.map(ag => `
-            <div class="share-bar-seg" style="flex-grow:${ag.share}; background:${ag.color};" title="${esc(ag.agentType)}: ${He(ag.share)}"></div>
+            <div class="share-bar-seg" style="flex-grow:${ag.share}; background:${ag.color};" title="${esc(ag.tip || ag.agentType)}: ${He(ag.share)}"></div>
           `).join("")}
         </div>
         <div class="stack" style="gap:8px; margin-top:2px;">
           ${agentSegments.map(ag => `
-            <div class="row" style="justify-content:space-between;">
-              <span class="row">
+            <div class="row" style="justify-content:space-between; gap:12px;">
+              <span class="row" style="flex:1; min-width:0;">
                 <span class="swatch" style="background:${ag.color};"></span>
-                <span>${esc(ag.agentType)}</span>
-                <span class="dim num micro">${B(ag.totalRequests)} req</span>
+                <span class="truncate" title="${esc(ag.tip || ag.agentType)}">${esc(ag.agentType)}</span>
+                <span class="dim num micro" style="flex-shrink:0;">${B(ag.totalRequests)} req</span>
               </span>
-              <span class="row">
+              <span class="row" style="flex-shrink:0;">
                 <span class="dim num">${Re(ag.totalTokens)}</span>
                 <span class="num" style="min-width:48px; text-align:right;">${He(ag.share)}</span>
               </span>
@@ -7751,9 +7787,9 @@ async function openSessionTrace(cid) {
 
     const spanColor = sp => {
       if (sp.isError) return "var(--bad)";
-      if (sp.kind === "user") return "var(--chart-tertiary)";
-      if (sp.kind === "subagent" || sp.agent !== "Lead") return "var(--chart-secondary)";
-      return "var(--chart-primary)";
+      if (sp.kind === "user") return "var(--cat-3)";
+      if (sp.kind === "subagent" || sp.agent !== "Lead") return "var(--cat-2)";
+      return "var(--cat-1)";
     };
 
     detEl.innerHTML = `
@@ -7793,9 +7829,9 @@ async function openSessionTrace(cid) {
         <header class="card-header">
           <h2 class="card-title">Timeline</h2>
           <div class="legend">
-            <span class="legend-item"><span class="swatch" style="background:var(--chart-tertiary);"></span> User</span>
-            <span class="legend-item"><span class="swatch" style="background:var(--chart-primary);"></span> Lead</span>
-            <span class="legend-item"><span class="swatch" style="background:var(--chart-secondary);"></span> Subagent</span>
+            <span class="legend-item"><span class="swatch" style="background:var(--cat-3);"></span> User</span>
+            <span class="legend-item"><span class="swatch" style="background:var(--cat-1);"></span> Lead</span>
+            <span class="legend-item"><span class="swatch" style="background:var(--cat-2);"></span> Subagent</span>
             <span class="legend-item"><span class="swatch" style="background:var(--bad);"></span> Error</span>
           </div>
         </header>
