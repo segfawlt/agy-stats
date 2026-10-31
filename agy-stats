@@ -57,7 +57,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 DEFAULT_REPO = "segfawlt/agy-stats"
 DEFAULT_UPDATE_URL = f"https://github.com/{DEFAULT_REPO}/releases/latest/download/agy-stats"
@@ -6066,7 +6066,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="row" style="justify-content:space-between; align-items:center; gap:8px;">
           <div class="form-section-title" style="margin-bottom:0;">Updates &amp; Maintenance</div>
           <div class="row" style="gap:6px;">
-            <span class="micro mono dim" id="settingVersionBadge">v1.1.1</span>
+            <span class="micro mono dim" id="settingVersionBadge">v1.1.2</span>
             <button type="button" class="btn" data-size="sm" data-variant="outline" id="checkUpdateWebBtn" onclick="triggerWebUpdate(true)">Check Now</button>
             <button type="button" class="btn" data-size="sm" data-variant="ghost" id="applyUpdateWebBtn" onclick="triggerWebUpdate(false)" style="display:none;">Update Now</button>
           </div>
