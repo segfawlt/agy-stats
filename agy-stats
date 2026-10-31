@@ -270,6 +270,7 @@ DEFAULT_CONFIG = {
         "port": 3872,
         "open_browser": True,
         "quota_mode": "server",
+        "quota_counting": "server",
         "pacing_style": "fun",
         "pacing_bars": True,
         "disabled_tabs": []
@@ -354,8 +355,11 @@ def _read_config_with_status():
             w = cfg["web"]
             res["web"]["port"] = _safe_int(w.get("port"), 3872)
             res["web"]["open_browser"] = _safe_bool(w.get("open_browser"), True)
-            if w.get("quota_mode") in ("server", "multi"):
-                res["web"]["quota_mode"] = w["quota_mode"]
+            # Read quota_counting so legacy dormant v1.0.x quota_mode="multi" stubs default cleanly to "server"
+            if str(w.get("quota_counting") or "").lower() in ("server", "multi", "local"):
+                qm_norm = "multi" if str(w.get("quota_counting")).lower() in ("multi", "local") else "server"
+                res["web"]["quota_mode"] = qm_norm
+                res["web"]["quota_counting"] = qm_norm
             if w.get("pacing_style") in ("fun", "straight", "minimal"):
                 res["web"]["pacing_style"] = w["pacing_style"]
             res["web"]["pacing_bars"] = _safe_bool(w.get("pacing_bars"), True)
@@ -408,8 +412,10 @@ def save_config(updates):
                 cur["web"]["port"] = _safe_int(v, cur["web"]["port"])
             elif k == "open_browser":
                 cur["web"]["open_browser"] = _safe_bool(v, cur["web"]["open_browser"])
-            elif k == "quota_mode":
-                cur["web"]["quota_mode"] = "multi" if v == "multi" else "server"
+            elif k in ("quota_mode", "quota_counting"):
+                qm_norm = "multi" if str(v or "").lower() in ("multi", "local") else "server"
+                cur["web"]["quota_mode"] = qm_norm
+                cur["web"]["quota_counting"] = qm_norm
             elif k == "pacing_style" and v in ("fun", "straight", "minimal"):
                 cur["web"]["pacing_style"] = v
             elif k == "pacing_bars":
@@ -666,28 +672,73 @@ def _is_3p_model(model_name):
     return ("claude" in ml) or ("opus" in ml) or ("sonnet" in ml) or ("haiku" in ml) or ("gpt" in ml) or ("openai" in ml)
 
 _LAST_QUOTA_REFRESH_ATTEMPT = 0.0
+_RECENT_SERVER_RATES = {}
 
 def _update_quota_calibration(flat_pools, cal_state, now):
-    """Guarded anchor calibrator: only updates 5h->weekly ratio after >=30% 5h burn & >=30m elapsed in a single window."""
+    """Guarded anchor calibrator + in-cycle server snapshot history for pure server delta pacing."""
     if not isinstance(cal_state, dict):
         cal_state = {}
     anchors = dict(cal_state.get("anchors") or {})
     ratios = dict(cal_state.get("ratios") or {})
+    snapshots = dict(cal_state.get("snapshots") or {})
     changed = False
 
     by_id = {p.get("id"): p for p in (flat_pools or []) if isinstance(p, dict) and p.get("id")}
     for pk, wk_id, fh_id in (("gemini", "gemini-weekly", "gemini-5h"), ("3p", "3p-weekly", "3p-5h")):
         wb = by_id.get(wk_id)
         fb = by_id.get(fh_id)
-        if not wb or not fb:
+        if not wb and not fb:
             continue
-        wk_rt = wb.get("resetTime") or ""
-        fh_rt = fb.get("resetTime") or ""
-        if not wk_rt or not fh_rt:
-            continue
-        wk_rem_f = float(wb.get("remainingFraction", 1.0))
-        fh_rem_f = float(fb.get("remainingFraction", 1.0))
+        wk_rt = (wb.get("resetTime") or "") if wb else ""
+        fh_rt = (fb.get("resetTime") or "") if fb else ""
+        wk_rem_f = float(wb.get("remainingFraction", 1.0)) if wb else 1.0
+        fh_rem_f = float(fb.get("remainingFraction", 1.0)) if fb else 1.0
+        wk_used_pct = round((1.0 - wk_rem_f) * 100.0, 2)
+        fh_used_pct = round((1.0 - fh_rem_f) * 100.0, 2)
         fh_used_f = 1.0 - fh_rem_f
+
+        sn = dict(snapshots.get(pk) or {})
+        srv_wk_day = None
+        srv_fh_hr = None
+        if wk_rt:
+            wk_pts = sn.get("wk_pts") if (sn.get("wk_reset") == wk_rt and isinstance(sn.get("wk_pts"), list)) else []
+            if not wk_pts or (wk_used_pct + 2.0 < float(wk_pts[-1][1])):
+                wk_pts = [[round(now, 1), wk_used_pct]]
+                sn["wk_reset"] = wk_rt
+                sn["wk_pts"] = wk_pts
+                changed = True
+            elif (now - float(wk_pts[-1][0])) >= 600 or abs(wk_used_pct - float(wk_pts[-1][1])) >= 0.4:
+                wk_pts = (wk_pts + [[round(now, 1), wk_used_pct]])[-48:]
+                sn["wk_reset"] = wk_rt
+                sn["wk_pts"] = wk_pts
+                changed = True
+            for pt in wk_pts:
+                dt_s = now - float(pt[0])
+                if 16 * 3600 <= dt_s <= 30 * 3600 and wk_used_pct >= float(pt[1]):
+                    srv_wk_day = ((wk_used_pct - float(pt[1])) / (dt_s / 3600.0)) * 24.0
+                    break
+        if fh_rt:
+            fh_pts = sn.get("fh_pts") if (sn.get("fh_reset") == fh_rt and isinstance(sn.get("fh_pts"), list)) else []
+            if not fh_pts or (fh_used_pct + 2.0 < float(fh_pts[-1][1])):
+                fh_pts = [[round(now, 1), fh_used_pct]]
+                sn["fh_reset"] = fh_rt
+                sn["fh_pts"] = fh_pts
+                changed = True
+            elif (now - float(fh_pts[-1][0])) >= 180 or abs(fh_used_pct - float(fh_pts[-1][1])) >= 0.5:
+                fh_pts = (fh_pts + [[round(now, 1), fh_used_pct]])[-24:]
+                sn["fh_reset"] = fh_rt
+                sn["fh_pts"] = fh_pts
+                changed = True
+            for pt in fh_pts:
+                dt_s = now - float(pt[0])
+                if 900 <= dt_s <= 4500 and fh_used_pct >= float(pt[1]):
+                    srv_fh_hr = (fh_used_pct - float(pt[1])) / (dt_s / 3600.0)
+                    break
+        snapshots[pk] = sn
+        _RECENT_SERVER_RATES[pk] = {"wk_day": srv_wk_day, "fh_hr": srv_fh_hr}
+
+        if not wb or not fb or not wk_rt or not fh_rt:
+            continue
 
         anc = anchors.get(pk)
         if not isinstance(anc, dict) or anc.get("fh_reset") != fh_rt or anc.get("wk_reset") != wk_rt:
@@ -720,7 +771,7 @@ def _update_quota_calibration(flat_pools, cal_state, now):
         if pk in ("gemini", "3p") and isinstance(rv, (int, float)) and 5.0 <= float(rv) <= 100.0:
             _CALIBRATED_BURST_TO_WK_PCT[pk] = float(rv)
 
-    return {"anchors": anchors, "ratios": ratios}, changed
+    return {"anchors": anchors, "ratios": ratios, "snapshots": snapshots}, changed
 
 def fetch_live_quota(force_refresh=False):
     global _LAST_QUOTA_REFRESH_ATTEMPT
@@ -1403,18 +1454,19 @@ def _build_pool_pacing(
     wk_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - wk_cycle_start_ms) / period_wk_ms) * 100.0)), 1)
     fh_elapsed_pct = round(max(0.0, min(100.0, ((now_ms - fh_cycle_start_ms) / period_5h_ms) * 100.0)), 1)
 
-    wk_used = round(float(wk_pool.get("usedPct", local_wk_pct)), 2) if wk_pool else local_wk_pct
+    raw_local_wk_pct = round(min(100.0, max(0.0, float(local_wk_pct))), 2)
+    raw_local_5h_pct = round(min(100.0, max(0.0, float(local_5h_pct))), 2)
+
+    wk_used = round(float(wk_pool.get("usedPct", raw_local_wk_pct)), 2) if wk_pool else raw_local_wk_pct
     wk_rem = round(float(wk_pool.get("remainingPct", max(0.0, 100.0 - wk_used))), 2) if wk_pool else round(max(0.0, 100.0 - wk_used), 2)
-    fh_used = round(float(fh_pool.get("usedPct", local_5h_pct)), 2) if fh_pool else local_5h_pct
+    fh_used = round(float(fh_pool.get("usedPct", raw_local_5h_pct)), 2) if fh_pool else raw_local_5h_pct
     fh_rem = round(float(fh_pool.get("remainingPct", max(0.0, 100.0 - fh_used))), 2) if fh_pool else round(max(0.0, 100.0 - fh_used), 2)
 
-    if wk_pool:
-        local_wk_pct = round(min(wk_used, local_wk_pct), 2)
-    if fh_pool:
-        local_5h_pct = round(min(fh_used, local_5h_pct), 2)
+    bar_local_wk_pct = round(min(wk_used, raw_local_wk_pct), 2) if wk_pool else raw_local_wk_pct
+    bar_local_5h_pct = round(min(fh_used, raw_local_5h_pct), 2) if fh_pool else raw_local_5h_pct
 
-    other_wk = round(max(0.0, wk_used - local_wk_pct), 2)
-    other_5h = round(max(0.0, fh_used - local_5h_pct), 2)
+    other_wk = round(max(0.0, wk_used - bar_local_wk_pct), 2)
+    other_5h = round(max(0.0, fh_used - bar_local_5h_pct), 2)
 
     wk_rem_hours = max(0.05, ((wk_reset_ms - now_ms) / 3_600_000.0) if (wk_reset_ms and wk_reset_ms > now_ms) else ((100.0 - wk_elapsed_pct) / 100.0 * 168.0))
     wk_el_hours = max(0.05, 168.0 - wk_rem_hours)
@@ -1424,9 +1476,9 @@ def _build_pool_pacing(
     fh_rem_hours = max(0.02, ((fh_reset_ms - now_ms) / 3_600_000.0) if (fh_reset_ms and fh_reset_ms > now_ms) else ((100.0 - fh_elapsed_pct) / 100.0 * 5.0))
     fh_el_hours = max(0.02, 5.0 - fh_rem_hours)
 
-    # Local recent velocity (Last 1h for 5h burst responsiveness; Last 24h for Weekly recency blend; Peak 1h for sprint benchmark)
-    cutoff_1h = now_ms - 3_600_000
-    cutoff_24h = now_ms - 86_400_000
+    # Strictly clamp rolling local lookbacks to active server reset cycle boundaries (never leak pre-reset burn)
+    eff_cutoff_1h = max(now_ms - 3_600_000, fh_cycle_start_ms)
+    eff_cutoff_24h = max(now_ms - 86_400_000, wk_cycle_start_ms)
     cutoff_7d = now_ms - 7 * 86_400_000
     u_1h = 0.0
     u_24h = 0.0
@@ -1439,16 +1491,17 @@ def _build_pool_pacing(
         hr_buckets_all[hb] += ru
         if rts >= cutoff_7d:
             hr_buckets_7d[hb] += ru
-            if rts >= cutoff_24h:
-                u_24h += ru
-                if rts >= cutoff_1h:
-                    u_1h += ru
+        if rts >= eff_cutoff_24h:
+            u_24h += ru
+        if rts >= eff_cutoff_1h:
+            u_1h += ru
 
-    local_1h_5h_rate = units_to_pct_5h(u_1h, 2, is_3p=is_3p_pool)
-    local_24h_wk_rate = units_to_pct_week(u_24h, 2)
+    loc_1h_span_h = max(0.25, min(1.0, (now_ms - eff_cutoff_1h) / 3_600_000.0))
+    loc_24h_span_d = max(0.25, min(1.0, (now_ms - eff_cutoff_24h) / 86_400_000.0))
+    local_1h_5h_rate = round(units_to_pct_5h(u_1h, 4, is_3p=is_3p_pool) / loc_1h_span_h, 2)
+    local_24h_wk_rate = round(units_to_pct_week(u_24h, 4) / loc_24h_span_d, 2)
     active_hr_src = hr_buckets_7d if len(hr_buckets_7d) >= 3 else hr_buckets_all
     peak_1h_wk_pct = round(units_to_pct_week(max(active_hr_src.values()), 3), 2) if active_hr_src else 0.0
-    sprint_hours_left = round(wk_rem / peak_1h_wk_pct, 1) if peak_1h_wk_pct >= 0.05 else None
 
     if wk_reset_ms and fh_reset_ms and wk_reset_ms > fh_reset_ms:
         after_fh_hours = max(0.0, (wk_reset_ms - fh_reset_ms) / 3_600_000.0)
@@ -1463,147 +1516,214 @@ def _build_pool_pacing(
         extra_5h_windows = full_extra + (min(1.0, rem_sliver_h / 1.0) if rem_sliver_h > 0.05 else 0.0)
     else:
         extra_5h_windows = 0.0
-    burst_windows_left = round((fh_rem / 100.0) + extra_5h_windows, 1)
-    smooth_cal_windows_left = round(max(0.1, (fh_rem / 100.0) + (after_fh_hours / 5.0)), 1)
 
-    max_reachable_add_wk = round(burst_windows_left * burst_to_wk_pct, 1)
-    max_final_wk_pct = round(min(100.0, wk_used + max_reachable_add_wk), 1)
-    wk_unkillable = bool(wk_rem > (burst_windows_left * burst_to_wk_pct + 0.5) and wk_rem > 1.0)
+    def _eval_view(v_wk_used, v_wk_rem, v_fh_used, v_fh_rem, v_wk_rate_day, v_fh_rate_hr, v_fh_src, v_src_actual):
+        v_burst_win_left = round((v_fh_rem / 100.0) + extra_5h_windows, 1)
+        v_smooth_cal_left = round(max(0.1, (v_fh_rem / 100.0) + (after_fh_hours / 5.0)), 1)
+        v_max_add_wk = round(v_burst_win_left * burst_to_wk_pct, 1)
+        v_max_final_wk = round(min(100.0, v_wk_used + v_max_add_wk), 1)
+        v_wk_unkillable = bool(v_wk_rem > (v_burst_win_left * burst_to_wk_pct + 0.5) and v_wk_rem > 1.0)
 
-    # Recency-weighted Weekly daily pace: (60% recent 24h + 40% cycle avg) on local + other-devices cycle avg
-    wk_cycle_rate_per_day = wk_used / wk_el_days
-    wk_cycle_rate_per_hour = wk_used / wk_el_hours
-    local_cycle_wk_day = local_wk_pct / wk_el_days
-    other_cycle_wk_day = other_wk / wk_el_days
-    if local_24h_wk_rate > 0 or local_cycle_wk_day > 0:
-        blended_local_wk_day = 0.6 * local_24h_wk_rate + 0.4 * local_cycle_wk_day
+        v_wk_cycle_day = v_wk_used / wk_el_days
+        v_wk_cycle_hr = v_wk_used / wk_el_hours
+        v_wk_rate_hr = v_wk_rate_day / 24.0
+        v_wk_safe_hr = v_wk_rem / wk_rem_hours
+        v_wk_safe_day = v_wk_rem / wk_rem_days
+
+        v_fh_win_hr = v_fh_used / fh_el_hours
+        v_fh_safe_hr = v_fh_rem / fh_rem_hours
+
+        v_wk_warmup = bool(wk_el_hours < 6.0 and v_wk_used < 12.0)
+        v_fh_warmup = bool(fh_el_hours < 0.25 and v_fh_used < 15.0)
+
+        v_wk_unclipped = round(min(999.0, v_wk_used + v_wk_rate_hr * wk_rem_hours), 1)
+        v_fh_unclipped = round(min(999.0, v_fh_used + v_fh_rate_hr * fh_rem_hours), 1)
+
+        v_wk_ratio = round(v_wk_rate_day / (100.0 / 7.0), 2)
+        v_fh_ratio = round(v_fh_rate_hr / 20.0, 2)
+
+        v_wk_tte = round(v_wk_rem / v_wk_rate_hr, 2) if v_wk_rate_hr > 0.01 else None
+        v_wk_short = round(max(0.0, wk_rem_hours - v_wk_tte), 2) if (v_wk_tte is not None and v_wk_tte < wk_rem_hours) else 0.0
+
+        v_fh_tte = round(v_fh_rem / v_fh_rate_hr, 2) if v_fh_rate_hr > 0.05 else None
+        v_fh_short = round(max(0.0, fh_rem_hours - v_fh_tte), 2) if (v_fh_tte is not None and v_fh_tte < fh_rem_hours) else 0.0
+
+        v_wk_clock_delta = round(v_wk_used - wk_elapsed_pct, 1)
+        v_fh_clock_delta = round(v_fh_used - fh_elapsed_pct, 1)
+        v_less_than_one_burst = bool(v_wk_rem < burst_to_wk_pct and v_wk_rem > 0.05 and wk_rem_hours > 12.0)
+
+        # Stock-vs-clock & compressed-runway warning gates (avoids Day-1 sleep/wake false alarms while catching 80% w/ 4d left)
+        v_wk_overpace = bool(
+            v_wk_short > 0.5 and (
+                (v_wk_clock_delta >= 12.0 and (v_wk_used >= 35.0 or v_wk_safe_day <= 11.0))
+                or (v_wk_used >= 75.0 and v_wk_clock_delta >= 5.0)
+                or (wk_rem_days >= 1.0 and v_wk_safe_day <= 8.5)
+                or (v_wk_unclipped >= 125.0 and v_wk_used >= 40.0 and v_wk_clock_delta >= 12.0)
+            )
+        )
+        v_wk_runway_crushed = bool(wk_rem_days >= 1.25 and v_wk_safe_day <= 7.5 and v_wk_used >= 50.0)
+        v_wk_run_out = bool(not v_wk_unkillable and not v_wk_warmup and (v_wk_rem <= 0.1 or v_wk_overpace or v_wk_runway_crushed))
+
+        v_wk_caution = bool(
+            not v_wk_unkillable and not v_wk_warmup and not v_wk_run_out and v_wk_rem > 0.1 and (
+                v_wk_clock_delta >= 7.0
+                or (wk_rem_days >= 1.5 and v_wk_safe_day <= 11.0)
+                or (v_wk_unclipped >= 105.0 and v_wk_used >= 20.0)
+            )
+        )
+
+        v_fh_run_out = bool(
+            not v_fh_warmup and (
+                v_fh_rem <= 0.1
+                or (v_fh_short > 0.12 and (v_fh_used >= 25.0 or v_fh_clock_delta >= 15.0))
+            )
+        )
+
+        v_target_wk_mult = round(v_wk_safe_day / v_wk_rate_day, 2) if v_wk_rate_day >= 0.35 else None
+        v_target_5h_mult = round(v_fh_safe_hr / v_fh_rate_hr, 2) if v_fh_rate_hr >= 0.4 else None
+
+        raw_awake = wk_rem_days * sessions_per_day
+        v_awake_left = round(min(v_smooth_cal_left, max(min(1.0, v_smooth_cal_left), raw_awake)), 1)
+        v_tanks_equiv = round(v_wk_rem / burst_to_wk_pct, 1)
+        tanks_exact = v_wk_rem / burst_to_wk_pct
+        v_smooth_sess = int(round((tanks_exact / max(0.2, v_awake_left)) * 100.0)) if v_wk_rem > 0.05 else 0
+        v_smooth_24x7 = int(round((tanks_exact / max(0.2, v_smooth_cal_left)) * 100.0)) if v_wk_rem > 0.05 else 0
+
+        v_sprint_hrs = round(v_wk_rem / peak_1h_wk_pct, 1) if peak_1h_wk_pct >= 0.05 else None
+        v_est_reqs = int(round(v_wk_rem / max(0.0002, avg_wk_pct_per_req)))
+        v_est_fh_reqs = int(round(((v_fh_rem / 100.0) * burst_to_wk_pct) / max(0.0002, avg_wk_pct_per_req)))
+
+        return {
+            "key": pool_key,
+            "label": label,
+            "fullName": full_name,
+            "sourceActual": v_src_actual,
+            "available": bool(wk_pool or fh_pool or raw_local_wk_pct > 0 or raw_local_5h_pct > 0),
+            "wkCycleSince": wk_cycle_since,
+            "fhCycleSince": fh_cycle_since,
+            "serverWkUsedPct": v_wk_used,
+            "serverWkRemPct": v_wk_rem,
+            "localWkUsedPct": bar_local_wk_pct if v_src_actual == "server" else raw_local_wk_pct,
+            "rawLocalWkUsedPct": raw_local_wk_pct,
+            "otherWkUsedPct": other_wk if v_src_actual == "server" else 0.0,
+            "wkElapsedPct": wk_elapsed_pct,
+            "wkClockDelta": v_wk_clock_delta,
+            "wkElapsedDays": round(wk_el_days, 2),
+            "wkRemainingDays": round(wk_rem_days, 2),
+            "wkElapsedHours": round(wk_el_hours, 2),
+            "wkRemainingHours": round(wk_rem_hours, 2),
+            "serverWkPaceRatio": v_wk_ratio,
+            "localWkPaceRatio": round(raw_local_wk_pct / max(2.0, wk_elapsed_pct), 2),
+            "serverWkProjectedPct": round(min(100.0, v_wk_unclipped), 1),
+            "serverWkUnclippedPct": v_wk_unclipped,
+            "localWkProjectedPct": round(min(100.0, raw_local_wk_pct / max(0.02, wk_elapsed_pct / 100.0)), 1),
+            "serverWkRatePerDay": round(v_wk_rate_day, 2),
+            "cycleWkRatePerDay": round(v_wk_cycle_day, 2),
+            "local24hWkRatePerDay": local_24h_wk_rate,
+            "serverWkRatePerHour": round(v_wk_rate_hr, 2),
+            "cycleWkRatePerHour": round(v_wk_cycle_hr, 2),
+            "localWkRatePerDay": round(raw_local_wk_pct / wk_el_days, 2),
+            "safeDailyBudgetLeft": round(v_wk_safe_day, 1),
+            "safeHourlyBudgetLeft": round(v_wk_safe_hr, 2),
+            "targetWkMultiplier": v_target_wk_mult,
+            "wkTteHours": v_wk_tte,
+            "wkShortfallHours": v_wk_short,
+            "wkUnkillable": v_wk_unkillable,
+            "wkWarmup": v_wk_warmup,
+            "wkWillRunOut": v_wk_run_out,
+            "wkCaution": v_wk_caution,
+            "wkLessThanOneBurst": v_less_than_one_burst,
+            "maxReachableAddWkPct": v_max_add_wk,
+            "maxFinalWkPct": v_max_final_wk,
+            "burstWindowsLeft": v_burst_win_left,
+            "smoothCalWindowsLeft": v_smooth_cal_left,
+            "awake5hSessionsLeft": v_awake_left,
+            "sessionsPerDay": round(sessions_per_day, 1),
+            "smooth5hSessionPct": v_smooth_sess,
+            "smooth5h24x7Pct": v_smooth_24x7,
+            "burstToWkPct": round(burst_to_wk_pct, 1),
+            "wkTanksTotal": round(100.0 / burst_to_wk_pct, 1),
+            "fhUsedAsWkPct": round((v_fh_used / 100.0) * burst_to_wk_pct, 2),
+            "fhRemAsWkPct": round((v_fh_rem / 100.0) * burst_to_wk_pct, 2),
+            "burstRatioCalibrated": bool(pool_key in _CALIBRATED_BURST_TO_WK_PCT),
+            "burstTanksEquivLeft": v_tanks_equiv,
+            "peak1hWkPct": peak_1h_wk_pct,
+            "sprintHoursLeft": v_sprint_hrs,
+            "estReqsLeft": v_est_reqs,
+            "est5hReqsLeft": v_est_fh_reqs,
+            "server5hUsedPct": v_fh_used,
+            "server5hRemPct": v_fh_rem,
+            "local5hUsedPct": bar_local_5h_pct if v_src_actual == "server" else raw_local_5h_pct,
+            "rawLocal5hUsedPct": raw_local_5h_pct,
+            "other5hUsedPct": other_5h if v_src_actual == "server" else 0.0,
+            "fhElapsedPct": fh_elapsed_pct,
+            "fhClockDelta": v_fh_clock_delta,
+            "fhElapsedHours": round(fh_el_hours, 2),
+            "fhRemainingHours": round(fh_rem_hours, 2),
+            "server5hPaceRatio": v_fh_ratio,
+            "local5hPaceRatio": round(raw_local_5h_pct / max(4.0, fh_elapsed_pct), 2),
+            "server5hProjectedPct": round(min(100.0, v_fh_unclipped), 1),
+            "server5hUnclippedPct": v_fh_unclipped,
+            "local5hProjectedPct": round(min(100.0, raw_local_5h_pct / max(0.02, fh_elapsed_pct / 100.0)), 1),
+            "server5hRatePerHour": round(v_fh_rate_hr, 2),
+            "window5hRatePerHour": round(v_fh_win_hr, 2),
+            "local1h5hRatePerHour": local_1h_5h_rate,
+            "fhRateSource": v_fh_src,
+            "local5hRatePerHour": round(raw_local_5h_pct / fh_el_hours, 2),
+            "safe5hHourlyBudgetLeft": round(v_fh_safe_hr, 1),
+            "target5hMultiplier": v_target_5h_mult,
+            "fhTteHours": v_fh_tte,
+            "fhShortfallHours": v_fh_short,
+            "fhWarmup": v_fh_warmup,
+            "fhWillRunOut": v_fh_run_out,
+            "wkResetTime": wk_pool.get("resetTime", "") if wk_pool else "",
+            "fhResetTime": fh_pool.get("resetTime", "") if fh_pool else "",
+        }
+
+    # 1. Pure Server Pool View (100% server /usage stock-vs-clock + in-cycle server snapshot deltas; zero local token math)
+    srv_rates = _RECENT_SERVER_RATES.get(pool_key) or {}
+    srv_cycle_wk_day = wk_used / wk_el_days
+    if wk_pool is not None:
+        srv_rec_wk = srv_rates.get("wk_day")
+        if srv_rec_wk is not None:
+            srv_wk_rate_day = max(srv_cycle_wk_day, 0.6 * float(srv_rec_wk) + 0.4 * srv_cycle_wk_day)
+        else:
+            srv_wk_rate_day = srv_cycle_wk_day
+        srv_actual = "server"
     else:
-        blended_local_wk_day = 0.0
-    effective_wk_rate_day = blended_local_wk_day + other_cycle_wk_day
-    effective_wk_rate_hour = effective_wk_rate_day / 24.0
+        loc_cyc = raw_local_wk_pct / wk_el_days
+        srv_wk_rate_day = (0.6 * local_24h_wk_rate + 0.4 * loc_cyc) if (local_24h_wk_rate > 0 or loc_cyc > 0) else 0.0
+        srv_actual = "local_fallback"
 
-    wk_safe_per_hour = wk_rem / wk_rem_hours
-    wk_safe_per_day = wk_rem / wk_rem_days
+    srv_win_fh_hr = fh_used / fh_el_hours
+    if fh_pool is not None:
+        srv_rec_fh = srv_rates.get("fh_hr")
+        if srv_rec_fh is not None and float(srv_rec_fh) > (srv_win_fh_hr + 0.5):
+            srv_fh_rate_hr = float(srv_rec_fh)
+            srv_fh_src = "recent server"
+        else:
+            srv_fh_rate_hr = srv_win_fh_hr
+            srv_fh_src = "5h window"
+    else:
+        srv_fh_rate_hr = max(srv_win_fh_hr, local_1h_5h_rate)
+        srv_fh_src = "last 1h" if local_1h_5h_rate > (srv_win_fh_hr + 0.5) else "5h window"
 
-    # 5-Hour Burst live pace: max(server 5h window rate, local last-1h rate + other-devices 5h rate)
-    server_fh_rate_per_hour = fh_used / fh_el_hours
-    other_fh_rate_per_hour = other_5h / fh_el_hours
-    recent_1h_fh_rate = local_1h_5h_rate + other_fh_rate_per_hour
-    fh_live_rate_per_hour = max(server_fh_rate_per_hour, recent_1h_fh_rate)
-    fh_rate_source = "last 1h" if recent_1h_fh_rate > (server_fh_rate_per_hour + 0.5) else "5h window"
-    fh_safe_per_hour = fh_rem / fh_rem_hours
+    srv_view = _eval_view(wk_used, wk_rem, fh_used, fh_rem, srv_wk_rate_day, srv_fh_rate_hr, srv_fh_src, srv_actual)
 
-    wk_warmup = bool(wk_el_hours < 6.0 and wk_used < 12.0 and local_24h_wk_rate < 20.0)
-    fh_warmup = bool(fh_el_hours < 0.20 and fh_used < 15.0 and local_1h_5h_rate < 25.0)
+    # 2. Pure In-Cycle Local Setup View (for Multi-Surface / Local counting users; strictly clamped to current reset cycle)
+    loc_wk_rem = round(max(0.0, 100.0 - raw_local_wk_pct), 2)
+    loc_fh_rem = round(max(0.0, 100.0 - raw_local_5h_pct), 2)
+    loc_cycle_wk_day = raw_local_wk_pct / wk_el_days
+    loc_wk_rate_day = (0.6 * local_24h_wk_rate + 0.4 * loc_cycle_wk_day) if (local_24h_wk_rate > 0 or loc_cycle_wk_day > 0) else 0.0
+    loc_win_fh_hr = raw_local_5h_pct / fh_el_hours
+    loc_fh_rate_hr = max(loc_win_fh_hr, local_1h_5h_rate)
+    loc_fh_src = "last 1h" if local_1h_5h_rate > (loc_win_fh_hr + 0.5) else "5h window"
 
-    wk_unclipped_proj = round(min(999.0, wk_used + effective_wk_rate_hour * wk_rem_hours), 1)
-    fh_unclipped_proj = round(min(999.0, fh_used + fh_live_rate_per_hour * fh_rem_hours), 1)
-
-    wk_pace_ratio = round(effective_wk_rate_day / (100.0 / 7.0), 2)
-    fh_pace_ratio = round(fh_live_rate_per_hour / 20.0, 2)
-
-    wk_tte_hours = round(wk_rem / effective_wk_rate_hour, 2) if effective_wk_rate_hour > 0.01 else None
-    wk_shortfall_hours = round(max(0.0, wk_rem_hours - wk_tte_hours), 2) if (wk_tte_hours is not None and wk_tte_hours < wk_rem_hours) else 0.0
-
-    fh_tte_hours = round(fh_rem / fh_live_rate_per_hour, 2) if fh_live_rate_per_hour > 0.05 else None
-    fh_shortfall_hours = round(max(0.0, fh_rem_hours - fh_tte_hours), 2) if (fh_tte_hours is not None and fh_tte_hours < fh_rem_hours) else 0.0
-
-    wk_will_run_out = bool(not wk_unkillable and not wk_warmup and (wk_rem <= 0.1 or wk_shortfall_hours > 0.25))
-    fh_will_run_out = bool(not fh_warmup and (fh_rem <= 0.1 or fh_shortfall_hours > 0.08))
-
-    target_wk_multiplier = round(wk_safe_per_day / effective_wk_rate_day, 2) if effective_wk_rate_day >= 0.35 else None
-    target_5h_multiplier = round(fh_safe_per_hour / fh_live_rate_per_hour, 2) if fh_live_rate_per_hour >= 0.4 else None
-
-    # Smooth 5h iteration distribution across realistic awake sessions (~2.5 sessions/day) vs 24/7 calendar windows
-    raw_awake_sessions = wk_rem_days * sessions_per_day
-    awake_sessions_left = round(min(smooth_cal_windows_left, max(min(1.0, smooth_cal_windows_left), raw_awake_sessions)), 1)
-    burst_tanks_equiv_left = round(wk_rem / burst_to_wk_pct, 1)
-    tanks_exact = wk_rem / burst_to_wk_pct
-    smooth_5h_session_pct = int(round((tanks_exact / max(0.2, awake_sessions_left)) * 100.0)) if wk_rem > 0.05 else 0
-    smooth_5h_24x7_pct = int(round((tanks_exact / max(0.2, smooth_cal_windows_left)) * 100.0)) if wk_rem > 0.05 else 0
-
-    est_reqs_left = int(round(wk_rem / max(0.0002, avg_wk_pct_per_req)))
-    est_fh_reqs_left = int(round(((fh_rem / 100.0) * burst_to_wk_pct) / max(0.0002, avg_wk_pct_per_req)))
-
-    return {
-        "key": pool_key,
-        "label": label,
-        "fullName": full_name,
-        "available": bool(wk_pool or fh_pool or local_wk_pct > 0 or local_5h_pct > 0),
-        "wkCycleSince": wk_cycle_since,
-        "fhCycleSince": fh_cycle_since,
-        "serverWkUsedPct": wk_used,
-        "serverWkRemPct": wk_rem,
-        "localWkUsedPct": local_wk_pct,
-        "otherWkUsedPct": other_wk,
-        "wkElapsedPct": wk_elapsed_pct,
-        "wkElapsedDays": round(wk_el_days, 2),
-        "wkRemainingDays": round(wk_rem_days, 2),
-        "wkElapsedHours": round(wk_el_hours, 2),
-        "wkRemainingHours": round(wk_rem_hours, 2),
-        "serverWkPaceRatio": wk_pace_ratio,
-        "localWkPaceRatio": round(local_wk_pct / max(2.0, wk_elapsed_pct), 2),
-        "serverWkProjectedPct": round(min(100.0, wk_unclipped_proj), 1),
-        "serverWkUnclippedPct": wk_unclipped_proj,
-        "localWkProjectedPct": round(min(100.0, local_wk_pct / max(0.02, wk_elapsed_pct / 100.0)), 1),
-        "serverWkRatePerDay": round(effective_wk_rate_day, 2),
-        "cycleWkRatePerDay": round(wk_cycle_rate_per_day, 2),
-        "local24hWkRatePerDay": local_24h_wk_rate,
-        "serverWkRatePerHour": round(effective_wk_rate_hour, 2),
-        "cycleWkRatePerHour": round(wk_cycle_rate_per_hour, 2),
-        "localWkRatePerDay": round(local_wk_pct / wk_el_days, 2),
-        "safeDailyBudgetLeft": round(wk_safe_per_day, 1),
-        "safeHourlyBudgetLeft": round(wk_safe_per_hour, 2),
-        "targetWkMultiplier": target_wk_multiplier,
-        "wkTteHours": wk_tte_hours,
-        "wkShortfallHours": wk_shortfall_hours,
-        "wkUnkillable": wk_unkillable,
-        "wkWarmup": wk_warmup,
-        "wkWillRunOut": wk_will_run_out,
-        "maxReachableAddWkPct": max_reachable_add_wk,
-        "maxFinalWkPct": max_final_wk_pct,
-        "burstWindowsLeft": burst_windows_left,
-        "smoothCalWindowsLeft": smooth_cal_windows_left,
-        "awake5hSessionsLeft": awake_sessions_left,
-        "sessionsPerDay": round(sessions_per_day, 1),
-        "smooth5hSessionPct": smooth_5h_session_pct,
-        "smooth5h24x7Pct": smooth_5h_24x7_pct,
-        "burstToWkPct": round(burst_to_wk_pct, 1),
-        "wkTanksTotal": round(100.0 / burst_to_wk_pct, 1),
-        "fhUsedAsWkPct": round((fh_used / 100.0) * burst_to_wk_pct, 2),
-        "fhRemAsWkPct": round((fh_rem / 100.0) * burst_to_wk_pct, 2),
-        "burstRatioCalibrated": bool(pool_key in _CALIBRATED_BURST_TO_WK_PCT),
-        "burstTanksEquivLeft": burst_tanks_equiv_left,
-        "peak1hWkPct": peak_1h_wk_pct,
-        "sprintHoursLeft": sprint_hours_left,
-        "estReqsLeft": est_reqs_left,
-        "est5hReqsLeft": est_fh_reqs_left,
-        "server5hUsedPct": fh_used,
-        "server5hRemPct": fh_rem,
-        "local5hUsedPct": local_5h_pct,
-        "other5hUsedPct": other_5h,
-        "fhElapsedPct": fh_elapsed_pct,
-        "fhElapsedHours": round(fh_el_hours, 2),
-        "fhRemainingHours": round(fh_rem_hours, 2),
-        "server5hPaceRatio": fh_pace_ratio,
-        "local5hPaceRatio": round(local_5h_pct / max(4.0, fh_elapsed_pct), 2),
-        "server5hProjectedPct": round(min(100.0, fh_unclipped_proj), 1),
-        "server5hUnclippedPct": fh_unclipped_proj,
-        "local5hProjectedPct": round(min(100.0, local_5h_pct / max(0.02, fh_elapsed_pct / 100.0)), 1),
-        "server5hRatePerHour": round(fh_live_rate_per_hour, 2),
-        "window5hRatePerHour": round(server_fh_rate_per_hour, 2),
-        "local1h5hRatePerHour": local_1h_5h_rate,
-        "fhRateSource": fh_rate_source,
-        "local5hRatePerHour": round(local_5h_pct / fh_el_hours, 2),
-        "safe5hHourlyBudgetLeft": round(fh_safe_per_hour, 1),
-        "target5hMultiplier": target_5h_multiplier,
-        "fhTteHours": fh_tte_hours,
-        "fhShortfallHours": fh_shortfall_hours,
-        "fhWarmup": fh_warmup,
-        "fhWillRunOut": fh_will_run_out,
-        "wkResetTime": wk_pool.get("resetTime", "") if wk_pool else "",
-        "fhResetTime": fh_pool.get("resetTime", "") if fh_pool else "",
-    }
+    srv_view["localView"] = _eval_view(
+        raw_local_wk_pct, loc_wk_rem, raw_local_5h_pct, loc_fh_rem,
+        loc_wk_rate_day, loc_fh_rate_hr, loc_fh_src, "local",
+    )
+    return srv_view
 
 def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
     telemetry = load_raw_telemetry()
@@ -2395,12 +2515,14 @@ def print_cli_quota(data):
             emp = width - fill
             return f"{color}{'█' * fill}{C.DIM}{'░' * emp}{C.RESET}"
 
+        q_mode_cli = load_config().get("web", {}).get("quota_mode", "server")
         pools_dict = p_root.get("pools") or {"gemini": p_root}
         for pk in ("gemini", "3p"):
-            p = pools_dict.get(pk)
-            if not p or not p.get("available"):
+            base_p = pools_dict.get(pk)
+            if not base_p or not base_p.get("available"):
                 continue
-            if pk == "3p" and p.get("serverWkUsedPct", 0) <= 0 and p.get("server5hUsedPct", 0) <= 0:
+            p = (base_p.get("localView") or base_p) if q_mode_cli == "multi" else base_p
+            if pk == "3p" and base_p.get("serverWkUsedPct", 0) <= 0 and base_p.get("server5hUsedPct", 0) <= 0 and p.get("serverWkUsedPct", 0) <= 0:
                 continue
 
             wk_rem_h = float(p.get("wkRemainingHours", 24.0))
@@ -2416,6 +2538,8 @@ def print_cli_quota(data):
             aw_sess = float(p.get("awake5hSessionsLeft", 1.0))
             cal_win = float(p.get("smoothCalWindowsLeft", 1.0))
             max_fin = float(p.get("maxFinalWkPct", 100.0))
+            clock_delta = float(p.get("wkClockDelta", float(p.get("serverWkUsedPct", 0.0)) - float(p.get("wkElapsedPct", 0.0))))
+            b2w = float(p.get("burstToWkPct", 25.0))
 
             if float(p.get("serverWkRemPct", 100.0)) <= 0.05:
                 pace_pill = f"{C.BOLD}{C.RED}[EXHAUSTED]{C.RESET}"
@@ -2441,13 +2565,29 @@ def print_cli_quota(data):
                 quota_color = C.RED
                 tte_s = _fmt_hrs_cli(p.get("wkTteHours"))
                 short_s = _fmt_hrs_cli(p.get("wkShortfallHours"))
-                runout_str = f"Yes — empties in ~{tte_s} ({short_s} before reset)"
-                mult_s = f"{wk_mult:.2f}x" if (wk_mult is not None and wk_mult < 1.0) else f"{(wk_mult or 0.5):.1f}x"
-                pace_100_str = f"{mult_s} your current pace ({safe_day_rate:.1f}%/day target vs ~{cur_day_rate:.1f}%/day now)"
+                ahead_note = f" · +{clock_delta:.0f}% ahead of clock" if clock_delta >= 5.0 else ""
+                burst_warn = f" · <1 full 5h burst ({b2w:.0f}% wk) left" if p.get("wkLessThanOneBurst") else ""
+                if p.get("wkTteHours") is not None and float(p.get("wkShortfallHours", 0)) > 0.25:
+                    runout_str = f"Yes — empties in ~{tte_s} ({short_s} before reset{ahead_note}{burst_warn})"
+                else:
+                    runout_str = f"Tight runway — {p['serverWkRemPct']:.1f}% left for {reset_disp} ({safe_day_rate:.1f}%/day cap{ahead_note}{burst_warn})"
+                mult_s = f"{wk_mult:.2f}x" if (wk_mult is not None and wk_mult < 1.0) else (f"{wk_mult:.1f}x" if wk_mult is not None else None)
+                pace_100_str = (
+                    f"{mult_s} your current pace (<= {safe_day_rate:.1f}%/day target vs ~{cur_day_rate:.1f}%/day now)"
+                    if mult_s else f"Cap at <= {safe_day_rate:.1f}%/day"
+                )
+                smooth_str = f"Aim for ~{sm_sess}% per 5h session (~{aw_sess:.0f} awake sessions · ~{sm_24x7}% if 24/7)"
+            elif p.get("wkCaution"):
+                ahead_lbl = f"+{max(1.0, clock_delta):.0f}% AHEAD" if clock_delta >= 1.0 else f"{pace_ratio:.1f}x PACE"
+                pace_pill = f"{C.BOLD}{C.YELLOW}[CAUTION · {ahead_lbl}]{C.RESET}"
+                quota_color = C.YELLOW
+                runout_str = f"Ahead of weekly clock — keep <= {safe_day_rate:.1f}%/day across {reset_disp} to avoid running dry"
+                mult_s = f"{wk_mult:.2f}x" if (wk_mult is not None and wk_mult < 1.0) else f"{(wk_mult or 0.8):.1f}x"
+                pace_100_str = f"{mult_s} your current pace (<= {safe_day_rate:.1f}%/day target vs ~{cur_day_rate:.1f}%/day now)"
                 smooth_str = f"Aim for ~{sm_sess}% per 5h session (~{aw_sess:.0f} awake sessions · ~{sm_24x7}% if 24/7)"
             elif p.get("serverWkUnclippedPct", 0) >= 85.0:
-                pace_pill = f"{C.BOLD}{C.YELLOW}[ON TARGET {pace_ratio:.1f}x]{C.RESET}"
-                quota_color = C.YELLOW
+                pace_pill = f"{C.BOLD}{C.GREEN}[ON TARGET {pace_ratio:.1f}x]{C.RESET}"
+                quota_color = C.GREEN
                 runout_str = f"No — lands near ~{min(100.0, p['serverWkUnclippedPct']):.0f}% at reset"
                 mult_s = f"{wk_mult:.2f}x" if (wk_mult is not None and wk_mult < 1.0) else f"{(wk_mult or 1.0):.1f}x"
                 pace_100_str = f"{mult_s} your current pace (hold steady: ~{cur_day_rate:.1f}%/day vs {safe_day_rate:.1f}%/day target)"
@@ -2475,13 +2615,15 @@ def print_cli_quota(data):
                     )
                 )
 
-            print(f"\n{C.BOLD}{C.CYAN}PACING & RUNWAY · {p.get('fullName', pk).upper()}{C.RESET}")
+            src_tag = " · LOCAL SETUP" if q_mode_cli == "multi" else ""
+            used_row_lbl = "This setup used:" if q_mode_cli == "multi" else "Server pool used:"
+            print(f"\n{C.BOLD}{C.CYAN}PACING & RUNWAY · {p.get('fullName', pk).upper()}{src_tag}{C.RESET}")
             print(f"{C.DIM}{'─' * 84}{C.RESET}")
             print(f"  {pace_pill}  Weekly: {p['serverWkUsedPct']:.1f}% used ({p['serverWkRemPct']:.1f}% left · resets in {reset_disp})")
             time_bar = _meter(p['wkElapsedPct'], 16, C.DIM)
             quota_bar = _meter(p['serverWkUsedPct'], 16, quota_color)
             print(f"    {'Week clock elapsed:':<24} {time_bar}  {p['wkElapsedPct']:>5.1f}%")
-            print(f"    {'Account quota used:':<24} {quota_bar}  {p['serverWkUsedPct']:>5.1f}%")
+            print(f"    {used_row_lbl:<24} {quota_bar}  {p['serverWkUsedPct']:>5.1f}%")
             print(f"    {'Will it run out?:':<24} {runout_str}")
             print(f"    {'Pace to finish 100%:':<24} {pace_100_str}")
             print(f"    {'Smooth 5h strategy:':<24} {smooth_str}")
@@ -2494,13 +2636,12 @@ def print_cli_quota(data):
             else:
                 fh_note = f"ceiling {p['safe5hHourlyBudgetLeft']:.1f}%/hr"
             print(f"    {'5-Hour Burst:':<24} {p['server5hUsedPct']:.1f}% used · {p['server5hRemPct']:.1f}% left · refills in {fh_reset_disp} ({fh_note})")
-            b2w = float(p.get('burstToWkPct', 25.0))
             t_tot = float(p.get('wkTanksTotal', round(100.0 / max(1.0, b2w), 1)))
             print(f"    {'5h -> Weekly factor:':<24} {C.DIM}100% of 5h = {b2w:.1f}% of Weekly ({t_tot:.1f} full 5h tanks/wk · ~{p.get('burstTanksEquivLeft', 0):.1f} tanks left){C.RESET}")
             if p.get("sprintHoursLeft") and p.get("peak1hWkPct", 0) >= 0.05:
                 print(f"    {'Peak sprint benchmark:':<24} {C.DIM}~{p['sprintHoursLeft']:.1f}h of coding left at your {p['peak1hWkPct']:.2f}%/hr peak hour{C.RESET}")
-            if p.get('otherWkUsedPct', 0) >= 1.0 or p.get('localWkUsedPct', 0) > 0:
-                print(f"    {'Setup attribution:':<24} {C.DIM}This setup: {p['localWkUsedPct']:.2f}% | Other products / devices: {p['otherWkUsedPct']:.2f}%{C.RESET}")
+            if q_mode_cli == "multi":
+                print(f"    {'Setup attribution:':<24} {C.DIM}This setup: {base_p['localWkUsedPct']:.2f}% | Other surfaces: {base_p['otherWkUsedPct']:.2f}% (Server total: {base_p['serverWkUsedPct']:.1f}%){C.RESET}")
 
 def print_cli_tokens(data, limit_days=10):
     ov = data["overall"]
@@ -2696,8 +2837,11 @@ def print_settings_table(cfg):
     print(f"{C.DIM}{'─' * 78}{C.RESET}")
     print(f"  {C.BOLD}{'Setting':<28} {'Value':<30} {'Key / Example':<18}{C.RESET}")
     print(f"{C.DIM}{'─' * 78}{C.RESET}")
+    q_mode = web_cfg.get("quota_mode", "server")
+    q_mode_str = "Local / Multi-surface" if q_mode == "multi" else "Server pool (default)"
     print(f"  {'Onboarding Status':<28} {onboarded_str:<39} onboarded=true|false")
     print(f"  {'Default Launch Mode':<28} {C.GREEN if def_mode=='web' else C.CYAN}{def_mode.upper():<30}{C.RESET} default=web|cli")
+    print(f"  {'Quota Counting Source':<28} {q_mode_str:<30} quota_mode=server|multi")
     print(f"  {'Web Auto-Open Browser':<28} {browser_str:<30} open_browser=true|false")
     print(f"  {'Web Dashboard Port':<28} {str(web_cfg.get('port', 3872)):<30} port=3872")
     print(f"  {'CLI Default View':<28} {cli_cfg.get('default_view', 'overview'):<30} cli.view=tokens|summary")
@@ -3929,6 +4073,8 @@ def run_interactive_onboarding(cfg):
             cfg = load_config()
             def_mode = cfg.get("default_mode", "web")
             open_br = cfg.get("web", {}).get("open_browser", True)
+            q_mode = cfg.get("web", {}).get("quota_mode", "server")
+            q_mode_lbl = "Local / Multi-Surface" if q_mode == "multi" else "Server Pool"
             cli_view = cfg.get("cli", {}).get("default_view", "overview")
             dis_sec = cfg.get("cli", {}).get("disabled_sections", [])
             auto_upd = cfg.get("auto_update", False)
@@ -3937,7 +4083,7 @@ def run_interactive_onboarding(cfg):
 
             hdr = [
                 f"{C.CYAN}┌{C.RESET}  {C.BOLD}AGY STATS · Settings & Preferences (v{__version__}){C.RESET}",
-                f"{C.DIM}│  Mode: {def_mode.upper()} · Display: {_describe_display_sections(dis_sec)} · Updates: {upd_short}{C.RESET}",
+                f"{C.DIM}│  Mode: {def_mode.upper()} · Quota: {q_mode_lbl} · Display: {_describe_display_sections(dis_sec)}{C.RESET}",
             ]
             if status_note:
                 hdr.append(f"{C.GREEN}◇{C.RESET}  {status_note}")
@@ -3948,6 +4094,7 @@ def run_interactive_onboarding(cfg):
                 "Main Menu",
                 [
                     ("wizard",  "Run Guided Onboarding Wizard", "4-step setup flow", False),
+                    ("qmode",   f"Set Quota Counting Source (currently: {q_mode_lbl})", "Server Pool vs Local / Multi-Surface", False),
                     ("display", "Customize Overview & Summary Display", _describe_display_sections(dis_sec), False),
                     ("mode",    f"Switch Default Launch Mode (currently: {def_mode.upper()})", "Toggle Web <-> CLI", False),
                     ("browser", f"Toggle Auto-Open Browser (currently: {'On' if open_br else 'Off'})", "Web mode launch behavior", False),
@@ -3977,6 +4124,22 @@ def run_interactive_onboarding(cfg):
                     return
                 status_note = "Returned to main menu (wizard cancelled)."
                 continue
+
+            elif choice == "qmode":
+                qm_act, qm_val = ui.select_one(
+                    hdr,
+                    "Quota Counting Source",
+                    [
+                        ("server", "Server Pool (Default)", "100% live /usage server state · ideal for single-product setups", False),
+                        ("multi", "Local / Multi-Surface", "Local CLI % counting + This setup vs Other surfaces split", False),
+                        ("__back__", "Back to Main Menu", "", True),
+                    ],
+                    default_idx=(1 if q_mode == "multi" else 0),
+                    footer="↑/↓ move · Enter select · Esc/b back to main menu",
+                )
+                if qm_act == "SELECT" and qm_val != "__back__":
+                    save_config({"onboarded": True, "web": {"quota_mode": qm_val}})
+                    status_note = f"Quota counting source set to: {'Local / Multi-Surface' if qm_val == 'multi' else 'Server Pool'}"
 
             elif choice == "display":
                 while True:
@@ -4144,8 +4307,8 @@ def handle_settings_cli(args_list):
         elif k in ("port", "web.port"):
             try: updates.setdefault("web", {})["port"] = int(v)
             except Exception: pass
-        elif k in ("quota_mode", "web.quota_mode"):
-            updates.setdefault("web", {})["quota_mode"] = "multi" if v.lower() == "multi" else "server"
+        elif k in ("quota_mode", "web.quota_mode", "quota"):
+            updates.setdefault("web", {})["quota_mode"] = "multi" if v.lower() in ("multi", "local") else "server"
         elif k in ("pacing_style", "web.pacing_style"):
             if v.lower() in ("fun", "straight", "minimal"):
                 updates.setdefault("web", {})["pacing_style"] = v.lower()
@@ -6005,6 +6168,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
       </div>
 
+      <!-- Quota Counting Source -->
+      <div class="form-section">
+        <div class="form-section-title">Quota Counting Source</div>
+        <div class="form-desc">Choose whether quota pacing tracks the live server pool directly (ideal for single-product setups) or measures local CLI usage across multiple surfaces:</div>
+        <div class="radio-pill-group">
+          <label class="radio-pill-label">
+            <input type="radio" name="settingQuotaMode" value="server" id="settingQuotaServer" checked>
+            <span>Server Pool (Default)</span>
+          </label>
+          <label class="radio-pill-label">
+            <input type="radio" name="settingQuotaMode" value="multi" id="settingQuotaMulti">
+            <span>Local / Multi-Surface</span>
+          </label>
+        </div>
+      </div>
+
       <!-- Pacing Coach & Forecast Style -->
       <div class="form-section">
         <div class="form-section-title">Quota Pacing &amp; Coach Style</div>
@@ -6113,6 +6292,18 @@ let G_PREV_STAT_VALUES = new Map();
 let G_INITIAL_REVEALED = false;
 let G_SYNC_PHASE = "syncing";
 let G_PACING_POOL = "gemini";
+let G_QUOTA_MODE = (() => {
+  try {
+    const q = localStorage.getItem("agy-stats-quota-counting");
+    return q === "multi" ? "multi" : "server";
+  } catch (e) { return "server"; }
+})();
+let G_PACING_SOURCE = (() => {
+  try {
+    const s = localStorage.getItem("agy-stats-pacing-source-v2");
+    return (s === "server" || s === "local") ? s : "local";
+  } catch (e) { return "local"; }
+})();
 let G_PACING_STYLE = (() => {
   try {
     const s = localStorage.getItem("agy-stats-pacing-style");
@@ -6287,6 +6478,39 @@ function setPacingPool(poolKey) {
   G_PACING_POOL = poolKey;
   renderPacingSection("overviewPacingBody");
   renderPacingSection("quotaPacingBody");
+  renderQuotaPoolsGrid();
+  syncSegmentedThumbs();
+}
+function setPacingSource(srcKey) {
+  if (srcKey !== "server" && srcKey !== "local") return;
+  hideQuotaConversionTip();
+  G_PACING_SOURCE = srcKey;
+  try { localStorage.setItem("agy-stats-pacing-source-v2", srcKey); } catch (e) {}
+  renderPacingSection("overviewPacingBody");
+  renderPacingSection("quotaPacingBody");
+  renderQuotaPoolsGrid();
+  syncSegmentedThumbs();
+}
+function setQuotaMode(modeKey, persist = true) {
+  const norm = modeKey === "multi" ? "multi" : "server";
+  hideQuotaConversionTip();
+  G_QUOTA_MODE = norm;
+  try { localStorage.setItem("agy-stats-quota-counting", norm); } catch (e) {}
+  const rSrv = document.getElementById("settingQuotaServer");
+  const rMul = document.getElementById("settingQuotaMulti");
+  if (rSrv) rSrv.checked = (norm === "server");
+  if (rMul) rMul.checked = (norm === "multi");
+  if (persist) {
+    if (G_SETTINGS && G_SETTINGS.web) G_SETTINGS.web.quota_mode = norm;
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Stats": "1" },
+      body: JSON.stringify({ web: { quota_mode: norm } })
+    }).catch(() => {});
+  }
+  renderPacingSection("overviewPacingBody");
+  renderPacingSection("quotaPacingBody");
+  renderQuotaPoolsGrid();
   syncSegmentedThumbs();
 }
 function setPacingStyle(styleKey, persist = true) {
@@ -6310,6 +6534,7 @@ function setPacingStyle(styleKey, persist = true) {
   }
   renderPacingSection("overviewPacingBody");
   renderPacingSection("quotaPacingBody");
+  renderQuotaPoolsGrid();
   syncSegmentedThumbs();
 }
 function setPacingBars(showBars, persist = true) {
@@ -6328,6 +6553,7 @@ function setPacingBars(showBars, persist = true) {
   }
   renderPacingSection("overviewPacingBody");
   renderPacingSection("quotaPacingBody");
+  renderQuotaPoolsGrid();
   syncSegmentedThumbs();
 }
 function togglePacingBars() {
@@ -6337,6 +6563,7 @@ function cyclePacingQuip() {
   G_PACING_QUIP_IDX = (G_PACING_QUIP_IDX + 1) % 12;
   renderPacingSection("overviewPacingBody");
   renderPacingSection("quotaPacingBody");
+  renderQuotaPoolsGrid();
   syncSegmentedThumbs();
 }
 function toLocalDatetimeValue(ms) {
@@ -6488,16 +6715,16 @@ function renderDynamicOverview() {
   if (shortWin) {
     footWk = `≈ ${ov.pct5hSpent}% of 5h limit`;
     if (priorWk > 0) {
-      footWk += ` · ${activeWk}% in current week`;
+      footWk += ` · ${activeWk}% since wk reset`;
     } else if (gemWk) {
       footWk += ` · ${gemWk.remainingPct}% wk left`;
     }
   } else if (subweekWin && priorWk > 0) {
-    footWk = `${activeWk}% in current week · +${priorWk}% prior week`;
+    footWk = `Local (${ov.windowLabel}) · ${activeWk}% since wk reset`;
   } else if (gemWk) {
-    footWk = `This week: ${ov.cycleWeekLocalPct ?? ov.pctWeeklySpent}% here · ${gemWk.remainingPct}% wk left`;
+    footWk = `Local (${ov.windowLabel}) · ${ov.cycleWeekLocalPct ?? activeWk}% since wk reset`;
   } else {
-    footWk = `${Re(ov.conversationTokens)} tokens`;
+    footWk = `Local (${ov.windowLabel}) · ${Re(ov.conversationTokens)} tokens`;
   }
   const has3pRange = Number(ov.pct3pWeeklySpent || 0) > 0;
   const footWkTitle = has3pRange
@@ -6506,7 +6733,7 @@ function renderDynamicOverview() {
 
   document.getElementById("primaryStatGrid").innerHTML = `
     <div class="stat" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, G_PACING_POOL)" onmouseleave="hideQuotaConversionTip()">
-      <div class="stat-label"><span class="pacing-tip-trigger">Weekly quota</span></div>
+      <div class="stat-label"><span class="pacing-tip-trigger">Quota spent</span></div>
       <div class="stat-value">${ov.pctWeeklySpent}%</div>
       <div class="stat-foot"><span class="truncate" title="${esc(footWkTitle)}">${esc(footWk)}</span></div>
       <div class="stat-spark">${renderSparklineSVG(qWkSpark, "var(--chart-primary)")}</div>
@@ -6552,12 +6779,21 @@ function renderDynamicOverview() {
   renderDynamicLatestRequests();
 }
 
+function _activePoolView(po) {
+  if (!po) return null;
+  if (G_QUOTA_MODE === "multi" && G_PACING_SOURCE === "local" && po.localView) {
+    return po.localView;
+  }
+  return po;
+}
+
 function _poolHealthTone(po) {
-  if (!po) return "neutral";
-  if (Number(po.serverWkRemPct ?? 100) <= 0.05 || Number(po.server5hRemPct ?? 100) <= 0.05 || po.wkWillRunOut || po.fhWillRunOut) {
+  const v = _activePoolView(po);
+  if (!v) return "neutral";
+  if (Number(v.serverWkRemPct ?? 100) <= 0.05 || Number(v.server5hRemPct ?? 100) <= 0.05 || v.wkWillRunOut || v.fhWillRunOut) {
     return "bad";
   }
-  if (Number(po.serverWkUnclippedPct || 0) >= 85 || Number(po.server5hUnclippedPct || 0) >= 85) {
+  if (v.wkCaution || Number(v.server5hUnclippedPct || 0) >= 85) {
     return "warn";
   }
   return "ok";
@@ -6580,9 +6816,10 @@ function showQuotaConversionTip(e, poolKey) {
   if (!tip || !ov?.pacing) return;
   const pools = ov.pacing.pools || { gemini: ov.pacing };
   const pk = (poolKey === "3p" && pools["3p"]) ? "3p" : "gemini";
-  const p = pools[pk] || pools.gemini || ov.pacing;
-  const gem = pools.gemini || p;
-  const tp = pools["3p"] || null;
+  const rawPool = pools[pk] || pools.gemini || ov.pacing;
+  const p = _activePoolView(rawPool) || rawPool;
+  const gem = _activePoolView(pools.gemini) || pools.gemini || p;
+  const tp = _activePoolView(pools["3p"]) || pools["3p"] || null;
 
   const gemB2W = Number(gem?.burstToWkPct ?? 25.0);
   const gemTanks = Number(gem?.wkTanksTotal ?? (100 / Math.max(1, gemB2W)));
@@ -6644,6 +6881,37 @@ function hideQuotaConversionTip() {
 
 window.addEventListener("scroll", hideQuotaConversionTip, { passive: true });
 
+function renderQuotaPoolsGrid() {
+  const grid = document.getElementById("quotaPoolsGrid");
+  const d = G_FULL_DATA || G_OVERVIEW_DATA;
+  if (!grid || !d) return;
+  const ov = d.overall || {};
+  const qList = d.quota || [];
+  grid.innerHTML = qList.length ? qList.map(g => {
+    const rem = Number(g.remainingPct ?? (g.remainingFraction * 100)).toFixed(1);
+    const used = Number(g.usedPct ?? (100 - g.remainingFraction * 100)).toFixed(1);
+    const isGemWk = g.id === "gemini-weekly";
+    const isGem5h = g.id === "gemini-5h";
+    const is3pWk = g.id === "3p-weekly";
+    const is3p5h = g.id === "3p-5h";
+    const localPct = isGemWk ? Number(ov.cycleWeekLocalPct || 0)
+      : isGem5h ? Number(ov.cycle5hLocalPct || 0)
+      : is3pWk ? Number(ov.cycle3pWeekLocalPct || 0)
+      : is3p5h ? Number(ov.cycle3p5hLocalPct || 0)
+      : 0;
+    const localCycleStr = (G_QUOTA_MODE === "multi" && localPct > 0) ? ` · ${localPct}% this setup` : "";
+    const fullFoot = `${rem}% left · resets ${fmtResetIn(g.resetTime)}${localCycleStr}`;
+    const qTipPool = (is3pWk || is3p5h) ? "3p" : "gemini";
+    return `
+      <div class="stat" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, '${qTipPool}')" onmouseleave="hideQuotaConversionTip()">
+        <div class="stat-label"><span class="pacing-tip-trigger">${esc(g.groupName)} · ${esc(g.windowLabel)}</span></div>
+        <div class="stat-value">${used}%</div>
+        <div class="stat-foot"><span class="truncate" title="${esc(fullFoot)}">${esc(fullFoot)}</span></div>
+      </div>
+    `;
+  }).join("") : `<div class="stat"><div class="stat-label">Server quota</div><div class="stat-value">–</div><div class="stat-foot">Live quota pools unavailable</div></div>`;
+}
+
 function renderPacingSection(targetId) {
   const el = document.getElementById(targetId);
   if (!el || !G_OVERVIEW_DATA?.overall) return;
@@ -6657,9 +6925,14 @@ function renderPacingSection(targetId) {
   const pools = ov.pacing.pools || { gemini: ov.pacing };
   const has3p = !!(pools["3p"] && pools["3p"].available);
   if (G_PACING_POOL === "3p" && !has3p) G_PACING_POOL = "gemini";
-  const p = pools[G_PACING_POOL] || pools.gemini || ov.pacing;
+  const baseP = pools[G_PACING_POOL] || pools.gemini || ov.pacing;
+  const isMultiMode = (G_QUOTA_MODE === "multi");
+  const useLocalSource = isMultiMode && G_PACING_SOURCE === "local" && !!baseP.localView;
+  const p = useLocalSource ? baseP.localView : baseP;
   const styleMode = (G_PACING_STYLE === "straight" || G_PACING_STYLE === "minimal") ? G_PACING_STYLE : "fun";
 
+  const gemView = _activePoolView(pools.gemini);
+  const tpView = _activePoolView(pools["3p"]);
   const gemTone = _poolHealthTone(pools.gemini);
   const tpTone = _poolHealthTone(pools["3p"]);
 
@@ -6673,7 +6946,8 @@ function renderPacingSection(targetId) {
 
   const resetDisp = fmtResetIn(p.wkResetTime);
   const burstRefill = fmtResetIn(p.fhResetTime);
-  const poolLabel = p.label || (G_PACING_POOL === "3p" ? "Claude / GPT" : "Gemini");
+  const baseLabel = p.label || (G_PACING_POOL === "3p" ? "Claude / GPT" : "Gemini");
+  const poolLabel = useLocalSource ? `${baseLabel} (This setup)` : baseLabel;
 
   // 5-Hour Burst metrics
   const fhUsed = Number(p.server5hUsedPct ?? 0);
@@ -6688,9 +6962,9 @@ function renderPacingSection(targetId) {
   const fhRateSrc = p.fhRateSource || "5h window";
   const fhMultVal = p.target5hMultiplier != null ? Number(p.target5hMultiplier) : null;
   const fhCutPct = Math.min(99, Math.max(1, Math.round((1 - (fhSafeHr / Math.max(0.01, fhRateHr))) * 100)));
-  const fhLocalW = Math.min(100, Math.max(0, Number(p.local5hUsedPct || 0)));
-  const fhOtherW = Math.min(100 - fhLocalW, Math.max(0, Number(p.other5hUsedPct || 0)));
-  const fhHasDualSeg = fhLocalW > 0.05 && fhOtherW >= 1.0;
+  const fhLocalW = Math.min(100, Math.max(0, Number(baseP.local5hUsedPct || 0)));
+  const fhOtherW = Math.min(100 - fhLocalW, Math.max(0, Number(baseP.other5hUsedPct || 0)));
+  const fhHasDualSeg = isMultiMode && !useLocalSource && fhLocalW > 0.05 && fhOtherW >= 1.0;
 
   let fhBarColor = "var(--ok)";
   let fhSubTitleHtml = "";
@@ -6729,6 +7003,8 @@ function renderPacingSection(targetId) {
   const wkWarmup = !!p.wkWarmup && !wkExhausted;
   const wkUnkillable = !!p.wkUnkillable && !wkExhausted;
   const wkRunOut = !!p.wkWillRunOut && !wkExhausted;
+  const wkCaution = !!p.wkCaution && !wkExhausted && !wkUnkillable && !wkWarmup && !wkRunOut;
+  const wkLessBurst = !!p.wkLessThanOneBurst && !wkExhausted && !wkUnkillable;
   const wkProjUnclipped = Number(p.serverWkUnclippedPct ?? wkUsed);
   const wkProj = Number(p.serverWkProjectedPct ?? Math.min(100, wkProjUnclipped));
   const wkRatio = Number(p.serverWkPaceRatio ?? 0);
@@ -6742,9 +7018,9 @@ function renderPacingSection(targetId) {
   const wkTargetStr = `${wkSafeRate.toFixed(wkDigits)}%/${wkUnit}`;
   const wkMultVal = p.targetWkMultiplier != null ? Number(p.targetWkMultiplier) : null;
   const wkCutPct = Math.min(99, Math.max(1, Math.round((1 - (wkSafeRate / Math.max(0.01, wkCurRate))) * 100)));
-  const wkLocalW = Math.min(100, Math.max(0, Number(p.localWkUsedPct || 0)));
-  const wkOtherW = Math.min(100 - wkLocalW, Math.max(0, Number(p.otherWkUsedPct || 0)));
-  const wkHasDualSeg = wkLocalW > 0.05 && wkOtherW >= 1.0;
+  const wkLocalW = Math.min(100, Math.max(0, Number(baseP.localWkUsedPct || 0)));
+  const wkOtherW = Math.min(100 - wkLocalW, Math.max(0, Number(baseP.otherWkUsedPct || 0)));
+  const wkHasDualSeg = isMultiMode && !useLocalSource && wkLocalW > 0.05 && wkOtherW >= 1.0;
 
   const smoothSessPct = Number(p.smooth5hSessionPct ?? 0);
   const smooth24x7Pct = Number(p.smooth5h24x7Pct ?? 0);
@@ -6772,9 +7048,13 @@ function renderPacingSection(targetId) {
   } else if (wkRunOut) {
     wkBarColor = "var(--bad)";
     wkSubTitleHtml = `resets in ${esc(resetDisp)} · ${wkRatio.toFixed(1)}x burn`;
-    wkRightMetaHtml = `<span class="mono" style="color:var(--bad);">${clockDelta >= 0 ? `+${clockDelta}% ahead of clock` : `empties in ~${esc(fmtHoursJS(p.wkTteHours))}`}</span>`;
-  } else if (wkProjUnclipped >= 85) {
+    wkRightMetaHtml = `<span class="mono" style="color:var(--bad);">${clockDelta >= 1 ? `+${clockDelta}% ahead of clock` : `empties in ~${esc(fmtHoursJS(p.wkTteHours))}`}</span>`;
+  } else if (wkCaution) {
     wkBarColor = "var(--warn)";
+    wkSubTitleHtml = `resets in ${esc(resetDisp)} · ahead of clock`;
+    wkRightMetaHtml = `<span class="mono" style="color:var(--warn);">+${Math.max(1, clockDelta)}% ahead · &lt;= ${esc(wkTargetStr)}</span>`;
+  } else if (wkProjUnclipped >= 85) {
+    wkBarColor = "var(--ok)";
     wkSubTitleHtml = `resets in ${esc(resetDisp)} · on target`;
     wkRightMetaHtml = `<span class="mono">Lands ~${wkProj.toFixed(0)}% at reset</span>`;
   } else {
@@ -6783,7 +7063,7 @@ function renderPacingSection(targetId) {
     wkRightMetaHtml = `<span class="mono">Tracks ~${wkProj.toFixed(0)}% at reset</span>`;
   }
 
-  // Controls cluster (Pool switcher + Fun/Straight/Minimal switcher)
+  // Controls cluster (Pool switcher + optional Multi-Surface Source switcher + Fun/Straight/Minimal switcher)
   const controlsHtml = `
     <div class="pacing-controls">
       ${has3p ? `
@@ -6791,13 +7071,19 @@ function renderPacingSection(targetId) {
           <button type="button" class="segmented-option" data-active="${G_PACING_POOL === 'gemini'}" onclick="setPacingPool('gemini')" onmouseenter="showQuotaConversionTip(event, 'gemini')" onmouseleave="hideQuotaConversionTip()">
             <span class="dot" data-tone="${gemTone}" style="width:6px;height:6px;"></span>
             <span>Gemini</span>
-            <span class="mono micro dim">${Math.round(Number(pools.gemini?.serverWkUsedPct || 0))}%</span>
+            <span class="mono micro dim">${Math.round(Number(gemView?.serverWkUsedPct || 0))}%</span>
           </button>
           <button type="button" class="segmented-option" data-active="${G_PACING_POOL === '3p'}" onclick="setPacingPool('3p')" onmouseenter="showQuotaConversionTip(event, '3p')" onmouseleave="hideQuotaConversionTip()">
             <span class="dot" data-tone="${tpTone}" style="width:6px;height:6px;"></span>
             <span>Claude/GPT</span>
-            <span class="mono micro dim">${Math.round(Number(pools['3p']?.serverWkUsedPct || 0))}%</span>
+            <span class="mono micro dim">${Math.round(Number(tpView?.serverWkUsedPct || 0))}%</span>
           </button>
+        </div>
+      ` : ""}
+      ${isMultiMode ? `
+        <div class="segmented" data-size="sm" title="Switch pacing calculation between local CLI setup and account server pool">
+          <button type="button" class="segmented-option" data-active="${useLocalSource}" onclick="setPacingSource('local')">This setup</button>
+          <button type="button" class="segmented-option" data-active="${!useLocalSource}" onclick="setPacingSource('server')">Server</button>
         </div>
       ` : ""}
       <div class="segmented" data-size="sm" title="Switch pacing guidance style">
@@ -6836,8 +7122,8 @@ function renderPacingSection(targetId) {
             </div>
             <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
               ${wkHasDualSeg ? `
-                <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
-                <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
+                <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${baseP.localWkUsedPct}%"></div>
+                <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other surfaces: ${baseP.otherWkUsedPct}%"></div>
               ` : `
                 <div style="width:${minWkW}%; height:100%; background:${wkUsed >= 90 ? 'var(--bad)' : 'var(--chart-primary)'}; border-radius:var(--r-pill);"></div>
               `}
@@ -6866,11 +7152,16 @@ function renderPacingSection(targetId) {
     scorePaceBig = wkMultTxt;
     if (wkRunOut) {
       scorePaceSub = `your pace · slow down by ${wkCutPct}% (${esc(wkCurStr)} → ${esc(wkTargetStr)})`;
+    } else if (wkCaution) {
+      scorePaceSub = `your pace · ease off ${wkCutPct}% (${esc(wkCurStr)} → ${esc(wkTargetStr)})`;
     } else if (wkProjUnclipped >= 85) {
       scorePaceSub = `your pace · hold steady (${esc(wkCurStr)} vs ${esc(wkTargetStr)})`;
     } else {
       scorePaceSub = `your pace · can step up (${esc(wkCurStr)} → ${esc(wkTargetStr)})`;
     }
+  } else if (wkRunOut || wkCaution) {
+    scorePaceBig = `&lt;= ${esc(wkTargetStr)}`;
+    scorePaceSub = `your pace · tight runway (${wkRem.toFixed(1)}% for ${esc(resetDisp)})`;
   } else {
     scorePaceBig = `Up to ${esc(wkTargetStr)}`;
     scorePaceSub = `light recent burn · ~${Re(p.estReqsLeft)} reqs left`;
@@ -6917,23 +7208,25 @@ function renderPacingSection(targetId) {
     deckTone = "bad";
     const wkTte = fmtHoursJS(p.wkTteHours);
     const wkShort = fmtHoursJS(p.wkShortfallHours);
-    const multHl = wkMultTxt ? `${wkMultTxt} your pace` : `-${wkCutPct}% burn`;
+    const multHl = wkMultTxt ? `${wkMultTxt} your pace` : `<= ${wkTargetStr}`;
+    const burstWarn = wkLessBurst ? ` Even one full 5h burst (${burstToWk.toFixed(0)}% wk) will drain the weekly pool.` : "";
+    const aheadLead = clockDelta >= 5 ? `+${clockDelta}% ahead of the weekly clock (${wkUsed.toFixed(0)}% used with ${resetDisp} left). ` : "";
     funTakes = [
       {
         h: `Hit the brakes — drop to <span class="hl-accent">${esc(multHl)}</span> or run dry ${esc(wkShort)} early.`,
-        s: `To keep ${poolLabel} alive until ${resetDay}'s reset (${resetDisp} left instead of emptying in ~${wkTte}), ration ~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(0)} awake sessions.`
+        s: `${aheadLead}To keep ${poolLabel} alive until ${resetDay}'s reset (${wkRem.toFixed(1)}% left), ration ~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(0)} awake sessions.${burstWarn}`
       },
       {
-        h: `Whoa — this tank empties in <span class="hl-accent">~${esc(wkTte)}</span> at your current speed.`,
-        s: `To survive until ${resetDay} without eating 429s, cap each 5h coding session near ~${smoothSessPct}% (~${Re(p.estReqsLeft)} avg reqs left in reserve).`
+        h: `Whoa — ${wkUsed.toFixed(0)}% burned with <span class="hl-accent">${esc(resetDisp)} still on the clock</span>.`,
+        s: `At ${wkCurStr}, ${poolLabel} empties in ~${wkTte}. Cap each 5h session near ~${smoothSessPct}% (<= ${wkTargetStr}) to reach ${resetDay} without 429s.${burstWarn}`
       },
       {
         h: `Ration like a Mars rover: aim for <span class="hl-accent">~${smoothSessPct}% per 5h session</span>.`,
-        s: `To stretch ${wkRem.toFixed(1)}% ${poolLabel} quota across the next ${resetDisp}, dial pace down to ${wkMultTxt || wkTargetStr} and route routine turns to lighter tiers.`
+        s: `To stretch the remaining ${wkRem.toFixed(1)}% ${poolLabel} quota across ${resetDisp}, dial pace down to ${wkMultTxt || wkTargetStr} and route routine turns to lighter tiers.${burstWarn}`
       }
     ];
-    straightHeadHtml = `Reduce ${esc(poolLabel)} pace to <span class="hl-accent">${esc(multHl)}</span> — runs dry in ~${esc(wkTte)}.`;
-    straightSubTxt = `Projected to exhaust ${wkShort} before ${resetDay}'s reset (${resetDisp} left). Smooth target: ~${smoothSessPct}% per 5h session across ~${awakeSessions.toFixed(1)} awake sessions.`;
+    straightHeadHtml = `Reduce ${esc(poolLabel)} pace to <span class="hl-accent">${esc(multHl)}</span> — ${wkUsed.toFixed(0)}% used with ${esc(resetDisp)} left.`;
+    straightSubTxt = `${aheadLead}Projected to exhaust ${wkShort} before ${resetDay}'s reset (empties in ~${wkTte}). Cap at <= ${wkTargetStr} (~${smoothSessPct}% per 5h session).${burstWarn}`;
   } else if (fhRunOut) {
     deckTone = "bad";
     const fhTte = fmtHoursJS(p.fhTteHours);
@@ -6983,8 +7276,24 @@ function renderPacingSection(targetId) {
     ];
     straightHeadHtml = `Fresh ${esc(poolLabel)} cycle — target <span class="hl-accent">~${sPct}% per 5h session</span>.`;
     straightSubTxt = `Cycle started < 6h ago (${wkRem.toFixed(1)}% left, resets in ${resetDisp}). Sustainable ceiling is ${wkTargetStr}.`;
-  } else if (wkProjUnclipped >= 85) {
+  } else if (wkCaution) {
     deckTone = "warn";
+    const sPct = Math.min(100, smoothSessPct);
+    const aheadTxt = clockDelta >= 1 ? `+${clockDelta}% ahead of the weekly clock` : `${wkRem.toFixed(1)}% left for ${resetDisp}`;
+    funTakes = [
+      {
+        h: `Running a bit warm (${esc(aheadTxt)}) — cruise near <span class="hl-accent">~${sPct}% per 5h session</span>.`,
+        s: `To glide into ${resetDay}'s reset (${resetDisp} left) without late-week rationing, keep ${poolLabel} burn under ${wkTargetStr} across ~${awakeSessions.toFixed(0)} awake sessions.`
+      },
+      {
+        h: `Ease off the throttle slightly — <span class="hl-accent">${wkRem.toFixed(1)}% left</span> for the next ${esc(resetDisp)}.`,
+        s: `${poolLabel} is burning ahead of schedule (${wkCurStr} vs ${wkTargetStr} ceiling). Trim pace to ${wkMultTxt || wkTargetStr} so the runway stays comfortable.`
+      }
+    ];
+    straightHeadHtml = `Ahead of weekly clock (${esc(aheadTxt)}) — <span class="hl-accent">keep &lt;= ${esc(wkTargetStr)}</span>.`;
+    straightSubTxt = `${wkUsed.toFixed(1)}% used with ${resetDisp} remaining. Target ~${sPct}% per 5h session across ~${awakeSessions.toFixed(1)} awake sessions to avoid running dry early.`;
+  } else if (wkProjUnclipped >= 85) {
+    deckTone = "ok";
     const sPct = Math.min(100, smoothSessPct);
     funTakes = [
       {
@@ -6992,8 +7301,8 @@ function renderPacingSection(targetId) {
         s: `To finish almost every drop of ${poolLabel} right as ${resetDay}'s reset hits (${resetDisp}), keep cruising near ~${sPct}% per 5h session (~${Re(p.estReqsLeft)} reqs left).`
       },
       {
-        h: `Goldilocks velocity — tracking <span class="hl-accent">~${wkProj.toFixed(0)}% used</span> by ${esc(resetDay)}.`,
-        s: `To extract full value from ${poolLabel} without hitting a single wall, touch nothing across your ~${awakeSessions.toFixed(0)} remaining awake sessions.`
+        h: `On-schedule velocity — tracking <span class="hl-accent">~${wkProj.toFixed(0)}% used</span> by ${esc(resetDay)}.`,
+        s: `To extract full value from ${poolLabel} without hitting a single wall, keep this steady rhythm across your ~${awakeSessions.toFixed(0)} remaining awake sessions.`
       }
     ];
     straightHeadHtml = `${esc(poolLabel)} pace is on target — tracking <span class="hl-accent">~${wkProj.toFixed(0)}% at reset</span>.`;
@@ -7037,6 +7346,31 @@ function renderPacingSection(targetId) {
   const fhBarW = Math.min(100, Math.max(0, fhUsed));
   const wkBarW = Math.min(100, Math.max(0, wkUsed));
 
+  const fhLeftMetaHtml = !isMultiMode
+    ? (p.sourceActual === "local_fallback"
+        ? `Local fallback · since ${esc(p.fhCycleSince)}`
+        : (fhUsed <= 0.05 ? `Server 5h pool ready` : `Server 5h pool · since ${esc(p.fhCycleSince)}`))
+    : (useLocalSource
+        ? `This setup <strong class="mono" style="color:var(--ink-2);">${fhUsed.toFixed(1)}%</strong> · Server total <strong class="mono" style="color:var(--ink-2);">${Number(baseP.server5hUsedPct ?? 0).toFixed(1)}%</strong>`
+        : (fhHasDualSeg
+            ? `<span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${baseP.local5hUsedPct}%</strong> &nbsp;·&nbsp; <span class="swatch" style="background:var(--chart-secondary);"></span> Other surfaces <strong class="mono" style="color:var(--ink-2);">${baseP.other5hUsedPct}%</strong>`
+            : (fhOtherW >= 1.0
+                ? `0% this setup · <strong class="mono" style="color:var(--ink-2);">${baseP.other5hUsedPct}%</strong> other surfaces`
+                : (fhUsed <= 0.05 ? `Fresh 5h burst tank ready` : `This setup <strong class="mono" style="color:var(--ink-2);">${baseP.local5hUsedPct}%</strong>`))));
+
+  const wkBurstWarnSpan = wkLessBurst ? ` · <span style="color:var(--bad);">&lt;1 full 5h burst left</span>` : "";
+  const wkLeftMetaHtml = !isMultiMode
+    ? (p.sourceActual === "local_fallback"
+        ? `Local fallback · since ${esc(p.wkCycleSince)}${wkBurstWarnSpan}`
+        : `Server pool · since ${esc(p.wkCycleSince)}${wkBurstWarnSpan}`)
+    : (useLocalSource
+        ? `This setup <strong class="mono" style="color:var(--ink-2);">${wkUsed.toFixed(1)}%</strong> · Server total <strong class="mono" style="color:var(--ink-2);">${Number(baseP.serverWkUsedPct ?? 0).toFixed(1)}%</strong>${wkBurstWarnSpan}`
+        : (wkHasDualSeg
+            ? `<span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${baseP.localWkUsedPct}%</strong> &nbsp;·&nbsp; <span class="swatch" style="background:var(--chart-secondary);"></span> Other surfaces <strong class="mono" style="color:var(--ink-2);">${baseP.otherWkUsedPct}%</strong>${wkBurstWarnSpan}`
+            : (wkOtherW >= 1.0
+                ? `0% this setup · <strong class="mono" style="color:var(--ink-2);">${baseP.otherWkUsedPct}%</strong> other surfaces${wkBurstWarnSpan}`
+                : `This setup <strong class="mono" style="color:var(--ink-2);">${baseP.localWkUsedPct}%</strong>${wkBurstWarnSpan}`)));
+
   el.innerHTML = `
     <div>
       <div class="pacing-hero">
@@ -7059,7 +7393,7 @@ function renderPacingSection(targetId) {
           <div class="pacing-scoreboard">
             <div class="pacing-score-cell">
               <span class="pacing-score-label">Pace to finish 100%</span>
-              <div class="pacing-score-big" data-tone="accent">${esc(scorePaceBig)}</div>
+              <div class="pacing-score-big" data-tone="accent">${scorePaceBig}</div>
               <span class="pacing-score-sub">${scorePaceSub}</span>
             </div>
             <div class="pacing-score-cell" data-has-tip="true" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">
@@ -7089,23 +7423,15 @@ function renderPacingSection(targetId) {
               ${_clockPinHtml(fhClockPos)}
               <div class="pacing-race-track">
                 ${fhHasDualSeg ? `
-                  <div style="width:${fhLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.local5hUsedPct}%"></div>
-                  <div style="width:${fhOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.88;" title="Other products / devices: ${p.other5hUsedPct}%"></div>
+                  <div style="width:${fhLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${baseP.local5hUsedPct}%"></div>
+                  <div style="width:${fhOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.88;" title="Other surfaces: ${baseP.other5hUsedPct}%"></div>
                 ` : `
                   <div style="width:${fhBarW}%; height:100%; background:${fhBarColor}; border-radius:var(--r-pill);"></div>
                 `}
               </div>
             </div>
             <div class="pacing-track-meta">
-              <span>
-                ${fhHasDualSeg ? `
-                  <span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.local5hUsedPct}%</strong>
-                  &nbsp;·&nbsp;
-                  <span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.other5hUsedPct}%</strong>
-                ` : (fhOtherW >= 1.0 ? `
-                  0% this setup · <strong class="mono" style="color:var(--ink-2);">${p.other5hUsedPct}%</strong> other products / devices
-                ` : (fhUsed <= 0.05 ? `Fresh 5h burst tank ready` : `This setup <strong class="mono" style="color:var(--ink-2);">${p.local5hUsedPct}%</strong>`))}
-              </span>
+              <span>${fhLeftMetaHtml}</span>
               ${fhRightMetaHtml}
             </div>
           </div>
@@ -7126,23 +7452,15 @@ function renderPacingSection(targetId) {
               ${_clockPinHtml(wkClockPos)}
               <div class="pacing-race-track">
                 ${wkHasDualSeg ? `
-                  <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${p.localWkUsedPct}%"></div>
-                  <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.88;" title="Other products / devices: ${p.otherWkUsedPct}%"></div>
+                  <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${baseP.localWkUsedPct}%"></div>
+                  <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.88;" title="Other surfaces: ${baseP.otherWkUsedPct}%"></div>
                 ` : `
                   <div style="width:${wkBarW}%; height:100%; background:${wkBarColor}; border-radius:var(--r-pill);"></div>
                 `}
               </div>
             </div>
             <div class="pacing-track-meta">
-              <span>
-                ${wkHasDualSeg ? `
-                  <span class="swatch" style="background:var(--chart-primary);"></span> This setup <strong class="mono" style="color:var(--ink-2);">${p.localWkUsedPct}%</strong>
-                  &nbsp;·&nbsp;
-                  <span class="swatch" style="background:var(--chart-secondary);"></span> Other devices <strong class="mono" style="color:var(--ink-2);">${p.otherWkUsedPct}%</strong>
-                ` : (wkOtherW >= 1.0 ? `
-                  0% this setup · <strong class="mono" style="color:var(--ink-2);">${p.otherWkUsedPct}%</strong> other products / devices
-                ` : `This setup <strong class="mono" style="color:var(--ink-2);">${p.localWkUsedPct}%</strong>`)}
-              </span>
+              <span>${wkLeftMetaHtml}</span>
               ${wkRightMetaHtml}
             </div>
           </div>
@@ -7924,32 +8242,7 @@ function renderFullViews() {
 
   // Quota
   try {
-    const ov = d.overall || {};
-    const qList = d.quota || [];
-    document.getElementById("quotaPoolsGrid").innerHTML = qList.length ? qList.map(g => {
-      const rem = Number(g.remainingPct ?? (g.remainingFraction * 100)).toFixed(1);
-      const used = Number(g.usedPct ?? (100 - g.remainingFraction * 100)).toFixed(1);
-      const isGemWk = g.id === "gemini-weekly";
-      const isGem5h = g.id === "gemini-5h";
-      const is3pWk = g.id === "3p-weekly";
-      const is3p5h = g.id === "3p-5h";
-      const localPct = isGemWk ? Number(ov.cycleWeekLocalPct || 0)
-        : isGem5h ? Number(ov.cycle5hLocalPct || 0)
-        : is3pWk ? Number(ov.cycle3pWeekLocalPct || 0)
-        : is3p5h ? Number(ov.cycle3p5hLocalPct || 0)
-        : 0;
-      const localCycleStr = localPct > 0 ? ` · ${localPct}% here` : "";
-      const fullFoot = `${rem}% left · resets ${fmtResetIn(g.resetTime)}${localCycleStr}`;
-      const qTipPool = (is3pWk || is3p5h) ? "3p" : "gemini";
-      return `
-        <div class="stat" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, '${qTipPool}')" onmouseleave="hideQuotaConversionTip()">
-          <div class="stat-label"><span class="pacing-tip-trigger">${esc(g.groupName)} · ${esc(g.windowLabel)}</span></div>
-          <div class="stat-value">${used}%</div>
-          <div class="stat-foot"><span class="truncate" title="${esc(fullFoot)}">${esc(fullFoot)}</span></div>
-        </div>
-      `;
-    }).join("") : `<div class="stat"><div class="stat-label">Server quota</div><div class="stat-value">–</div><div class="stat-foot">Live quota pools unavailable</div></div>`;
-
+    renderQuotaPoolsGrid();
     renderPacingSection("quotaPacingBody");
 
     document.getElementById("quotaLedgerTbody").innerHTML = Object.entries(d.daily || {}).reverse().map(([dt, v]) => `
@@ -8122,6 +8415,11 @@ function applyOnboardingPreset(presetKey) {
   const brCheck = document.getElementById("settingOpenBrowser");
   if (brCheck) brCheck.checked = openBrowser;
 
+  const rQSrv = document.getElementById("settingQuotaServer");
+  const rQMul = document.getElementById("settingQuotaMulti");
+  if (rQSrv) rQSrv.checked = true;
+  if (rQMul) rQMul.checked = false;
+
   const rFun = document.getElementById("settingPacingFun");
   const rStr = document.getElementById("settingPacingStraight");
   const rMin = document.getElementById("settingPacingMinimal");
@@ -8156,6 +8454,18 @@ async function fetchSettings() {
 function applySettings(cfg) {
   if (!cfg) return;
   let needPacingRender = false;
+  const qMode = cfg.web?.quota_mode;
+  if (qMode === "server" || qMode === "multi") {
+    if (G_QUOTA_MODE !== qMode) {
+      G_QUOTA_MODE = qMode;
+      needPacingRender = true;
+    }
+    try { localStorage.setItem("agy-stats-quota-counting", qMode); } catch (e) {}
+    const rQSrv = document.getElementById("settingQuotaServer");
+    const rQMul = document.getElementById("settingQuotaMulti");
+    if (rQSrv) rQSrv.checked = (qMode === "server");
+    if (rQMul) rQMul.checked = (qMode === "multi");
+  }
   const pStyle = cfg.web?.pacing_style;
   if (pStyle === "fun" || pStyle === "straight" || pStyle === "minimal") {
     G_PACING_STYLE = pStyle;
@@ -8172,6 +8482,7 @@ function applySettings(cfg) {
   if (needPacingRender && G_OVERVIEW_DATA) {
     renderPacingSection("overviewPacingBody");
     renderPacingSection("quotaPacingBody");
+    renderQuotaPoolsGrid();
   }
   const disSec = (cfg.cli && Array.isArray(cfg.cli.disabled_sections)) ? cfg.cli.disabled_sections : [];
   applyOverviewDisplaySections(disSec);
@@ -8238,6 +8549,12 @@ async function openSettingsModal(isFirstRun = false) {
 
   const brCheck = document.getElementById("settingOpenBrowser");
   if (brCheck) brCheck.checked = cfg.web?.open_browser !== false;
+
+  const qMode = cfg.web?.quota_mode || G_QUOTA_MODE || "server";
+  const rQSrv = document.getElementById("settingQuotaServer");
+  const rQMul = document.getElementById("settingQuotaMulti");
+  if (rQSrv) rQSrv.checked = (qMode !== "multi");
+  if (rQMul) rQMul.checked = (qMode === "multi");
 
   const pStyle = cfg.web?.pacing_style || G_PACING_STYLE || "fun";
   const rFun = document.getElementById("settingPacingFun");
@@ -8350,6 +8667,7 @@ async function saveSettingsFromModal() {
   const autoChkChecked = autoUpdChecked || !!document.getElementById("settingAutoCheckUpdates")?.checked;
   const updUrlVal = document.getElementById("settingUpdateUrl")?.value?.trim() || "";
 
+  const qModeVal = document.getElementById("settingQuotaMulti")?.checked ? "multi" : "server";
   const pStyleVal = document.getElementById("settingPacingMinimal")?.checked ? "minimal"
     : document.getElementById("settingPacingStraight")?.checked ? "straight"
     : "fun";
@@ -8362,6 +8680,7 @@ async function saveSettingsFromModal() {
     update_url: updUrlVal,
     web: {
       open_browser: !!document.getElementById("settingOpenBrowser")?.checked,
+      quota_mode: qModeVal,
       pacing_style: pStyleVal,
       pacing_bars: document.getElementById("settingPacingBars") ? !!document.getElementById("settingPacingBars").checked : true,
       disabled_tabs: []
@@ -8408,7 +8727,7 @@ async function resetSettingsToDefault() {
         update_url: "",
         auto_check_updates: true,
         auto_update: false,
-        web: { open_browser: true, pacing_style: "fun", pacing_bars: true, disabled_tabs: [] },
+        web: { open_browser: true, quota_mode: "server", pacing_style: "fun", pacing_bars: true, disabled_tabs: [] },
         cli: { default_view: "overview", days: 10, disabled_sections: [] }
       })
     });
