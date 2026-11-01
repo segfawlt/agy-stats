@@ -271,6 +271,7 @@ DEFAULT_CONFIG = {
         "open_browser": True,
         "quota_mode": "server",
         "quota_counting": "server",
+        "show_reset_breakdown": False,
         "pacing_style": "fun",
         "pacing_bars": True,
         "disabled_tabs": []
@@ -360,6 +361,7 @@ def _read_config_with_status():
                 qm_norm = "multi" if str(w.get("quota_counting")).lower() in ("multi", "local") else "server"
                 res["web"]["quota_mode"] = qm_norm
                 res["web"]["quota_counting"] = qm_norm
+            res["web"]["show_reset_breakdown"] = _safe_bool(w.get("show_reset_breakdown"), False)
             if w.get("pacing_style") in ("fun", "straight", "minimal"):
                 res["web"]["pacing_style"] = w["pacing_style"]
             res["web"]["pacing_bars"] = _safe_bool(w.get("pacing_bars"), True)
@@ -416,6 +418,8 @@ def save_config(updates):
                 qm_norm = "multi" if str(v or "").lower() in ("multi", "local") else "server"
                 cur["web"]["quota_mode"] = qm_norm
                 cur["web"]["quota_counting"] = qm_norm
+            elif k == "show_reset_breakdown":
+                cur["web"]["show_reset_breakdown"] = _safe_bool(v, cur["web"]["show_reset_breakdown"])
             elif k == "pacing_style" and v in ("fun", "straight", "minimal"):
                 cur["web"]["pacing_style"] = v
             elif k == "pacing_bars":
@@ -1094,6 +1098,7 @@ def load_raw_telemetry(force=False):
         current_model = initial_models.get(cid, "Gemini 4 Argon (Medium)")
         consecutive_errors = 0
         prev_ts_ms = None
+        open_tool_req = None
         pending_tool_events = []
         last_req_for_session = None
         meta_entry = conv_meta.get(cid, {})
@@ -1134,13 +1139,19 @@ def load_raw_telemetry(force=False):
                         except Exception:
                             pass
 
-                    dur_ms = max(120, min(90000, (ts_ms - prev_ts_ms) if (prev_ts_ms and ts_ms >= prev_ts_ms) else 850))
                     if ts_ms > 0:
+                        if open_tool_req is not None:
+                            if stype == "GENERIC" and 0 <= (ts_ms - open_tool_req["ts"]) <= 180_000:
+                                open_tool_req["durationMs"] = max(250, min(90000, ts_ms - open_tool_req["ts"]))
+                                open_tool_req["durMeasured"] = True
+                            open_tool_req = None
                         prev_ts_ms = ts_ms
                         if first_ts is None or ts_ms < first_ts:
                             first_ts = ts_ms
                         if last_ts is None or ts_ms > last_ts:
                             last_ts = ts_ms
+                    else:
+                        open_tool_req = None
 
                     if "Model Selection" in content:
                         m = MODEL_SELECTION_RE.search(content)
@@ -1299,6 +1310,7 @@ def load_raw_telemetry(force=False):
                             tool_events.append(te)
                             pending_tool_events.append(te)
 
+                        est_dur_ms = max(450, min(90000, int(round((max(24, out) / 80.0) * 1000.0))))
                         req_obj = {
                             "id": f"{cid[:8]}-{step_idx}",
                             "cid": cid,
@@ -1317,7 +1329,8 @@ def load_raw_telemetry(force=False):
                             "units": q_units,
                             "pct_5h": units_to_pct_5h(q_units, 3, is_3p=_is_3p_model(current_model)),
                             "pct_week": units_to_pct_week(q_units, 3),
-                            "durationMs": dur_ms,
+                            "durationMs": est_dur_ms,
+                            "durMeasured": False,
                             "tools": tc_names_for_req,
                             "status": "error" if is_err else "ok",
                             "is_err": is_err,
@@ -1325,6 +1338,8 @@ def load_raw_telemetry(force=False):
                         }
                         all_requests.append(req_obj)
                         last_req_for_session = req_obj
+                        if tc_count > 0 and ts_ms > 0:
+                            open_tool_req = req_obj
                     else:
                         pending_tool_events = []
 
@@ -1482,6 +1497,8 @@ def _build_pool_pacing(
     cutoff_7d = now_ms - 7 * 86_400_000
     u_1h = 0.0
     u_24h = 0.0
+    local_wk_reqs = 0
+    local_5h_reqs = 0
     hr_buckets_7d = Counter()
     hr_buckets_all = Counter()
     for r in pool_reqs:
@@ -1491,6 +1508,10 @@ def _build_pool_pacing(
         hr_buckets_all[hb] += ru
         if rts >= cutoff_7d:
             hr_buckets_7d[hb] += ru
+        if rts >= wk_cycle_start_ms:
+            local_wk_reqs += 1
+        if rts >= fh_cycle_start_ms:
+            local_5h_reqs += 1
         if rts >= eff_cutoff_24h:
             u_24h += ru
         if rts >= eff_cutoff_1h:
@@ -1605,6 +1626,7 @@ def _build_pool_pacing(
             "serverWkRemPct": v_wk_rem,
             "localWkUsedPct": bar_local_wk_pct if v_src_actual == "server" else raw_local_wk_pct,
             "rawLocalWkUsedPct": raw_local_wk_pct,
+            "localWkReqs": local_wk_reqs,
             "otherWkUsedPct": other_wk if v_src_actual == "server" else 0.0,
             "wkElapsedPct": wk_elapsed_pct,
             "wkClockDelta": v_wk_clock_delta,
@@ -1655,6 +1677,7 @@ def _build_pool_pacing(
             "server5hRemPct": v_fh_rem,
             "local5hUsedPct": bar_local_5h_pct if v_src_actual == "server" else raw_local_5h_pct,
             "rawLocal5hUsedPct": raw_local_5h_pct,
+            "local5hReqs": local_5h_reqs,
             "other5hUsedPct": other_5h if v_src_actual == "server" else 0.0,
             "fhElapsedPct": fh_elapsed_pct,
             "fhClockDelta": v_fh_clock_delta,
@@ -1837,9 +1860,11 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
     tot_units = 0.0
     tot_errors = 0
     durs = []
+    measured_durs = []
+    measured_out = 0
 
     agent_counts = defaultdict(lambda: {"requests": 0, "in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "errors": 0})
-    models_agg = defaultdict(lambda: {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "steps": 0, "errors": 0, "tools": 0, "durations": []})
+    models_agg = defaultdict(lambda: {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "steps": 0, "errors": 0, "tools": 0, "durations": [], "measured_durs": []})
     sess_agg = defaultdict(lambda: {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "steps": 0, "errors": 0, "tools": 0, "models": set(), "first_ts": None, "last_ts": None})
 
     for r in in_range:
@@ -1851,6 +1876,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         is_err = r["is_err"]
         ag = r["agent"]
         dur = r["durationMs"]
+        dur_meas = bool(r.get("durMeasured"))
         m_name = r["model"]
         cid = r["cid"]
 
@@ -1861,6 +1887,9 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         if is_err:
             tot_errors += 1
         durs.append(dur)
+        if dur_meas:
+            measured_durs.append(dur)
+            measured_out += out
 
         ag_entry = agent_counts[ag]
         ag_entry["requests"] += 1
@@ -1884,6 +1913,8 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
             ma["errors"] += 1
         if len(ma["durations"]) < 800:
             ma["durations"].append(dur)
+        if dur_meas and len(ma["measured_durs"]) < 800:
+            ma["measured_durs"].append(dur)
 
         sa = sess_agg[cid]
         sa["in"] += inp
@@ -1915,7 +1946,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
 
     models_clean = {}
     for m_name, mv in sorted(models_agg.items(), key=lambda x: x[1]["units"], reverse=True):
-        mdurs = sorted(mv["durations"])
+        mdurs = sorted(mv["measured_durs"]) if mv["measured_durs"] else sorted(mv["durations"])
         models_clean[m_name] = {
             "in": mv["in"],
             "out": mv["out"],
@@ -1925,7 +1956,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
             "errors": mv["errors"],
             "tools": mv["tools"],
             "medianMs": mdurs[len(mdurs) // 2] if mdurs else 0,
-            "p95Ms": mdurs[int(len(mdurs) * 0.95)] if mdurs else 0,
+            "p95Ms": mdurs[min(len(mdurs) - 1, int(len(mdurs) * 0.95))] if mdurs else 0,
             "pct_5h": units_to_pct_5h(mv["units"], 2, is_3p=_is_3p_model(m_name)),
             "pct_week": units_to_pct_week(mv["units"], 2),
             "is3p": _is_3p_model(m_name),
@@ -2074,12 +2105,12 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
     tot_conv = tot_in + tot_cch + tot_out
     cache_rate = tot_cch / max(1, tot_in + tot_cch)
 
-    durs.sort()
-    avg_dur = sum(durs) / max(1, len(durs)) if durs else 0
-    med_dur = durs[len(durs) // 2] if durs else 0
-    p95_dur = durs[int(len(durs) * 0.95)] if durs else 0
+    use_durs = sorted(measured_durs) if measured_durs else sorted(durs)
+    avg_dur = sum(use_durs) / max(1, len(use_durs)) if use_durs else 0
+    med_dur = use_durs[len(use_durs) // 2] if use_durs else 0
+    p95_dur = use_durs[min(len(use_durs) - 1, int(len(use_durs) * 0.95))] if use_durs else 0
     avg_ttft = avg_dur * 0.28
-    avg_tps = (tot_out / max(1, sum(durs) / 1000.0)) if durs else 0.0
+    avg_tps = (measured_out / max(0.1, sum(measured_durs) / 1000.0)) if measured_durs else ((tot_out / max(0.1, sum(durs) / 1000.0)) if durs else 0.0)
 
     time_series = []
     for b_ts, b_val in sorted(bucket_map.items()):
@@ -2201,6 +2232,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "unitDescription": desc,
         "unit": unit,
         "totalRequests": tot_requests,
+        "totalSessionsInRange": len(sessions_list),
         "successfulRequests": max(0, tot_requests - tot_errors),
         "failedRequests": tot_errors,
         "errorRate": (tot_errors / max(1, tot_requests)) if tot_requests else 0.0,
@@ -2839,9 +2871,11 @@ def print_settings_table(cfg):
     print(f"{C.DIM}{'─' * 78}{C.RESET}")
     q_mode = web_cfg.get("quota_mode", "server")
     q_mode_str = "Local / Multi-surface" if q_mode == "multi" else "Server pool (default)"
+    rb_str = "Overview + Quota tab" if web_cfg.get("show_reset_breakdown", False) else "Quota tab only (default)"
     print(f"  {'Onboarding Status':<28} {onboarded_str:<39} onboarded=true|false")
     print(f"  {'Default Launch Mode':<28} {C.GREEN if def_mode=='web' else C.CYAN}{def_mode.upper():<30}{C.RESET} default=web|cli")
     print(f"  {'Quota Counting Source':<28} {q_mode_str:<30} quota_mode=server|multi")
+    print(f"  {'Since-Reset Breakdown':<28} {rb_str:<30} reset_breakdown=true|false")
     print(f"  {'Web Auto-Open Browser':<28} {browser_str:<30} open_browser=true|false")
     print(f"  {'Web Dashboard Port':<28} {str(web_cfg.get('port', 3872)):<30} port=3872")
     print(f"  {'CLI Default View':<28} {cli_cfg.get('default_view', 'overview'):<30} cli.view=tokens|summary")
@@ -4075,6 +4109,7 @@ def run_interactive_onboarding(cfg):
             open_br = cfg.get("web", {}).get("open_browser", True)
             q_mode = cfg.get("web", {}).get("quota_mode", "server")
             q_mode_lbl = "Local / Multi-Surface" if q_mode == "multi" else "Server Pool"
+            show_rb = bool(cfg.get("web", {}).get("show_reset_breakdown", False))
             cli_view = cfg.get("cli", {}).get("default_view", "overview")
             dis_sec = cfg.get("cli", {}).get("disabled_sections", [])
             auto_upd = cfg.get("auto_update", False)
@@ -4095,6 +4130,7 @@ def run_interactive_onboarding(cfg):
                 [
                     ("wizard",  "Run Guided Onboarding Wizard", "4-step setup flow", False),
                     ("qmode",   f"Set Quota Counting Source (currently: {q_mode_lbl})", "Server Pool vs Local / Multi-Surface", False),
+                    ("rbreak",  f"Toggle Overview Since-Reset Breakdown (currently: {'On' if show_rb else 'Quota tab only'})", "Server vs Local usage since 5h & weekly reset", False),
                     ("display", "Customize Overview & Summary Display", _describe_display_sections(dis_sec), False),
                     ("mode",    f"Switch Default Launch Mode (currently: {def_mode.upper()})", "Toggle Web <-> CLI", False),
                     ("browser", f"Toggle Auto-Open Browser (currently: {'On' if open_br else 'Off'})", "Web mode launch behavior", False),
@@ -4140,6 +4176,10 @@ def run_interactive_onboarding(cfg):
                 if qm_act == "SELECT" and qm_val != "__back__":
                     save_config({"onboarded": True, "web": {"quota_mode": qm_val}})
                     status_note = f"Quota counting source set to: {'Local / Multi-Surface' if qm_val == 'multi' else 'Server Pool'}"
+
+            elif choice == "rbreak":
+                save_config({"onboarded": True, "web": {"show_reset_breakdown": not show_rb}})
+                status_note = f"Overview since-reset breakdown set to: {'Shown on Overview + Quota' if not show_rb else 'Quota tab only'}"
 
             elif choice == "display":
                 while True:
@@ -4314,6 +4354,8 @@ def handle_settings_cli(args_list):
                 updates.setdefault("web", {})["pacing_style"] = v.lower()
         elif k in ("pacing_bars", "web.pacing_bars"):
             updates.setdefault("web", {})["pacing_bars"] = v.lower() in ("1", "true", "yes", "on")
+        elif k in ("reset_breakdown", "show_reset_breakdown", "web.show_reset_breakdown"):
+            updates.setdefault("web", {})["show_reset_breakdown"] = v.lower() in ("1", "true", "yes", "on")
         elif k in ("cli.view", "view", "default_view"):
             updates.setdefault("cli", {})["default_view"] = v.lower()
         elif k in ("display", "preset"):
@@ -4929,7 +4971,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   @media (max-width: 960px) {
     #primaryStatGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    #secondaryStatGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    #secondaryStatGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     #liveScanInfo, .topbar-hide-md { display: none !important; }
     #settingsBtn svg { margin-right: 0 !important; }
   }
@@ -4942,7 +4984,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   @media (min-width: 961px) {
     #primaryStatGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-    #secondaryStatGrid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+    #secondaryStatGrid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   }
 
   /* Share Bar / Proportion Stack */
@@ -5739,6 +5781,79 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-size: 12px;
     color: var(--ink-3);
   }
+  .pacing-reset-breakdown {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-top: 1px solid var(--line-1);
+    background: color-mix(in oklab, var(--raised) 50%, var(--surface));
+  }
+  .pacing-reset-col {
+    padding: 14px 24px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+  }
+  .pacing-reset-col + .pacing-reset-col {
+    border-left: 1px solid var(--line-1);
+  }
+  .pacing-reset-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .pacing-reset-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-1);
+    letter-spacing: -0.01em;
+  }
+  .pacing-reset-since {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-2);
+  }
+  .pacing-reset-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .pacing-reset-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 8px 10px;
+    border-radius: var(--r-control);
+    background: var(--surface);
+    border: 1px solid var(--line-1);
+  }
+  .pacing-reset-label {
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--ink-2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .pacing-reset-val {
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 620;
+    color: var(--ink-1);
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .pacing-reset-sub {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   @media (max-width: 960px) {
     .pacing-hero {
       grid-template-columns: 1fr;
@@ -5755,6 +5870,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       padding: 14px 18px 16px;
     }
     .pacing-track-col + .pacing-track-col {
+      border-left: none;
+      border-top: 1px solid var(--line-1);
+    }
+    .pacing-reset-breakdown {
+      grid-template-columns: 1fr;
+    }
+    .pacing-reset-col {
+      padding: 14px 18px 16px;
+    }
+    .pacing-reset-col + .pacing-reset-col {
       border-left: none;
       border-top: 1px solid var(--line-1);
     }
@@ -6182,6 +6307,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <span>Local / Multi-Surface</span>
           </label>
         </div>
+        <label class="checkbox-row" style="margin-top:6px;">
+          <input type="checkbox" id="settingResetBreakdown">
+          <span>Also show Server vs. Local since-reset breakdown inside Overview's pacing card (always shown in Quota tab)</span>
+        </label>
       </div>
 
       <!-- Pacing Coach & Forecast Style -->
@@ -6315,6 +6444,12 @@ let G_PACING_BARS = (() => {
     const b = localStorage.getItem("agy-stats-pacing-bars");
     return b === null ? true : (b !== "false" && b !== "0");
   } catch (e) { return true; }
+})();
+let G_SHOW_RESET_BREAKDOWN = (() => {
+  try {
+    const r = localStorage.getItem("agy-stats-reset-breakdown");
+    return r === "true" || r === "1";
+  } catch (e) { return false; }
 })();
 let G_PACING_QUIP_IDX = 0;
 
@@ -6559,6 +6694,23 @@ function setPacingBars(showBars, persist = true) {
 function togglePacingBars() {
   setPacingBars(!G_PACING_BARS, true);
 }
+function setShowResetBreakdown(show, persist = true) {
+  hideQuotaConversionTip();
+  G_SHOW_RESET_BREAKDOWN = !!show;
+  try { localStorage.setItem("agy-stats-reset-breakdown", G_SHOW_RESET_BREAKDOWN ? "true" : "false"); } catch (e) {}
+  const cb = document.getElementById("settingResetBreakdown");
+  if (cb) cb.checked = G_SHOW_RESET_BREAKDOWN;
+  if (persist) {
+    if (G_SETTINGS && G_SETTINGS.web) G_SETTINGS.web.show_reset_breakdown = G_SHOW_RESET_BREAKDOWN;
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Stats": "1" },
+      body: JSON.stringify({ web: { show_reset_breakdown: G_SHOW_RESET_BREAKDOWN } })
+    }).catch(() => {});
+  }
+  renderPacingSection("overviewPacingBody");
+  renderPacingSection("quotaPacingBody");
+}
 function cyclePacingQuip() {
   G_PACING_QUIP_IDX = (G_PACING_QUIP_IDX + 1) % 12;
   renderPacingSection("overviewPacingBody");
@@ -6697,52 +6849,21 @@ function renderDynamicOverview() {
 
   const ov = ovData.overall;
   const ts = ovData.timeSeries || [];
-  const shortWin = !!ov.isShortWindow;
-  const subweekWin = !!ov.isSubweekWindow;
 
   document.getElementById("activityDescription").textContent = ov.unitDescription;
 
   const reqSpark = ts.map(t => t.requests);
   const tokSpark = ts.map(t => t.tokens);
-  const qWkSpark = ts.map(t => t.pctWeek);
   const cacheSpark = ts.map(t => Math.max(0, t.tokens - (t.requests * 200)));
-
-  const gemWk = findPool("gemini-weekly");
-  const priorWk = Number(ov.priorPctWeekSpent || 0);
-  const activeWk = Number(ov.activePctWeekSpent ?? ov.pctWeeklySpent ?? 0);
-
-  let footWk = "";
-  if (shortWin) {
-    footWk = `≈ ${ov.pct5hSpent}% of 5h limit`;
-    if (priorWk > 0) {
-      footWk += ` · ${activeWk}% since wk reset`;
-    } else if (gemWk) {
-      footWk += ` · ${gemWk.remainingPct}% wk left`;
-    }
-  } else if (subweekWin && priorWk > 0) {
-    footWk = `Local (${ov.windowLabel}) · ${activeWk}% since wk reset`;
-  } else if (gemWk) {
-    footWk = `Local (${ov.windowLabel}) · ${ov.cycleWeekLocalPct ?? activeWk}% since wk reset`;
-  } else {
-    footWk = `Local (${ov.windowLabel}) · ${Re(ov.conversationTokens)} tokens`;
-  }
-  const has3pRange = Number(ov.pct3pWeeklySpent || 0) > 0;
-  const footWkTitle = has3pRange
-    ? `Gemini: ${ov.pctGeminiWeeklySpent}% wk · Claude/GPT: ${ov.pct3pWeeklySpent}% wk — ${footWk}`
-    : footWk;
+  const errSpark = ts.map(t => t.errors || 0);
+  const errSparkColor = ov.failedRequests > 0 ? "var(--bad)" : "var(--chart-primary)";
+  const sessInRange = Number(ov.totalSessionsInRange || 0);
 
   document.getElementById("primaryStatGrid").innerHTML = `
-    <div class="stat" style="cursor:help;" onmouseenter="showQuotaConversionTip(event, G_PACING_POOL)" onmouseleave="hideQuotaConversionTip()">
-      <div class="stat-label"><span class="pacing-tip-trigger">Quota spent</span></div>
-      <div class="stat-value">${ov.pctWeeklySpent}%</div>
-      <div class="stat-foot"><span class="truncate" title="${esc(footWkTitle)}">${esc(footWk)}</span></div>
-      <div class="stat-spark">${renderSparklineSVG(qWkSpark, "var(--chart-primary)")}</div>
-    </div>
-
     <div class="stat">
       <div class="stat-label">Requests</div>
       <div class="stat-value">${B(ov.totalRequests)}</div>
-      <div class="stat-foot"><span class="truncate">${B(ov.failedRequests)} failed · ${He(ov.errorRate, 1)}</span></div>
+      <div class="stat-foot"><span class="truncate">${B(ov.successfulRequests)} ok · ${B(sessInRange)} ${sessInRange === 1 ? "session" : "sessions"}</span></div>
       <div class="stat-spark">${renderSparklineSVG(reqSpark, "var(--chart-primary)")}</div>
     </div>
 
@@ -6759,17 +6880,22 @@ function renderDynamicOverview() {
       <div class="stat-foot"><span class="truncate">${Re(ov.totalCacheReadTokens)} cached</span></div>
       <div class="stat-spark">${renderSparklineSVG(cacheSpark, "var(--chart-primary)")}</div>
     </div>
+
+    <div class="stat">
+      <div class="stat-label">Error rate</div>
+      <div class="stat-value">${He(ov.errorRate, 1)}</div>
+      <div class="stat-foot"><span class="truncate">${B(ov.failedRequests)} failed</span></div>
+      <div class="stat-spark">${renderSparklineSVG(errSpark, errSparkColor)}</div>
+    </div>
   `;
 
   document.getElementById("secondaryStatGrid").innerHTML = `
     <div class="stat" data-size="sm"><div class="stat-label">Uncached input</div><div class="stat-value">${Re(ov.totalInputTokens)}</div></div>
     <div class="stat" data-size="sm"><div class="stat-label">Cache read</div><div class="stat-value">${Re(ov.totalCacheReadTokens)}</div></div>
-    <div class="stat" data-size="sm"><div class="stat-label">Cache write</div><div class="stat-value">${Re(ov.totalCacheWriteTokens)}</div></div>
     <div class="stat" data-size="sm"><div class="stat-label">Output</div><div class="stat-value">${Re(ov.totalOutputTokens)}</div></div>
-    <div class="stat" data-size="sm"><div class="stat-label">Subagents</div><div class="stat-value">${B(ov.totalSubagentRequests)}</div></div>
     <div class="stat" data-size="sm"><div class="stat-label">Tokens/s</div><div class="stat-value">${ov.avgTokensPerSecond.toFixed(1)}</div></div>
     <div class="stat" data-size="sm"><div class="stat-label">Avg latency</div><div class="stat-value">${Rt(ov.avgDuration)}</div></div>
-    <div class="stat" data-size="sm"><div class="stat-label">Avg TTFT</div><div class="stat-value">${Rt(ov.avgTtft)}</div></div>
+    <div class="stat" data-size="sm"><div class="stat-label">P95 latency</div><div class="stat-value">${Rt(ov.p95Duration)}</div></div>
   `;
 
   renderPacingSection("overviewPacingBody");
@@ -7094,42 +7220,112 @@ function renderPacingSection(targetId) {
     </div>
   `;
 
+  // Active-cycle Server vs. Local since-reset breakdown (always ON in Quota tab; optional on Overview)
+  const showResetPanel = (targetId === "quotaPacingBody") || !!G_SHOW_RESET_BREAKDOWN;
+  const isSrvLive = baseP.sourceActual !== "local_fallback";
+  const srv5hPct = Number(baseP.server5hUsedPct ?? 0);
+  const loc5hPct = Number(baseP.rawLocal5hUsedPct ?? 0);
+  const loc5hReqs = Number(baseP.local5hReqs || 0);
+  const oth5hPct = isSrvLive ? Math.max(0, srv5hPct - loc5hPct) : 0;
+  const oth5hSub = !isSrvLive ? "server offline" : (loc5hPct > srv5hPct + 0.3 ? "pending sync" : "server - local");
+
+  const srvWkPct = Number(baseP.serverWkUsedPct ?? 0);
+  const locWkPct = Number(baseP.rawLocalWkUsedPct ?? 0);
+  const locWkReqs = Number(baseP.localWkReqs || 0);
+  const othWkPct = isSrvLive ? Math.max(0, srvWkPct - locWkPct) : 0;
+  const othWkSub = !isSrvLive ? "server offline" : (locWkPct > srvWkPct + 0.3 ? "pending sync" : "server - local");
+
+  const resetBreakdownHtml = `
+    <div class="pacing-reset-breakdown">
+      <div class="pacing-reset-col">
+        <div class="pacing-reset-head">
+          <span class="pacing-reset-title">5h since reset</span>
+          <span class="pacing-reset-since">since ${esc(baseP.fhCycleSince || "–")} (${esc(fmtHoursJS(baseP.fhElapsedHours))} ago)</span>
+        </div>
+        <div class="pacing-reset-metrics">
+          <div class="pacing-reset-item">
+            <span class="pacing-reset-label">Server used</span>
+            <span class="pacing-reset-val">${isSrvLive ? `${srv5hPct.toFixed(1)}%` : "–"}</span>
+            <span class="pacing-reset-sub">${isSrvLive ? "live /usage" : "local fallback"}</span>
+          </div>
+          <div class="pacing-reset-item">
+            <span class="pacing-reset-label">Local (this setup)</span>
+            <span class="pacing-reset-val">${loc5hPct.toFixed(1)}%</span>
+            <span class="pacing-reset-sub">${B(loc5hReqs)} ${loc5hReqs === 1 ? "req" : "reqs"}</span>
+          </div>
+          <div class="pacing-reset-item">
+            <span class="pacing-reset-label">Other surfaces</span>
+            <span class="pacing-reset-val">${isSrvLive ? `${oth5hPct.toFixed(1)}%` : "–"}</span>
+            <span class="pacing-reset-sub">${esc(oth5hSub)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="pacing-reset-col">
+        <div class="pacing-reset-head">
+          <span class="pacing-reset-title">Weekly since reset</span>
+          <span class="pacing-reset-since">since ${esc(baseP.wkCycleSince || "–")} (${esc(fmtHoursJS(baseP.wkElapsedHours))} ago)</span>
+        </div>
+        <div class="pacing-reset-metrics">
+          <div class="pacing-reset-item">
+            <span class="pacing-reset-label">Server used</span>
+            <span class="pacing-reset-val">${isSrvLive ? `${srvWkPct.toFixed(1)}%` : "–"}</span>
+            <span class="pacing-reset-sub">${isSrvLive ? "live /usage" : "local fallback"}</span>
+          </div>
+          <div class="pacing-reset-item">
+            <span class="pacing-reset-label">Local (this setup)</span>
+            <span class="pacing-reset-val">${locWkPct.toFixed(1)}%</span>
+            <span class="pacing-reset-sub">${B(locWkReqs)} ${locWkReqs === 1 ? "req" : "reqs"}</span>
+          </div>
+          <div class="pacing-reset-item">
+            <span class="pacing-reset-label">Other surfaces</span>
+            <span class="pacing-reset-val">${isSrvLive ? `${othWkPct.toFixed(1)}%` : "–"}</span>
+            <span class="pacing-reset-sub">${esc(othWkSub)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
   // Minimal (zero-pressure) mode: compact calm 2-bar view, no big coach headline
   if (styleMode === "minimal") {
     if (cardEl) { cardEl.dataset.tone = "neutral"; cardEl.dataset.minimal = "true"; }
     const minFhW = Math.min(100, Math.max(0, fhUsed));
     const minWkW = Math.min(100, Math.max(0, wkUsed));
     el.innerHTML = `
-      <div class="stack" style="gap:12px; padding:16px 20px;">
-        <div class="row" style="justify-content:space-between; flex-wrap:wrap; gap:10px; align-items:center;">
-          <span class="muted" style="font-size:13px; font-weight:600;">${esc(poolLabel)} Quota</span>
-          ${controlsHtml}
-        </div>
-        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px;">
-          <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px; cursor:help;" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">
-            <div class="row" style="justify-content:space-between; font-size:12px;">
-              <span class="pacing-tip-trigger" style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · 5-Hour Burst</span>
-              <span class="mono"><strong style="color:var(--ink-1);">${fhUsed.toFixed(1)}%</strong> <span class="dim">(${fhRem.toFixed(1)}% left · ${esc(burstRefill)})</span></span>
+      <div>
+        <div class="stack" style="gap:12px; padding:16px 20px;">
+          <div class="row" style="justify-content:space-between; flex-wrap:wrap; gap:10px; align-items:center;">
+            <span class="muted" style="font-size:13px; font-weight:600;">${esc(poolLabel)} Quota</span>
+            ${controlsHtml}
+          </div>
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px;">
+            <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px; cursor:help;" onmouseenter="showQuotaConversionTip(event, '${esc(G_PACING_POOL)}')" onmouseleave="hideQuotaConversionTip()">
+              <div class="row" style="justify-content:space-between; font-size:12px;">
+                <span class="pacing-tip-trigger" style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · 5-Hour Burst</span>
+                <span class="mono"><strong style="color:var(--ink-1);">${fhUsed.toFixed(1)}%</strong> <span class="dim">(${fhRem.toFixed(1)}% left · ${esc(burstRefill)})</span></span>
+              </div>
+              <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
+                <div style="width:${minFhW}%; height:100%; background:${fhUsed >= 90 ? 'var(--bad)' : 'var(--chart-primary)'}; border-radius:var(--r-pill);"></div>
+              </div>
             </div>
-            <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden;">
-              <div style="width:${minFhW}%; height:100%; background:${fhUsed >= 90 ? 'var(--bad)' : 'var(--chart-primary)'}; border-radius:var(--r-pill);"></div>
+            <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px;">
+              <div class="row" style="justify-content:space-between; font-size:12px;">
+                <span style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · Weekly Pool</span>
+                <span class="mono"><strong style="color:var(--ink-1);">${wkUsed.toFixed(1)}%</strong> <span class="dim">(${wkRem.toFixed(1)}% left · ${esc(resetDisp)})</span></span>
+              </div>
+              <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
+                ${wkHasDualSeg ? `
+                  <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${baseP.localWkUsedPct}%"></div>
+                  <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other surfaces: ${baseP.otherWkUsedPct}%"></div>
+                ` : `
+                  <div style="width:${minWkW}%; height:100%; background:${wkUsed >= 90 ? 'var(--bad)' : 'var(--chart-primary)'}; border-radius:var(--r-pill);"></div>
+                `}
+              </div>
             </div>
           </div>
-          <div style="padding:10px 12px; background:var(--raised); border:1px solid var(--line-1); border-radius:var(--r-control); display:flex; flex-direction:column; gap:6px;">
-            <div class="row" style="justify-content:space-between; font-size:12px;">
-              <span style="color:var(--ink-2); font-weight:500;">${esc(poolLabel)} · Weekly Pool</span>
-              <span class="mono"><strong style="color:var(--ink-1);">${wkUsed.toFixed(1)}%</strong> <span class="dim">(${wkRem.toFixed(1)}% left · ${esc(resetDisp)})</span></span>
-            </div>
-            <div style="height:6px; width:100%; background:var(--line-1); border-radius:var(--r-pill); overflow:hidden; display:flex;">
-              ${wkHasDualSeg ? `
-                <div style="width:${wkLocalW}%; height:100%; background:var(--chart-primary);" title="This setup: ${baseP.localWkUsedPct}%"></div>
-                <div style="width:${wkOtherW}%; height:100%; background:var(--chart-secondary); opacity:0.85;" title="Other surfaces: ${baseP.otherWkUsedPct}%"></div>
-              ` : `
-                <div style="width:${minWkW}%; height:100%; background:${wkUsed >= 90 ? 'var(--bad)' : 'var(--chart-primary)'}; border-radius:var(--r-pill);"></div>
-              `}
-            </div>
-          </div>
         </div>
+        ${showResetPanel ? resetBreakdownHtml : ""}
       </div>
     `;
     syncSegmentedThumbs();
@@ -7466,6 +7662,7 @@ function renderPacingSection(targetId) {
           </div>
         </div>
       ` : ""}
+      ${showResetPanel ? resetBreakdownHtml : ""}
     </div>
   `;
   syncSegmentedThumbs();
@@ -7682,7 +7879,7 @@ function renderDynamicTokenMix() {
     { key: "cacheRead", label: "Cache read", value: ov.totalCacheReadTokens, color: "var(--cat-1)" },
     { key: "input", label: "Uncached input", value: ov.totalInputTokens, color: "var(--cat-2)" },
     { key: "output", label: "Output", value: ov.totalOutputTokens, color: "var(--cat-3)" },
-    { key: "cacheWrite", label: "Cache write", value: ov.totalCacheWriteTokens, color: "var(--cat-4)" }
+    ...(ov.totalCacheWriteTokens > 0 ? [{ key: "cacheWrite", label: "Cache write", value: ov.totalCacheWriteTokens, color: "var(--cat-4)" }] : [])
   ];
 
   const knownAgentColors = {
@@ -8419,6 +8616,8 @@ function applyOnboardingPreset(presetKey) {
   const rQMul = document.getElementById("settingQuotaMulti");
   if (rQSrv) rQSrv.checked = true;
   if (rQMul) rQMul.checked = false;
+  const rbCheck = document.getElementById("settingResetBreakdown");
+  if (rbCheck) rbCheck.checked = false;
 
   const rFun = document.getElementById("settingPacingFun");
   const rStr = document.getElementById("settingPacingStraight");
@@ -8478,6 +8677,15 @@ function applySettings(cfg) {
     const cb = document.getElementById("settingPacingBars");
     if (cb) cb.checked = G_PACING_BARS;
     needPacingRender = true;
+  }
+  if (typeof cfg.web?.show_reset_breakdown === "boolean") {
+    if (G_SHOW_RESET_BREAKDOWN !== cfg.web.show_reset_breakdown) {
+      G_SHOW_RESET_BREAKDOWN = cfg.web.show_reset_breakdown;
+      needPacingRender = true;
+    }
+    try { localStorage.setItem("agy-stats-reset-breakdown", G_SHOW_RESET_BREAKDOWN ? "true" : "false"); } catch (e) {}
+    const rbCb = document.getElementById("settingResetBreakdown");
+    if (rbCb) rbCb.checked = G_SHOW_RESET_BREAKDOWN;
   }
   if (needPacingRender && G_OVERVIEW_DATA) {
     renderPacingSection("overviewPacingBody");
@@ -8555,6 +8763,8 @@ async function openSettingsModal(isFirstRun = false) {
   const rQMul = document.getElementById("settingQuotaMulti");
   if (rQSrv) rQSrv.checked = (qMode !== "multi");
   if (rQMul) rQMul.checked = (qMode === "multi");
+  const rbCb = document.getElementById("settingResetBreakdown");
+  if (rbCb) rbCb.checked = (cfg.web?.show_reset_breakdown !== undefined) ? !!cfg.web.show_reset_breakdown : G_SHOW_RESET_BREAKDOWN;
 
   const pStyle = cfg.web?.pacing_style || G_PACING_STYLE || "fun";
   const rFun = document.getElementById("settingPacingFun");
@@ -8681,6 +8891,7 @@ async function saveSettingsFromModal() {
     web: {
       open_browser: !!document.getElementById("settingOpenBrowser")?.checked,
       quota_mode: qModeVal,
+      show_reset_breakdown: !!document.getElementById("settingResetBreakdown")?.checked,
       pacing_style: pStyleVal,
       pacing_bars: document.getElementById("settingPacingBars") ? !!document.getElementById("settingPacingBars").checked : true,
       disabled_tabs: []
@@ -8727,7 +8938,7 @@ async function resetSettingsToDefault() {
         update_url: "",
         auto_check_updates: true,
         auto_update: false,
-        web: { open_browser: true, quota_mode: "server", pacing_style: "fun", pacing_bars: true, disabled_tabs: [] },
+        web: { open_browser: true, quota_mode: "server", show_reset_breakdown: false, pacing_style: "fun", pacing_bars: true, disabled_tabs: [] },
         cli: { default_view: "overview", days: 10, disabled_sections: [] }
       })
     });
