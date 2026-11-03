@@ -1,0 +1,12 @@
+{
+  "stats": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "~/.local/bin/agy-stats --pre-invocation-hook",
+        "timeout": 10
+      }
+    ]
+  }
+}

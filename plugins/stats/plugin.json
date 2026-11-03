@@ -1,7 +1,8 @@
 {
   "name": "stats",
+  "displayName": "Antigravity Telemetry & Quota (/stats)",
   "version": "1.4.0",
-  "description": "Live quota pools, time-windowed token & request overviews, visual activity bar charts, and Web Dashboard launcher for Antigravity (/stats).",
+  "description": "Zero-LLM instant /stats slash commands (/stats, /stats 5m, /stats 1h, /stats 5h, /stats 24h, /stats today, /stats days), live quota pools, visual activity charts, and Web Dashboard launcher.",
   "author": {
     "name": "segfawlt",
     "url": "https://github.com/segfawlt/agy-stats"
@@ -16,8 +17,16 @@
     "dashboard",
     "analytics"
   ],
+  "logo": "assets/logo.svg",
   "assets": {
     "logo": "./assets/logo.svg"
   },
-  "skills": "./skills/"
+  "suggestedPrompts": [
+    "/stats",
+    "/stats 5h",
+    "/stats today",
+    "/stats days",
+    "/stats web",
+    "/stats onboard"
+  ]
 }

@@ -107,6 +107,7 @@ for fname in (
     "release.sh",
     "README.md",
     "plugins/stats/plugin.json",
+    "plugins/stats/hooks.json",
     "plugins/stats/README.md",
     "plugins/stats/skills/stats/SKILL.md",
 ):
