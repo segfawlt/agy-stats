@@ -2963,7 +2963,10 @@ def _build_slash_activity_rows(telemetry, r_norm, span_ms, now_ms):
                     bmap[bk]["toks"] += r["total"]
                     bmap[bk]["reqs"] += 1
                     bmap[bk]["units"] += r["units"]
-        for b_ts, bv in sorted(bmap.items()):
+        items = sorted(bmap.items())
+        first_nz = next((i for i, (_, v) in enumerate(items) if v["reqs"] > 0), max(0, len(items) - 4))
+        items = items[min(first_nz, max(0, len(items) - 4)):]
+        for b_ts, bv in items:
             lbl = datetime.fromtimestamp(b_ts / 1000).astimezone().strftime("%H:%M")
             rows.append((lbl, bv["toks"], bv["reqs"], units_to_pct_week(bv["units"], 2)))
         return f"per {step_ms // 60_000}m", rows
@@ -2983,7 +2986,10 @@ def _build_slash_activity_rows(telemetry, r_norm, span_ms, now_ms):
                     bmap[bk]["toks"] += r["total"]
                     bmap[bk]["reqs"] += 1
                     bmap[bk]["units"] += r["units"]
-        for b_ts, bv in sorted(bmap.items()):
+        items = sorted(bmap.items())
+        first_nz = next((i for i, (_, v) in enumerate(items) if v["reqs"] > 0), max(0, len(items) - 4))
+        items = items[min(first_nz, max(0, len(items) - 4)):]
+        for b_ts, bv in items:
             lbl = datetime.fromtimestamp(b_ts / 1000).astimezone().strftime("%H:%M")
             rows.append((lbl, bv["toks"], bv["reqs"], units_to_pct_week(bv["units"], 2)))
         unit_lbl = "per hour" if step_ms == 3_600_000 else f"per {step_ms // 3_600_000}h"
@@ -3012,14 +3018,75 @@ def _build_slash_activity_rows(telemetry, r_norm, span_ms, now_ms):
         rows.append((lbl, dv["toks"], dv["reqs"], units_to_pct_week(dv["units"], 2)))
     return f"last {len(rows)} days · per day", rows
 
-def _print_slash_quota_lines(stats, include_reset=False, include_pacing=False):
+class _SlashCard:
+    """Boxed TUI card builder with per-line ANSI resets so lipgloss outer styling never tints the card."""
+    def __init__(self, use_color=True, inner_width=76):
+        self.use_color = bool(use_color)
+        self.w = inner_width
+        if self.use_color:
+            self.RST = "\x1b[0m"
+            self.BDR = "\x1b[0m\x1b[38;5;240m"
+            self.TRK = "\x1b[0m\x1b[38;5;238m"
+            self.HDR = "\x1b[0m\x1b[1;36m"
+            self.VAL = "\x1b[0m\x1b[1;97m"
+            self.TXT = "\x1b[0m\x1b[38;5;252m"
+            self.LBL = "\x1b[0m\x1b[38;5;245m"
+            self.GRN = "\x1b[0m\x1b[1;32m"
+            self.AMB = "\x1b[0m\x1b[1;33m"
+            self.RED = "\x1b[0m\x1b[1;31m"
+            self.CYN = "\x1b[0m\x1b[38;5;45m"
+        else:
+            self.RST = self.BDR = self.TRK = self.HDR = self.VAL = ""
+            self.TXT = self.LBL = self.GRN = self.AMB = self.RED = self.CYN = ""
+
+    def vlen(self, s):
+        return len(_ANSI_SEQ_RE.sub("", s))
+
+    def pad(self, s, width):
+        vl = self.vlen(s)
+        return s + (" " * max(0, width - vl))
+
+    def section(self, title, is_top=False):
+        lc = "╭─ " if is_top else "├─ "
+        rc = "─╮" if is_top else "─┤"
+        dashes = max(1, self.w - len(title) - 4)
+        print(f"{self.BDR}{lc}{self.HDR}{title}{self.BDR} {'─' * dashes}{rc}{self.RST}")
+
+    def footer(self, text_styled):
+        vl = self.vlen(text_styled)
+        dashes = max(1, self.w - vl - 4)
+        print(f"{self.BDR}╰─ {text_styled}{self.BDR} {'─' * dashes}─╯{self.RST}")
+
+    def row(self, content):
+        vl = self.vlen(content)
+        if vl > self.w:
+            content = _fit_ansi_line(content, self.w)
+            vl = self.vlen(content)
+        pad_s = " " * max(0, self.w - vl)
+        print(f"{self.BDR}│{self.RST}{content}{pad_s}{self.BDR}│{self.RST}")
+
+    def quota_bar(self, pct_left, width=16):
+        clamped = min(max(float(pct_left or 0.0), 0.0), 100.0)
+        fill = int(round((clamped / 100.0) * width))
+        col = self.GRN if clamped >= 50.0 else (self.AMB if clamped >= 20.0 else self.RED)
+        bar = f"{col}{'█' * fill}{self.TRK}{'░' * (width - fill)}{self.RST}"
+        return bar, col
+
+    def chart_bar(self, val, max_val, width=18):
+        mv = max(float(max_val or 1.0), 1.0)
+        fill = int(round((min(max(float(val or 0.0), 0.0), mv) / mv) * width))
+        if val > 0 and fill == 0:
+            fill = 1
+        return f"{self.CYN}{'█' * fill}{self.TRK}{'░' * (width - fill)}{self.RST}"
+
+def _print_slash_quota_rows(card, stats, include_reset=False, include_pacing=False, is_top=True):
     ov = stats.get("overall") or {}
     p_root = ov.get("pacing") or {}
     pools = p_root.get("pools") or {"gemini": p_root}
     gem = pools.get("gemini") or p_root
     tp = pools.get("3p") or {}
 
-    print("LIVE QUOTA STATUS")
+    card.section("QUOTA POOLS", is_top=is_top)
     if gem and gem.get("available"):
         fh_rem = float(gem.get("server5hRemPct", 100.0))
         fh_used = float(gem.get("server5hUsedPct", 0.0))
@@ -3027,13 +3094,16 @@ def _print_slash_quota_lines(stats, include_reset=False, include_pacing=False):
         wk_rem = float(gem.get("serverWkRemPct", 100.0))
         wk_used = float(gem.get("serverWkUsedPct", 0.0))
         wk_rst = _fmt_hrs_plain(gem.get("wkRemainingHours"))
-        print(f"  {'Gemini · 5h':<20} {_plain_bar(fh_rem, 16)} {fh_rem:>5.1f}% left ({fh_used:>5.1f}% used · refills {fh_rst})")
-        print(f"  {'Gemini · Weekly':<20} {_plain_bar(wk_rem, 16)} {wk_rem:>5.1f}% left ({wk_used:>5.1f}% used · resets {wk_rst})")
+        b_fh, c_fh = card.quota_bar(fh_rem, 16)
+        b_wk, c_wk = card.quota_bar(wk_rem, 16)
+        card.row(f" {card.TXT}{'Gemini · 5h':<19}{card.RST} {b_fh}  {c_fh}{fh_rem:>5.1f}% left{card.LBL}  {fh_used:>5.1f}% used · rst {fh_rst}{card.RST}")
+        card.row(f" {card.TXT}{'Gemini · Weekly':<19}{card.RST} {b_wk}  {c_wk}{wk_rem:>5.1f}% left{card.LBL}  {wk_used:>5.1f}% used · rst {wk_rst}{card.RST}")
     if tp and tp.get("available") and (float(tp.get("serverWkUsedPct", 0)) > 0 or float(tp.get("server5hUsedPct", 0)) > 0):
         tp_wk_rem = float(tp.get("serverWkRemPct", 100.0))
         tp_wk_used = float(tp.get("serverWkUsedPct", 0.0))
         tp_wk_rst = _fmt_hrs_plain(tp.get("wkRemainingHours"))
-        print(f"  {'Claude/GPT · Weekly':<20} {_plain_bar(tp_wk_rem, 16)} {tp_wk_rem:>5.1f}% left ({tp_wk_used:>5.1f}% used · resets {tp_wk_rst})")
+        b_tp, c_tp = card.quota_bar(tp_wk_rem, 16)
+        card.row(f" {card.TXT}{'Claude/GPT · Weekly':<19}{card.RST} {b_tp}  {c_tp}{tp_wk_rem:>5.1f}% left{card.LBL}  {tp_wk_used:>5.1f}% used · rst {tp_wk_rst}{card.RST}")
 
     if include_reset and gem and gem.get("available"):
         fh_srv = float(gem.get("server5hUsedPct", 0.0))
@@ -3044,9 +3114,9 @@ def _print_slash_quota_lines(stats, include_reset=False, include_pacing=False):
         wk_loc = float(gem.get("rawLocalWkUsedPct", 0.0))
         wk_reqs = int(gem.get("localWkReqs", 0))
         wk_oth = max(0.0, wk_srv - wk_loc)
-        print("\nSINCE LAST RESET (Server vs. Local)")
-        print(f"  5h (since {gem.get('fhCycleSince', '–'):<5}):       Server {fh_srv:>5.1f}% │ Local {fh_loc:>5.1f}% ({fh_reqs:,} reqs) │ Other {fh_oth:>4.1f}%")
-        print(f"  Weekly (since {gem.get('wkCycleSince', '–'):<12}): Server {wk_srv:>5.1f}% │ Local {wk_loc:>5.1f}% ({wk_reqs:,} reqs) │ Other {wk_oth:>4.1f}%")
+        card.section("SINCE LAST RESET (Server vs. Local)", is_top=False)
+        card.row(f" {card.LBL}5h ({gem.get('fhCycleSince', '–'):<5}):{card.RST}         {card.TXT}Server {card.VAL}{fh_srv:>5.1f}%{card.BDR} │ {card.TXT}Local {card.VAL}{fh_loc:>5.1f}% {card.LBL}({fh_reqs:,}r){card.BDR} │ {card.LBL}Other {fh_oth:>4.1f}%{card.RST}")
+        card.row(f" {card.LBL}Weekly ({gem.get('wkCycleSince', '–'):<12}):{card.RST} {card.TXT}Server {card.VAL}{wk_srv:>5.1f}%{card.BDR} │ {card.TXT}Local {card.VAL}{wk_loc:>5.1f}% {card.LBL}({wk_reqs:,}r){card.BDR} │ {card.LBL}Other {wk_oth:>4.1f}%{card.RST}")
 
     if include_pacing and gem and gem.get("available"):
         wk_rem = float(gem.get("serverWkRemPct", 100.0))
@@ -3058,29 +3128,33 @@ def _print_slash_quota_lines(stats, include_reset=False, include_pacing=False):
         mult = gem.get("targetWkMultiplier")
         mult_s = f"{mult:.2f}x" if (mult is not None and mult < 1.0) else (f"{mult:.1f}x" if mult is not None else "1.0x")
         if wk_rem <= 0.05:
-            status_s = f"[EXHAUSTED] 0% left · resets in {wk_rst}"
+            status_s = f"{card.RED}[EXHAUSTED]{card.TXT} 0% left · resets in {wk_rst}"
         elif gem.get("wkUnkillable"):
-            status_s = f"[UNKILLABLE WK] Safe to max 100% every 5h window until reset ({wk_rst})"
+            status_s = f"{card.GRN}[UNKILLABLE WK]{card.TXT} Safe to max 100% every 5h window ({wk_rst})"
         elif gem.get("wkWillRunOut"):
-            status_s = f"[HIGH BURN] Slow to {mult_s} pace (<= {safe_d:.1f}%/day vs ~{cur_d:.1f}%/day now · ~{sm_s}%/5h session)"
+            status_s = f"{card.RED}[HIGH BURN]{card.TXT} Slow to {card.VAL}{mult_s}{card.TXT} (<= {safe_d:.1f}%/d vs ~{cur_d:.1f}%/d · ~{sm_s}%/5h)"
         elif gem.get("wkCaution"):
-            status_s = f"[CAUTION] Keep <= {safe_d:.1f}%/day (~{sm_s}% per 5h session across ~{aw_s:.0f} awake sessions)"
+            status_s = f"{card.AMB}[CAUTION]{card.TXT} Keep <= {card.VAL}{safe_d:.1f}%/d{card.TXT} (~{sm_s}%/5h across ~{aw_s:.0f} sessions)"
         else:
-            status_s = f"[ON TRACK] Target {mult_s} pace (~{sm_s}% per 5h session · {safe_d:.1f}%/day budget)"
-        print("\nPACING GUIDANCE")
-        print(f"  Gemini Weekly:  {status_s}")
+            status_s = f"{card.GRN}[ON TRACK]{card.TXT} Target {card.VAL}{mult_s}{card.TXT} pace (~{sm_s}%/5h · {safe_d:.1f}%/day budget)"
+        card.section("PACING GUIDANCE", is_top=False)
+        card.row(f" {card.LBL}Gemini Weekly:{card.RST} {status_s}{card.RST}")
 
-def run_slash_command(arg_str=""):
+def run_slash_command(arg_str="", use_color=None):
     cfg = load_config()
     cli_cfg = cfg.get("cli", {})
+    if use_color is None:
+        use_color = (sys.stdout.isatty() or os.environ.get("AGY_STATS_COLOR") == "1") and not bool(os.environ.get("NO_COLOR"))
+    card = _SlashCard(use_color=use_color, inner_width=76)
     raw_arg = str(arg_str or "").strip().lower()
     tokens = raw_arg.split() if raw_arg else []
     cmd = tokens[0] if tokens else ""
 
+    saved_notice = ""
     if cmd in ("set", "default") and len(tokens) >= 2:
         new_pref = tokens[1].strip().lower()
         save_config({"cli": {"slash_range": new_pref}})
-        print(f"Saved default /stats view -> {new_pref}\n")
+        saved_notice = f" {card.GRN}[Saved default -> {new_pref}]{card.RST}"
         cmd = new_pref
         tokens = tokens[1:]
 
@@ -3093,13 +3167,14 @@ def run_slash_command(arg_str=""):
         _launch_web_detached(port=port, open_browser=True)
         return
 
+    port = cfg.get("web", {}).get("port", 3872)
+    ftr_txt = f"{card.LBL}/stats {card.TXT}5m{card.LBL} | {card.TXT}1h{card.LBL} | {card.TXT}5h{card.LBL} | {card.TXT}24h{card.LBL} | {card.TXT}today{card.LBL} | {card.TXT}7d{card.LBL} | {card.TXT}days{card.LBL} | {card.TXT}all{card.LBL} · {card.TXT}web{card.LBL} | {card.TXT}set{card.RST}"
+
     if cmd == "quota":
         stats = compute_stats_for_range("all")
-        print("AGY STATS · QUOTA & PACING REPORT")
-        print("─" * 78)
-        _print_slash_quota_lines(stats, include_reset=True, include_pacing=True)
-        print("─" * 78)
-        print("Web Dashboard: /stats web (http://localhost:3872) · Ranges: /stats 5h | today | 7d")
+        print(f"{card.HDR}AGY STATS · QUOTA & PACING REPORT{card.RST}{saved_notice}")
+        _print_slash_quota_rows(card, stats, include_reset=True, include_pacing=True, is_top=True)
+        card.footer(ftr_txt)
         return
 
     if cmd in ("models", "sessions"):
@@ -3108,23 +3183,22 @@ def run_slash_command(arg_str=""):
         ov = stats["overall"]
         lbl = ov.get("windowLabel", r_sub).upper()
         if cmd == "models":
-            print(f"AGY STATS · MODELS BREAKDOWN ({lbl})")
-            print("─" * 78)
-            print(f"  {'Model':<28} {'Reqs':>7} {'Total Tok':>11} {'Output':>10} {'Median':>8} {'Wk %':>8}")
-            print("─" * 78)
+            print(f"{card.HDR}AGY STATS · MODELS BREAKDOWN ({lbl}){card.RST}{saved_notice}")
+            card.section(f"ACTIVE MODELS ({lbl})", is_top=True)
+            card.row(f" {card.LBL}{'Model':<28} {'Reqs':>7} {'Total Tok':>11} {'Output':>10} {'Median':>8} {'Wk %':>8}{card.RST}")
             for m_name, mv in (stats.get("models") or {}).items():
-                print(f"  {m_name[:28]:<28} {mv['steps']:>7,} {format_tokens(mv['total']):>11} {format_tokens(mv['out']):>10} {_fmt_dur_plain(mv.get('medianMs')):>8} {mv['pct_week']:>7.2f}%")
-            print("─" * 78)
+                card.row(f" {card.TXT}{m_name[:28]:<28}{card.RST} {card.VAL}{mv['steps']:>7,}{card.RST} {card.VAL}{format_tokens(mv['total']):>11}{card.RST} {card.TXT}{format_tokens(mv['out']):>10}{card.RST} {card.LBL}{_fmt_dur_plain(mv.get('medianMs')):>8}{card.RST} {card.CYN}{mv['pct_week']:>7.2f}%{card.RST}")
+            card.footer(ftr_txt)
         else:
-            print(f"AGY STATS · TOP SESSIONS ({lbl})")
-            print("─" * 78)
-            print(f"  {'Session':<36} {'Agent':<10} {'Reqs':>6} {'Tokens':>10} {'Wk %':>8} {'Err':>4}")
-            print("─" * 78)
+            print(f"{card.HDR}AGY STATS · TOP SESSIONS ({lbl}){card.RST}{saved_notice}")
+            card.section(f"TOP SESSIONS ({lbl})", is_top=True)
+            card.row(f" {card.LBL}{'Session':<34} {'Agent':<10} {'Reqs':>6} {'Tokens':>10} {'Wk %':>8} {'Err':>4}{card.RST}")
             for s in (stats.get("sessions") or [])[:12]:
-                t_s = (s["title"][:33] + "...") if len(s["title"]) > 36 else s["title"]
+                t_s = (s["title"][:31] + "...") if len(s["title"]) > 34 else s["title"]
                 ag_s = (s.get("agent") or "Lead")[:10]
-                print(f"  {t_s:<36} {ag_s:<10} {s['steps']:>6,} {format_tokens(s['total']):>10} {s['pct_week']:>7.2f}% {s['errors']:>4}")
-            print("─" * 78)
+                e_col = card.RED if s["errors"] > 0 else card.LBL
+                card.row(f" {card.TXT}{t_s:<34}{card.RST} {card.LBL}{ag_s:<10}{card.RST} {card.VAL}{s['steps']:>6,}{card.RST} {card.VAL}{format_tokens(s['total']):>10}{card.RST} {card.CYN}{s['pct_week']:>7.2f}%{card.RST} {e_col}{s['errors']:>4}{card.RST}")
+            card.footer(ftr_txt)
         return
 
     # Normalize range argument ("5m", "1h", "5h", "6h", "today", "24h", "7d", "days", "10d", "30d", "all", "<N>m", "<N>h", "<N>d")
@@ -3177,21 +3251,22 @@ def run_slash_command(arg_str=""):
         hdr_lbl = f"LAST {n_d} DAY{'S' if n_d != 1 else ''} ({r_key})"
     else:
         hdr_lbl = win_lbl.upper()
-    print(f"AGY STATS · {hdr_lbl}")
-    print("─" * 78)
 
+    tot_reqs = int(ov.get("totalRequests", 0))
+    sess_cnt = int(ov.get("totalSessionsInRange", 0))
+    conv_tok = int(ov.get("conversationTokens", 0))
+    print(f"{card.HDR}AGY STATS · {hdr_lbl}{card.LBL}  ·  {card.VAL}{sess_cnt:,}{card.LBL} sessions  ·  {card.VAL}{tot_reqs:,}{card.LBL} reqs  ·  {card.VAL}{format_tokens(conv_tok)}{card.LBL} tok{card.RST}{saved_notice}")
+
+    is_first_sec = True
     if "quota" in sections:
-        _print_slash_quota_lines(stats, include_reset=("reset" in sections), include_pacing=("pacing" in sections))
-        print()
+        _print_slash_quota_rows(card, stats, include_reset=("reset" in sections), include_pacing=("pacing" in sections), is_top=is_first_sec)
+        is_first_sec = False
 
     if "kpis" in sections:
-        tot_reqs = int(ov.get("totalRequests", 0))
         ok_reqs = int(ov.get("successfulRequests", 0))
         err_reqs = int(ov.get("failedRequests", 0))
         err_pct = float(ov.get("errorRate", 0.0)) * 100.0
-        sess_cnt = int(ov.get("totalSessionsInRange", 0))
         sub_reqs = int(ov.get("totalSubagentRequests", 0))
-        conv_tok = int(ov.get("conversationTokens", 0))
         in_tok = int(ov.get("totalInputTokens", 0))
         cch_tok = int(ov.get("totalCacheReadTokens", 0))
         out_tok = int(ov.get("totalOutputTokens", 0))
@@ -3201,22 +3276,24 @@ def run_slash_command(arg_str=""):
         tps = float(ov.get("avgTokensPerSecond", 0.0))
         avg_d = _fmt_dur_plain(ov.get("avgDuration"))
         p95_d = _fmt_dur_plain(ov.get("p95Duration"))
+        err_col = card.RED if err_reqs > 0 else card.LBL
 
-        left_1 = f"Requests      {tot_reqs:,} ({ok_reqs:,} ok · {err_reqs:,} err · {err_pct:.1f}%)"
-        right_1 = f"Sessions    {sess_cnt:,} active ({sub_reqs:,} subagent reqs)"
-        left_2 = f"Total tokens  {format_tokens(conv_tok)} (~{pct_5h:.1f}% 5h · ~{pct_wk:.2f}% wk)"
-        right_2 = f"Cache hit   {cch_pct:.1f}% ({format_tokens(cch_tok)} read)"
-        left_3 = f"Uncached in   {format_tokens(in_tok)} tokens"
-        right_3 = f"Output      {format_tokens(out_tok)} tokens"
-        left_4 = f"Throughput    {tps:.1f} tok/s"
-        right_4 = f"Latency     {avg_d} avg · {p95_d} p95"
+        card.section(f"WINDOW KPIs ({win_lbl})", is_top=is_first_sec)
+        is_first_sec = False
 
-        print(f"USAGE IN WINDOW ({win_lbl})")
-        print(f"  {left_1:<44} {right_1}")
-        print(f"  {left_2:<44} {right_2}")
-        print(f"  {left_3:<44} {right_3}")
-        print(f"  {left_4:<44} {right_4}")
-        print()
+        c1_l = card.pad(f" {card.LBL}Total Tokens  {card.VAL}{format_tokens(conv_tok)}{card.LBL} (~{pct_wk:.2f}% wk){card.RST}", 41)
+        c1_r = f"{card.LBL}Cache Hit   {card.VAL}{cch_pct:.1f}%{card.LBL} ({format_tokens(cch_tok)} read){card.RST}"
+        c2_l = card.pad(f" {card.LBL}Uncached In   {card.VAL}{format_tokens(in_tok)}{card.LBL} (~{pct_5h:.1f}% 5h){card.RST}", 41)
+        c2_r = f"{card.LBL}Output      {card.VAL}{format_tokens(out_tok)}{card.LBL} tokens{card.RST}"
+        c3_l = card.pad(f" {card.LBL}Requests      {card.VAL}{tot_reqs:,}{card.LBL} ({ok_reqs:,} ok · {err_col}{err_reqs:,} err{card.LBL}){card.RST}", 41)
+        c3_r = f"{card.LBL}Sessions    {card.VAL}{sess_cnt:,}{card.LBL} ({sub_reqs:,} sub reqs){card.RST}"
+        c4_l = card.pad(f" {card.LBL}Throughput    {card.VAL}{tps:.1f}{card.LBL} tok/s{card.RST}", 41)
+        c4_r = f"{card.LBL}Latency     {card.VAL}{avg_d}{card.LBL} avg · {card.TXT}{p95_d}{card.LBL} p95{card.RST}"
+
+        card.row(c1_l + c1_r)
+        card.row(c2_l + c2_r)
+        card.row(c3_l + c3_r)
+        card.row(c4_l + c4_r)
 
     if "chart" in sections:
         now_ms = int(time.time() * 1000)
@@ -3232,34 +3309,31 @@ def run_slash_command(arg_str=""):
         chart_desc, chart_rows = _build_slash_activity_rows(telemetry, r_key, span_ms, now_ms)
         if chart_rows:
             peak_t = max((r[1] for r in chart_rows), default=1) or 1
-            print(f"ACTIVITY CHART ({chart_desc})")
+            card.section(f"ACTIVITY ({chart_desc})", is_top=is_first_sec)
+            is_first_sec = False
             for lbl, b_toks, b_reqs, b_wk in chart_rows:
-                fill = int(round((min(max(b_toks, 0), peak_t) / float(peak_t)) * 18))
-                if b_toks > 0 and fill == 0:
-                    fill = 1
-                bar = ("█" * fill) + ("░" * (18 - fill))
-                print(f"  {lbl:<11} {bar}  {format_tokens(b_toks):>8} tok │ {b_reqs:>5,} reqs │ {b_wk:>5.2f}% wk")
-            print()
+                bar = card.chart_bar(b_toks, peak_t, 18)
+                v_col = card.VAL if b_toks > 0 else card.LBL
+                card.row(f" {card.TXT}{lbl:<11}{card.RST} {bar}  {v_col}{format_tokens(b_toks):>8}{card.LBL} tok{card.BDR} │ {card.TXT}{b_reqs:>5,}{card.LBL} reqs{card.BDR} │ {card.CYN}{b_wk:>5.2f}%{card.LBL} wk{card.RST}")
 
     models_dict = stats.get("models") or {}
     sess_list = stats.get("sessions") or []
     if ("models" in sections and models_dict) or ("sessions" in sections and sess_list):
-        print(f"MODELS & TOP SESSIONS ({win_lbl})")
+        card.section(f"MODELS & TOP SESSIONS ({win_lbl})", is_top=is_first_sec)
+        is_first_sec = False
         if "models" in sections and models_dict:
             for m_name, mv in list(models_dict.items())[:5]:
-                print(f"  • {m_name[:28]:<28} {mv['steps']:>5,} reqs │ {format_tokens(mv['total']):>8} tok │ {format_tokens(mv['out']):>8} out │ {mv['pct_week']:>5.2f}% wk")
+                card.row(f" {card.CYN}•{card.RST} {card.TXT}{m_name[:26]:<26}{card.RST} {card.VAL}{mv['steps']:>5,}{card.LBL} reqs{card.BDR} │ {card.VAL}{format_tokens(mv['total']):>7}{card.LBL} tok{card.BDR} │ {card.TXT}{format_tokens(mv['out']):>7}{card.LBL} out{card.BDR} │ {card.CYN}{mv['pct_week']:>4.2f}%{card.RST}")
         if "sessions" in sections and sess_list:
             top3 = []
             for s in sess_list[:3]:
-                t_clean = (s["title"][:22] + "..") if len(s["title"]) > 24 else s["title"]
-                top3.append(f"{t_clean} ({s['steps']:,} reqs · {format_tokens(s['total'])})")
+                t_clean = (s["title"][:14] + "..") if len(s["title"]) > 16 else s["title"]
+                top3.append(f"{card.TXT}{t_clean}{card.LBL} ({card.VAL}{format_tokens(s['total'])}{card.LBL}){card.RST}")
             if top3:
-                print(f"  Top sessions: {' · '.join(top3)}")
-        print()
+                sep = f" {card.BDR}·{card.RST} "
+                card.row(f" {card.LBL}Top:{card.RST} {sep.join(top3)}")
 
-    port = cfg.get("web", {}).get("port", 3872)
-    print("─" * 78)
-    print(f"Web: /stats web (localhost:{port}) · Ranges: /stats 5m | 1h | 5h | 24h | today | 7d | days | all · Default: /stats set <range> | onboard")
+    card.footer(ftr_txt)
 
 def run_pre_invocation_hook():
     """Zero-LLM PreInvocation hook for Antigravity: intercepts /stats commands in Python (~50ms, 0 model tokens)."""
@@ -3300,10 +3374,11 @@ def run_pre_invocation_hook():
         print("{}")
         return
 
+    use_col = not bool(os.environ.get("NO_COLOR"))
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            run_slash_command(arg_part)
+            run_slash_command(arg_part, use_color=use_col)
         report_txt = buf.getvalue().rstrip()
     except Exception as ex:
         report_txt = f"AGY STATS ERROR: {ex}"
