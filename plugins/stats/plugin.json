@@ -1,6 +1,6 @@
 {
   "name": "stats",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Live quota pools, time-windowed token & request overviews, visual activity bar charts, and Web Dashboard launcher for Antigravity (/stats).",
   "author": {
     "name": "segfawlt",
