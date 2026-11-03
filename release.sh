@@ -100,7 +100,16 @@ forbidden_terms = [
 forbidden_re = re.compile(r"\b(" + "|".join(re.escape(w) for w in forbidden_terms) + r")\b", re.I)
 emoji_re = re.compile(r"[\U0001F300-\U0001FAFF]")
 
-for fname in ("agy-stats", "install.sh", "install.ps1", "release.sh", "README.md"):
+for fname in (
+    "agy-stats",
+    "install.sh",
+    "install.ps1",
+    "release.sh",
+    "README.md",
+    "plugins/stats/plugin.json",
+    "plugins/stats/README.md",
+    "plugins/stats/skills/stats/SKILL.md",
+):
     with open(fname, "r", encoding="utf-8") as fh:
         txt = fh.read()
     bad = forbidden_re.findall(txt)
@@ -383,6 +392,15 @@ src_new = re.sub(
 
 with open("agy-stats", "w", encoding="utf-8") as f:
     f.write(src_new)
+
+import os
+pjson = "plugins/stats/plugin.json"
+if os.path.exists(pjson):
+    with open(pjson, "r", encoding="utf-8") as f:
+        ptxt = f.read()
+    ptxt_new = re.sub(r'("version"\s*:\s*")[0-9]+\.[0-9]+\.[0-9]+(")', rf'\g<1>{ver}\g<2>', ptxt, count=1)
+    with open(pjson, "w", encoding="utf-8") as f:
+        f.write(ptxt_new)
 PYBUMP
     run_preflight_gates
 fi
@@ -395,7 +413,7 @@ if [ -x "${HOME}/.local/bin/agy-stats" ] && [ -x "./install.sh" ]; then
 fi
 
 echo "==> [4/5] Committing, tagging & pushing ${TAG} to origin ..."
-git add agy-stats agy-stats.sha256 agy-stats.sig
+git add agy-stats agy-stats.sha256 agy-stats.sig plugins/stats/plugin.json
 if ! git diff --cached --quiet; then
     git commit -m "chore(release): ${TAG}"
 fi

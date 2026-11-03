@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from collections import defaultdict, Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 try:
@@ -279,7 +279,9 @@ DEFAULT_CONFIG = {
     "cli": {
         "default_view": "overview",  # "overview" | "tokens" | "summary" | "quota" | "sessions" | "models"
         "days": 10,
-        "disabled_sections": []
+        "disabled_sections": [],
+        "slash_range": "ask",        # "ask" | "1h" | "5h" | "today" | "24h" | "7d" | "days" | "30d" | "all" | "web"
+        "slash_sections": ["quota", "kpis", "chart", "models", "sessions"]
     }
 }
 
@@ -374,6 +376,10 @@ def _read_config_with_status():
             res["cli"]["days"] = max(1, _safe_int(c.get("days"), 10))
             if isinstance(c.get("disabled_sections"), list):
                 res["cli"]["disabled_sections"] = [str(s).lower() for s in c["disabled_sections"] if s]
+            if c.get("slash_range"):
+                res["cli"]["slash_range"] = str(c["slash_range"]).strip().lower()
+            if isinstance(c.get("slash_sections"), list) and c["slash_sections"]:
+                res["cli"]["slash_sections"] = [str(s).strip().lower() for s in c["slash_sections"] if str(s).strip()]
     return res, False
 
 def load_config():
@@ -434,6 +440,10 @@ def save_config(updates):
                 cur["cli"]["days"] = max(1, _safe_int(v, cur["cli"]["days"]))
             elif k == "disabled_sections" and isinstance(v, list):
                 cur["cli"]["disabled_sections"] = [str(s).lower() for s in v if s]
+            elif k == "slash_range" and v:
+                cur["cli"]["slash_range"] = str(v).strip().lower()
+            elif k == "slash_sections" and isinstance(v, list) and v:
+                cur["cli"]["slash_sections"] = [str(s).strip().lower() for s in v if str(s).strip()]
     try:
         _atomic_write_json(CONFIG_PATH, cur)
     except Exception as ex:
@@ -1788,16 +1798,31 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
     cycle_3p_wk_units = sum(r["units"] for r in all_reqs if r["ts"] >= tp_wk_cycle_start_ms and _is_3p_model(r["model"]))
 
     range_configs = {
-        "1h":  {"span_ms": 3600 * 1000,       "bucket_ms": 300 * 1000,   "unit": "5m", "desc": "Per 5m",   "label": "1h"},
-        "5h":  {"span_ms": 5 * 3600 * 1000,   "bucket_ms": 300 * 1000,   "unit": "5m", "desc": "Per 5m",   "label": "5h"},
-        "24h": {"span_ms": 86400 * 1000,      "bucket_ms": 3600 * 1000,  "unit": "1h", "desc": "Per hour", "label": "24h"},
-        "7d":  {"span_ms": 7 * 86400 * 1000,  "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "7d"},
-        "30d": {"span_ms": 30 * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "30d"},
-        "90d": {"span_ms": 90 * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "90d"},
-        "all": {"span_ms": None,              "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "all"}
+        "1h":   {"span_ms": 3600 * 1000,       "bucket_ms": 300 * 1000,   "unit": "5m", "desc": "Per 5m",   "label": "1h"},
+        "5h":   {"span_ms": 5 * 3600 * 1000,   "bucket_ms": 300 * 1000,   "unit": "5m", "desc": "Per 5m",   "label": "5h"},
+        "24h":  {"span_ms": 86400 * 1000,      "bucket_ms": 3600 * 1000,  "unit": "1h", "desc": "Per hour", "label": "24h"},
+        "7d":   {"span_ms": 7 * 86400 * 1000,  "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "7d"},
+        "10d":  {"span_ms": 10 * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "10d"},
+        "days": {"span_ms": 10 * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "10d"},
+        "30d":  {"span_ms": 30 * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "30d"},
+        "90d":  {"span_ms": 90 * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "90d"},
+        "all":  {"span_ms": None,              "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day",  "label": "all"}
     }
 
-    if range_str == "custom" and from_ms is not None and to_ms is not None:
+    r_norm = str(range_str or "all").strip().lower()
+    if r_norm == "today":
+        now_local = datetime.fromtimestamp(now_ms / 1000).astimezone()
+        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ms = int(midnight_local.timestamp() * 1000)
+        end_ms = now_ms
+        span_ms = max(60_000, end_ms - start_ms)
+        bucket_ms, unit, desc = 3600 * 1000, "1h", "Per hour"
+        label = f"today ({now_local.strftime('%b %d')})"
+        range_str = "today"
+        in_time = lambda ts: start_ms <= ts <= end_ms
+        start_bucket = (start_ms // bucket_ms) * bucket_ms
+        cur_bucket = (end_ms // bucket_ms) * bucket_ms
+    elif r_norm == "custom" and from_ms is not None and to_ms is not None:
         start_ms = min(int(from_ms), int(to_ms))
         end_ms = max(int(from_ms), int(to_ms))
         span_ms = max(60_000, end_ms - start_ms)
@@ -1814,8 +1839,25 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         start_bucket = (start_ms // bucket_ms) * bucket_ms
         cur_bucket = (end_ms // bucket_ms) * bucket_ms
     else:
-        cfg = range_configs.get(range_str, range_configs["all"])
-        range_str = range_str if range_str in range_configs else "all"
+        m_hr = re.fullmatch(r"(\d+)h", r_norm)
+        m_dy = re.fullmatch(r"(\d+)d", r_norm)
+        if r_norm in range_configs:
+            cfg = range_configs[r_norm]
+            range_str = "10d" if r_norm == "days" else r_norm
+        elif m_hr:
+            hrs = max(1, min(720, int(m_hr.group(1))))
+            b_ms = 300 * 1000 if hrs <= 6 else (3600 * 1000 if hrs <= 48 else 86400 * 1000)
+            u_s = "5m" if hrs <= 6 else ("1h" if hrs <= 48 else "1d")
+            d_s = "Per 5m" if hrs <= 6 else ("Per hour" if hrs <= 48 else "Per day")
+            cfg = {"span_ms": hrs * 3600 * 1000, "bucket_ms": b_ms, "unit": u_s, "desc": d_s, "label": f"{hrs}h"}
+            range_str = f"{hrs}h"
+        elif m_dy:
+            dys = max(1, min(365, int(m_dy.group(1))))
+            cfg = {"span_ms": dys * 86400 * 1000, "bucket_ms": 86400 * 1000, "unit": "1d", "desc": "Per day", "label": f"{dys}d"}
+            range_str = f"{dys}d"
+        else:
+            cfg = range_configs["all"]
+            range_str = "all"
         span_ms = cfg["span_ms"]
         bucket_ms = cfg["bucket_ms"]
         unit = cfg["unit"]
@@ -2696,13 +2738,18 @@ def print_cli_models(data):
 
 def print_cli_days(data, limit_days):
     print(f"\n{C.BOLD}{C.CYAN}DAILY LEDGER ({'ALL' if limit_days >= 999 else f'LAST {limit_days}D'}){C.RESET}")
-    print(f"{C.DIM}{'─' * 86}{C.RESET}")
-    print(f"  {C.BOLD}{'Date':<12} {'Reqs':>7} {'Input':>11} {'Output':>10} {'Cache':>12} {'Total':>11} {'Wk Quota':>10}{C.RESET}")
-    print(f"{C.DIM}{'─' * 86}{C.RESET}")
+    print(f"{C.DIM}{'─' * 98}{C.RESET}")
+    print(f"  {C.BOLD}{'Date':<12} {'Activity':<12} {'Reqs':>7} {'Input':>10} {'Output':>9} {'Cache':>11} {'Total':>10} {'Wk Quota':>9}{C.RESET}")
+    print(f"{C.DIM}{'─' * 98}{C.RESET}")
     items = list(data["daily"].items())[-limit_days:]
+    peak_tok = max((st["total"] for _, st in items), default=1) or 1
     for dt, st in items:
         mark = f"{C.GREEN}*{C.RESET}" if dt == data["today"]["date"] else " "
-        print(f" {mark}{dt:<11} {st['steps']:>7,} {st['in']/1e6:>10.2f}M {st['out']/1e6:>9.2f}M {st['cache']/1e6:>11.1f}M {st['total']/1e6:>10.1f}M {C.CYAN}{st['pct_week']:>9.2f}%{C.RESET}")
+        fill = int(round((min(max(st["total"], 0), peak_tok) / float(peak_tok)) * 12))
+        if st["total"] > 0 and fill == 0:
+            fill = 1
+        bar = f"{C.CYAN}{'█' * fill}{C.DIM}{'░' * (12 - fill)}{C.RESET}"
+        print(f" {mark}{dt:<11} {bar} {st['steps']:>7,} {st['in']/1e6:>9.2f}M {st['out']/1e6:>8.2f}M {st['cache']/1e6:>10.1f}M {st['total']/1e6:>9.1f}M {C.CYAN}{st['pct_week']:>8.2f}%{C.RESET}")
 
 def print_cli_sessions(data, limit=15):
     print(f"\n{C.BOLD}{C.CYAN}SESSIONS{C.RESET}")
@@ -2787,6 +2834,391 @@ def run_cli_view(view_name, data, disabled_sections=None, limit_days=10):
     if "frustration" not in disabled:
         print_cli_frustration(data)
 
+def _plain_bar(pct, width=16):
+    p = min(max(float(pct or 0.0), 0.0), 100.0)
+    fill = int(round((p / 100.0) * width))
+    if p > 0.2 and fill == 0:
+        fill = 1
+    return ("█" * fill) + ("░" * (width - fill))
+
+def _fmt_dur_plain(ms):
+    if not ms or ms <= 0:
+        return "–"
+    s = float(ms) / 1000.0
+    return f"{int(round(ms))}ms" if s < 1.0 else f"{s:.1f}s"
+
+def _fmt_hrs_plain(h):
+    if h is None:
+        return "–"
+    total_m = max(1, int(round(float(h) * 60)))
+    if total_m >= 1440:
+        return f"{total_m // 1440}d {(total_m % 1440) // 60}h"
+    if total_m >= 60:
+        return f"{total_m // 60}h {total_m % 60}m"
+    return f"{total_m}m"
+
+def _launch_web_detached(port=3872, open_browser=True):
+    url = f"http://localhost:{port}"
+    api_url = f"http://127.0.0.1:{port}/api/settings"
+    already_up = False
+    try:
+        req = urllib.request.Request(api_url, headers={"Host": f"127.0.0.1:{port}"})
+        with urllib.request.urlopen(req, timeout=0.45) as resp:
+            already_up = (resp.status == 200)
+    except Exception:
+        already_up = False
+
+    if not already_up:
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--web", "--no-open", "--port", str(port)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            for _ in range(20):
+                time.sleep(0.1)
+                try:
+                    req = urllib.request.Request(api_url, headers={"Host": f"127.0.0.1:{port}"})
+                    with urllib.request.urlopen(req, timeout=0.3) as resp:
+                        if resp.status == 200:
+                            already_up = True
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    status_lbl = "Running in background (opened in default browser)" if already_up else "Starting on loopback port"
+    print("AGY STATS · WEB DASHBOARD")
+    print("─" * 78)
+    print(f"  URL:     {url}")
+    print(f"  Status:  {status_lbl}")
+    print("─" * 78)
+
+def _build_slash_activity_rows(telemetry, r_norm, span_ms, now_ms):
+    all_reqs = telemetry.get("all_requests") or []
+    rows = []
+    if r_norm == "today":
+        now_local = datetime.fromtimestamp(now_ms / 1000).astimezone()
+        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ms = int(midnight_local.timestamp() * 1000)
+        cur_hr = (now_ms // 3_600_000) * 3_600_000
+        start_hr = (start_ms // 3_600_000) * 3_600_000
+        step_ms = 3_600_000 if ((cur_hr - start_hr) // 3_600_000) < 12 else 7_200_000
+        b_start = start_ms
+        b_end = start_ms + ((now_ms - start_ms) // step_ms) * step_ms
+        bmap = {t: {"toks": 0, "reqs": 0, "units": 0.0} for t in range(b_start, b_end + step_ms, step_ms)}
+        for r in all_reqs:
+            if start_ms <= r["ts"] <= now_ms:
+                bk = start_ms + ((r["ts"] - start_ms) // step_ms) * step_ms
+                if bk in bmap:
+                    bmap[bk]["toks"] += r["total"]
+                    bmap[bk]["reqs"] += 1
+                    bmap[bk]["units"] += r["units"]
+        items = sorted(bmap.items())
+        # Trim leading empty hours before first activity (keep at least last 6 buckets)
+        first_nz = next((i for i, (_, v) in enumerate(items) if v["reqs"] > 0), max(0, len(items) - 6))
+        items = items[min(first_nz, max(0, len(items) - 6)):]
+        for b_ts, bv in items[-12:]:
+            lbl = datetime.fromtimestamp(b_ts / 1000).astimezone().strftime("%H:%M")
+            rows.append((lbl, bv["toks"], bv["reqs"], units_to_pct_week(bv["units"], 2)))
+        return "today · per hour" if step_ms == 3_600_000 else "today · per 2h", rows
+
+    if span_ms is not None and span_ms <= 2 * 3_600_000:
+        step_ms = max(300_000, span_ms // 6)
+        cur_b = (now_ms // step_ms) * step_ms
+        start_b = cur_b - 5 * step_ms
+        bmap = {t: {"toks": 0, "reqs": 0, "units": 0.0} for t in range(start_b, cur_b + step_ms, step_ms)}
+        cutoff = now_ms - span_ms
+        for r in all_reqs:
+            if r["ts"] >= cutoff:
+                bk = min(cur_b, max(start_b, (r["ts"] // step_ms) * step_ms))
+                if bk in bmap:
+                    bmap[bk]["toks"] += r["total"]
+                    bmap[bk]["reqs"] += 1
+                    bmap[bk]["units"] += r["units"]
+        for b_ts, bv in sorted(bmap.items()):
+            lbl = datetime.fromtimestamp(b_ts / 1000).astimezone().strftime("%H:%M")
+            rows.append((lbl, bv["toks"], bv["reqs"], units_to_pct_week(bv["units"], 2)))
+        return f"per {step_ms // 60_000}m", rows
+
+    if span_ms is not None and span_ms <= 48 * 3_600_000:
+        hrs = max(1, int(round(span_ms / 3_600_000)))
+        step_ms = 3_600_000 if hrs <= 12 else (7_200_000 if hrs <= 24 else 14_400_000)
+        n_bars = max(1, min(12, int(round(span_ms / step_ms))))
+        cur_b = (now_ms // step_ms) * step_ms
+        start_b = cur_b - (n_bars - 1) * step_ms
+        bmap = {t: {"toks": 0, "reqs": 0, "units": 0.0} for t in range(start_b, cur_b + step_ms, step_ms)}
+        cutoff = now_ms - span_ms
+        for r in all_reqs:
+            if r["ts"] >= cutoff:
+                bk = min(cur_b, max(start_b, (r["ts"] // step_ms) * step_ms))
+                if bk in bmap:
+                    bmap[bk]["toks"] += r["total"]
+                    bmap[bk]["reqs"] += 1
+                    bmap[bk]["units"] += r["units"]
+        for b_ts, bv in sorted(bmap.items()):
+            lbl = datetime.fromtimestamp(b_ts / 1000).astimezone().strftime("%H:%M")
+            rows.append((lbl, bv["toks"], bv["reqs"], units_to_pct_week(bv["units"], 2)))
+        unit_lbl = "per hour" if step_ms == 3_600_000 else f"per {step_ms // 3_600_000}h"
+        return unit_lbl, rows
+
+    # Multi-day or all-time -> Daily bars (using local calendar date)
+    n_days = 10
+    if span_ms is not None:
+        n_days = max(2, min(14, int(round(span_ms / 86_400_000))))
+    else:
+        n_days = 10
+    daily_map = defaultdict(lambda: {"toks": 0, "reqs": 0, "units": 0.0})
+    cutoff = (now_ms - span_ms) if span_ms is not None else 0
+    for r in all_reqs:
+        if r["ts"] >= cutoff:
+            dt_key = datetime.fromtimestamp(r["ts"] / 1000).astimezone().strftime("%Y-%m-%d")
+            daily_map[dt_key]["toks"] += r["total"]
+            daily_map[dt_key]["reqs"] += 1
+            daily_map[dt_key]["units"] += r["units"]
+    today_local = datetime.fromtimestamp(now_ms / 1000).astimezone().date()
+    day_keys = [(today_local - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n_days - 1, -1, -1)]
+    for dk in day_keys:
+        dv = daily_map.get(dk, {"toks": 0, "reqs": 0, "units": 0.0})
+        dt_obj = datetime.strptime(dk, "%Y-%m-%d")
+        lbl = dt_obj.strftime("%b %d %a")
+        rows.append((lbl, dv["toks"], dv["reqs"], units_to_pct_week(dv["units"], 2)))
+    return f"last {len(rows)} days · per day", rows
+
+def _print_slash_quota_lines(stats, include_reset=False, include_pacing=False):
+    ov = stats.get("overall") or {}
+    p_root = ov.get("pacing") or {}
+    pools = p_root.get("pools") or {"gemini": p_root}
+    gem = pools.get("gemini") or p_root
+    tp = pools.get("3p") or {}
+
+    print("LIVE QUOTA STATUS")
+    if gem and gem.get("available"):
+        fh_rem = float(gem.get("server5hRemPct", 100.0))
+        fh_used = float(gem.get("server5hUsedPct", 0.0))
+        fh_rst = _fmt_hrs_plain(gem.get("fhRemainingHours"))
+        wk_rem = float(gem.get("serverWkRemPct", 100.0))
+        wk_used = float(gem.get("serverWkUsedPct", 0.0))
+        wk_rst = _fmt_hrs_plain(gem.get("wkRemainingHours"))
+        print(f"  {'Gemini · 5h':<20} {_plain_bar(fh_rem, 16)} {fh_rem:>5.1f}% left ({fh_used:>5.1f}% used · refills {fh_rst})")
+        print(f"  {'Gemini · Weekly':<20} {_plain_bar(wk_rem, 16)} {wk_rem:>5.1f}% left ({wk_used:>5.1f}% used · resets {wk_rst})")
+    if tp and tp.get("available") and (float(tp.get("serverWkUsedPct", 0)) > 0 or float(tp.get("server5hUsedPct", 0)) > 0):
+        tp_wk_rem = float(tp.get("serverWkRemPct", 100.0))
+        tp_wk_used = float(tp.get("serverWkUsedPct", 0.0))
+        tp_wk_rst = _fmt_hrs_plain(tp.get("wkRemainingHours"))
+        print(f"  {'Claude/GPT · Weekly':<20} {_plain_bar(tp_wk_rem, 16)} {tp_wk_rem:>5.1f}% left ({tp_wk_used:>5.1f}% used · resets {tp_wk_rst})")
+
+    if include_reset and gem and gem.get("available"):
+        fh_srv = float(gem.get("server5hUsedPct", 0.0))
+        fh_loc = float(gem.get("rawLocal5hUsedPct", 0.0))
+        fh_reqs = int(gem.get("local5hReqs", 0))
+        fh_oth = max(0.0, fh_srv - fh_loc)
+        wk_srv = float(gem.get("serverWkUsedPct", 0.0))
+        wk_loc = float(gem.get("rawLocalWkUsedPct", 0.0))
+        wk_reqs = int(gem.get("localWkReqs", 0))
+        wk_oth = max(0.0, wk_srv - wk_loc)
+        print("\nSINCE LAST RESET (Server vs. Local)")
+        print(f"  5h (since {gem.get('fhCycleSince', '–'):<5}):       Server {fh_srv:>5.1f}% │ Local {fh_loc:>5.1f}% ({fh_reqs:,} reqs) │ Other {fh_oth:>4.1f}%")
+        print(f"  Weekly (since {gem.get('wkCycleSince', '–'):<12}): Server {wk_srv:>5.1f}% │ Local {wk_loc:>5.1f}% ({wk_reqs:,} reqs) │ Other {wk_oth:>4.1f}%")
+
+    if include_pacing and gem and gem.get("available"):
+        wk_rem = float(gem.get("serverWkRemPct", 100.0))
+        wk_rst = _fmt_hrs_plain(gem.get("wkRemainingHours"))
+        safe_d = float(gem.get("safeDailyBudgetLeft", 0.0))
+        cur_d = float(gem.get("serverWkRatePerDay", 0.0))
+        sm_s = int(gem.get("smooth5hSessionPct", 0))
+        aw_s = float(gem.get("awake5hSessionsLeft", 1.0))
+        mult = gem.get("targetWkMultiplier")
+        mult_s = f"{mult:.2f}x" if (mult is not None and mult < 1.0) else (f"{mult:.1f}x" if mult is not None else "1.0x")
+        if wk_rem <= 0.05:
+            status_s = f"[EXHAUSTED] 0% left · resets in {wk_rst}"
+        elif gem.get("wkUnkillable"):
+            status_s = f"[UNKILLABLE WK] Safe to max 100% every 5h window until reset ({wk_rst})"
+        elif gem.get("wkWillRunOut"):
+            status_s = f"[HIGH BURN] Slow to {mult_s} pace (<= {safe_d:.1f}%/day vs ~{cur_d:.1f}%/day now · ~{sm_s}%/5h session)"
+        elif gem.get("wkCaution"):
+            status_s = f"[CAUTION] Keep <= {safe_d:.1f}%/day (~{sm_s}% per 5h session across ~{aw_s:.0f} awake sessions)"
+        else:
+            status_s = f"[ON TRACK] Target {mult_s} pace (~{sm_s}% per 5h session · {safe_d:.1f}%/day budget)"
+        print("\nPACING GUIDANCE")
+        print(f"  Gemini Weekly:  {status_s}")
+
+def run_slash_command(arg_str=""):
+    cfg = load_config()
+    cli_cfg = cfg.get("cli", {})
+    raw_arg = str(arg_str or "").strip().lower()
+    tokens = raw_arg.split() if raw_arg else []
+    cmd = tokens[0] if tokens else ""
+
+    if not cmd or cmd == "default":
+        pref_range = str(cli_cfg.get("slash_range", "ask") or "ask").strip().lower()
+        if pref_range == "ask":
+            stats = compute_stats_for_range("5h")
+            print("[SLASH_PICKER_REQUIRED] Specify a time range or select one below:")
+            print("─" * 78)
+            _print_slash_quota_lines(stats, include_reset=False, include_pacing=False)
+            print("─" * 78)
+            print("Available commands: /stats 1h | 5h | today | 24h | 7d | days | 30d | all | web | onboard")
+            return
+        cmd = pref_range
+
+    if cmd in ("web", "dashboard", "open", "serve"):
+        port = cfg.get("web", {}).get("port", 3872)
+        _launch_web_detached(port=port, open_browser=True)
+        return
+
+    if cmd == "quota":
+        stats = compute_stats_for_range("all")
+        print("AGY STATS · QUOTA & PACING REPORT")
+        print("─" * 78)
+        _print_slash_quota_lines(stats, include_reset=True, include_pacing=True)
+        print("─" * 78)
+        print("Web Dashboard: /stats web (http://localhost:3872) · Ranges: /stats 5h | today | 7d")
+        return
+
+    if cmd in ("models", "sessions"):
+        r_sub = tokens[1] if len(tokens) > 1 else "all"
+        stats = compute_stats_for_range(r_sub)
+        ov = stats["overall"]
+        lbl = ov.get("windowLabel", r_sub).upper()
+        if cmd == "models":
+            print(f"AGY STATS · MODELS BREAKDOWN ({lbl})")
+            print("─" * 78)
+            print(f"  {'Model':<28} {'Reqs':>7} {'Total Tok':>11} {'Output':>10} {'Median':>8} {'Wk %':>8}")
+            print("─" * 78)
+            for m_name, mv in (stats.get("models") or {}).items():
+                print(f"  {m_name[:28]:<28} {mv['steps']:>7,} {format_tokens(mv['total']):>11} {format_tokens(mv['out']):>10} {_fmt_dur_plain(mv.get('medianMs')):>8} {mv['pct_week']:>7.2f}%")
+            print("─" * 78)
+        else:
+            print(f"AGY STATS · TOP SESSIONS ({lbl})")
+            print("─" * 78)
+            print(f"  {'Session':<36} {'Agent':<10} {'Reqs':>6} {'Tokens':>10} {'Wk %':>8} {'Err':>4}")
+            print("─" * 78)
+            for s in (stats.get("sessions") or [])[:12]:
+                t_s = (s["title"][:33] + "...") if len(s["title"]) > 36 else s["title"]
+                ag_s = (s.get("agent") or "Lead")[:10]
+                print(f"  {t_s:<36} {ag_s:<10} {s['steps']:>6,} {format_tokens(s['total']):>10} {s['pct_week']:>7.2f}% {s['errors']:>4}")
+            print("─" * 78)
+        return
+
+    # Normalize range argument ("5h", "1h", "today", "24h", "7d", "days", "10d", "30d", "all", "<N>h", "<N>d")
+    if cmd in ("today", "1d"):
+        r_key = "today" if cmd == "today" else "24h"
+    elif cmd in ("days", "chart", "daily"):
+        r_key = "10d"
+    elif cmd in ("week", "wk"):
+        r_key = "7d"
+    else:
+        r_key = cmd
+
+    telemetry = load_raw_telemetry()
+    stats = compute_stats_for_range(r_key)
+    ov = stats["overall"]
+    win_lbl = ov.get("windowLabel", r_key)
+    sections = set(cli_cfg.get("slash_sections") or ["quota", "kpis", "chart", "models", "sessions"])
+
+    title_map = {
+        "1h": "LAST 1 HOUR (1h)",
+        "5h": "LAST 5 HOURS (5h)",
+        "24h": "LAST 24 HOURS (24h)",
+        "7d": "LAST 7 DAYS (7d)",
+        "10d": "LAST 10 DAYS (10d)",
+        "30d": "LAST 30 DAYS (30d)",
+        "90d": "LAST 90 DAYS (90d)",
+        "all": "ALL TIME (all)",
+    }
+    hdr_lbl = title_map.get(r_key, win_lbl.upper())
+    print(f"AGY STATS · {hdr_lbl}")
+    print("─" * 78)
+
+    if "quota" in sections:
+        _print_slash_quota_lines(stats, include_reset=("reset" in sections), include_pacing=("pacing" in sections))
+        print()
+
+    if "kpis" in sections:
+        tot_reqs = int(ov.get("totalRequests", 0))
+        ok_reqs = int(ov.get("successfulRequests", 0))
+        err_reqs = int(ov.get("failedRequests", 0))
+        err_pct = float(ov.get("errorRate", 0.0)) * 100.0
+        sess_cnt = int(ov.get("totalSessionsInRange", 0))
+        sub_reqs = int(ov.get("totalSubagentRequests", 0))
+        conv_tok = int(ov.get("conversationTokens", 0))
+        in_tok = int(ov.get("totalInputTokens", 0))
+        cch_tok = int(ov.get("totalCacheReadTokens", 0))
+        out_tok = int(ov.get("totalOutputTokens", 0))
+        cch_pct = float(ov.get("cacheRate", 0.0)) * 100.0
+        pct_5h = float(ov.get("pct5hSpent", 0.0))
+        pct_wk = float(ov.get("pctWeeklySpent", 0.0))
+        tps = float(ov.get("avgTokensPerSecond", 0.0))
+        avg_d = _fmt_dur_plain(ov.get("avgDuration"))
+        p95_d = _fmt_dur_plain(ov.get("p95Duration"))
+
+        left_1 = f"Requests      {tot_reqs:,} ({ok_reqs:,} ok · {err_reqs:,} err · {err_pct:.1f}%)"
+        right_1 = f"Sessions    {sess_cnt:,} active ({sub_reqs:,} subagent reqs)"
+        left_2 = f"Total tokens  {format_tokens(conv_tok)} (~{pct_5h:.1f}% 5h · ~{pct_wk:.2f}% wk)"
+        right_2 = f"Cache hit   {cch_pct:.1f}% ({format_tokens(cch_tok)} read)"
+        left_3 = f"Uncached in   {format_tokens(in_tok)} tokens"
+        right_3 = f"Output      {format_tokens(out_tok)} tokens"
+        left_4 = f"Throughput    {tps:.1f} tok/s"
+        right_4 = f"Latency     {avg_d} avg · {p95_d} p95"
+
+        print(f"USAGE IN WINDOW ({win_lbl})")
+        print(f"  {left_1:<44} {right_1}")
+        print(f"  {left_2:<44} {right_2}")
+        print(f"  {left_3:<44} {right_3}")
+        print(f"  {left_4:<44} {right_4}")
+        print()
+
+    if "chart" in sections:
+        now_ms = int(time.time() * 1000)
+        span_ms = None
+        if r_key == "today":
+            span_ms = None
+        elif r_key.endswith("h") and r_key[:-1].isdigit():
+            span_ms = int(r_key[:-1]) * 3_600_000
+        elif r_key.endswith("d") and r_key[:-1].isdigit():
+            span_ms = int(r_key[:-1]) * 86_400_000
+        chart_desc, chart_rows = _build_slash_activity_rows(telemetry, r_key, span_ms, now_ms)
+        if chart_rows:
+            peak_t = max((r[1] for r in chart_rows), default=1) or 1
+            print(f"ACTIVITY CHART ({chart_desc})")
+            for lbl, b_toks, b_reqs, b_wk in chart_rows:
+                fill = int(round((min(max(b_toks, 0), peak_t) / float(peak_t)) * 18))
+                if b_toks > 0 and fill == 0:
+                    fill = 1
+                bar = ("█" * fill) + ("░" * (18 - fill))
+                print(f"  {lbl:<11} {bar}  {format_tokens(b_toks):>8} tok │ {b_reqs:>5,} reqs │ {b_wk:>5.2f}% wk")
+            print()
+
+    models_dict = stats.get("models") or {}
+    sess_list = stats.get("sessions") or []
+    if ("models" in sections and models_dict) or ("sessions" in sections and sess_list):
+        print(f"MODELS & TOP SESSIONS ({win_lbl})")
+        if "models" in sections and models_dict:
+            for m_name, mv in list(models_dict.items())[:5]:
+                print(f"  • {m_name[:28]:<28} {mv['steps']:>5,} reqs │ {format_tokens(mv['total']):>8} tok │ {format_tokens(mv['out']):>8} out │ {mv['pct_week']:>5.2f}% wk")
+        if "sessions" in sections and sess_list:
+            top3 = []
+            for s in sess_list[:3]:
+                t_clean = (s["title"][:22] + "..") if len(s["title"]) > 24 else s["title"]
+                top3.append(f"{t_clean} ({s['steps']:,} reqs · {format_tokens(s['total'])})")
+            if top3:
+                print(f"  Top sessions: {' · '.join(top3)}")
+        print()
+
+    port = cfg.get("web", {}).get("port", 3872)
+    print("─" * 78)
+    print(f"Web Dashboard: /stats web (http://localhost:{port}) · Ranges: /stats 1h | 5h | today | 7d | days | all · Setup: /stats onboard")
+
 def _prompt_tty(prompt_str):
     if sys.stdin.isatty():
         return input(prompt_str)
@@ -2824,6 +3256,7 @@ def print_usage_cheatsheet():
     print(f"\n{C.BOLD}Usage:{C.RESET} {C.CYAN}agy stats{C.RESET} [options]")
     print(f"  {C.CYAN}{'(no args)':<24}{C.RESET} Launch your configured default mode")
     print(f"  {C.CYAN}{'--web [--no-open]':<24}{C.RESET} Start Web Dashboard (http://localhost:3872)")
+    print(f"  {C.CYAN}{'--slash [range|web]':<24}{C.RESET} Clean range report or web launcher (/stats plugin)")
     print(f"  {C.CYAN}{'--cli':<24}{C.RESET} Print terminal overview using your display sections")
     print(f"  {C.CYAN}{'--summary':<24}{C.RESET} Compact 1-line telemetry & quota summary")
     print(f"  {C.CYAN}{'--quota':<24}{C.RESET} Live 5h & weekly quota pools + pacing runway")
@@ -2872,10 +3305,13 @@ def print_settings_table(cfg):
     q_mode = web_cfg.get("quota_mode", "server")
     q_mode_str = "Local / Multi-surface" if q_mode == "multi" else "Server pool (default)"
     rb_str = "Overview + Quota tab" if web_cfg.get("show_reset_breakdown", False) else "Quota tab only (default)"
+    sl_range = cli_cfg.get("slash_range", "ask")
+    sl_str = "Ask range each time (default)" if sl_range == "ask" else f"Default: {sl_range}"
     print(f"  {'Onboarding Status':<28} {onboarded_str:<39} onboarded=true|false")
     print(f"  {'Default Launch Mode':<28} {C.GREEN if def_mode=='web' else C.CYAN}{def_mode.upper():<30}{C.RESET} default=web|cli")
     print(f"  {'Quota Counting Source':<28} {q_mode_str:<30} quota_mode=server|multi")
     print(f"  {'Since-Reset Breakdown':<28} {rb_str:<30} reset_breakdown=true|false")
+    print(f"  {'Slash Command (/stats)':<28} {sl_str:<30} slash_range=ask|5h|today")
     print(f"  {'Web Auto-Open Browser':<28} {browser_str:<30} open_browser=true|false")
     print(f"  {'Web Dashboard Port':<28} {str(web_cfg.get('port', 3872)):<30} port=3872")
     print(f"  {'CLI Default View':<28} {cli_cfg.get('default_view', 'overview'):<30} cli.view=tokens|summary")
@@ -2987,6 +3423,145 @@ def _get_powershell_profiles():
         profiles.append((os.path.join(ps7_dir, "Microsoft.PowerShell_profile.ps1"), "PowerShell 7"))
     profiles.append((os.path.join(ps5_dir, "Microsoft.PowerShell_profile.ps1"), "Windows PowerShell"))
     return profiles
+
+PLUGIN_DIR = os.path.expanduser("~/.gemini/config/plugins/stats")
+
+def _build_plugin_manifest_json():
+    return json.dumps({
+        "name": "stats",
+        "version": __version__,
+        "description": "Live quota pools, time-windowed token & request overviews, visual activity bar charts, and Web Dashboard launcher for Antigravity (/stats).",
+        "author": {
+            "name": "segfawlt",
+            "url": "https://github.com/segfawlt/agy-stats"
+        },
+        "repository": "https://github.com/segfawlt/agy-stats",
+        "license": "MIT",
+        "keywords": ["telemetry", "quota", "tokens", "stats", "dashboard", "analytics"],
+        "assets": {
+            "logo": "./assets/logo.svg"
+        },
+        "skills": "./skills/"
+    }, indent=2) + "\n"
+
+PLUGIN_SKILL_MD = """---
+name: stats
+description: Inspect live Antigravity quota pools, time-windowed token and request overviews (/stats 5h, /stats today, /stats 7d, /stats days, /stats all), configure /stats preferences (/stats onboard), or launch the interactive Web Dashboard (/stats web). Triggered by /stats or when the user asks to check their token usage, quota runway, or telemetry stats.
+---
+
+# Antigravity Telemetry & Quota Slash Skill (`/stats`)
+
+Use this skill whenever the user invokes `/stats` (with or without arguments).
+
+## Command Routing
+
+Always invoke `~/.local/bin/agy-stats` directly via `run_command` (`WaitMsBeforeAsync: 5000`). Do not invoke the shell function `agy stats` inside non-interactive subshells.
+
+### 1. Bare `/stats` (No Arguments)
+
+1. Run `~/.local/bin/agy-stats --slash` via `run_command`.
+2. Inspect the stdout:
+   - **If stdout contains `[SLASH_PICKER_REQUIRED]`**:
+     - Immediately call `ask_question` so the user can pick their time window with a single click:
+       - `question`: `"Select a time window or view for /stats:"`
+       - `is_multi_select`: `false`
+       - `options`:
+         - `"(Recommended) 5h — Active 5-hour quota window overview"`
+         - `"today — Since midnight local time"`
+         - `"7d — Last 7 days overview & daily chart"`
+         - `"days — 10-day daily token & quota ledger chart"`
+         - `"all — All-time telemetry overview"`
+         - `"web — Open interactive Web Dashboard (localhost:3872)"`
+     - Map the chosen option to its leading token (`5h`, `today`, `7d`, `days`, `all`, or `web`), run `~/.local/bin/agy-stats --slash <token>`, and display the resulting report inside a fenced `text` code block.
+   - **If stdout does NOT contain `[SLASH_PICKER_REQUIRED]`** (the user configured a default range or launched web):
+     - Display the stdout directly inside a fenced `text` code block.
+
+### 2. Time-Window Overview or Subview (`/stats <arg>`)
+
+Supported arguments:
+- **Time ranges**: `1h`, `5h`, `today`, `24h`, `7d`, `days` (`10d`), `30d`, `all`, or any `<N>h` / `<N>d` (e.g. `2h`, `14d`)
+- **Focused views**: `quota`, `models`, `sessions`
+
+Execution:
+1. Run `~/.local/bin/agy-stats --slash <arg>` via `run_command`.
+2. Present the exact stdout inside a single fenced `text` code block (` ```text ... ``` `) so box-drawing borders and Unicode bar charts stay aligned in monospace.
+3. Keep commentary minimal (1 short line noting `/stats web` opens the full interactive dashboard or `/stats onboard` customizes the default view). Do not repeat every metric in prose.
+
+### 3. Launch Web Dashboard (`/stats web`)
+
+1. Run `~/.local/bin/agy-stats --slash web` via `run_command`.
+2. This starts the background server on `http://localhost:3872` (if not already running), opens the browser, and exits immediately. Confirm the URL to the user.
+
+### 4. Interactive Onboarding (`/stats onboard` or `/stats settings`)
+
+1. Call `ask_question` with two questions in a single turn:
+   - **Question 1** (`is_multi_select: false`): `"What should bare /stats do when invoked without arguments?"`
+     - `"(Recommended) ask — Prompt for a time window (5h, today, 7d, days, all, web)"`
+     - `"5h — Immediately show 5-hour window overview"`
+     - `"today — Immediately show today's overview"`
+     - `"7d — Immediately show 7-day overview"`
+     - `"days — Immediately show 10-day daily bar chart"`
+     - `"web — Immediately launch Web Dashboard"`
+   - **Question 2** (`is_multi_select: true`): `"Which sections should appear in /stats <range> reports?"`
+     - `"(Recommended) quota — Live 5h & Weekly quota progress bars"`
+     - `"(Recommended) kpis — Window KPIs (requests, tokens, cache hit %, output, speed, latency)"`
+     - `"(Recommended) chart — Visual activity bar chart (hourly or daily)"`
+     - `"(Recommended) models — Active model breakdown in window"`
+     - `"(Recommended) sessions — Top sessions in window"`
+     - `"reset — Server vs. Local since-reset quota breakdown"`
+     - `"pacing — 6-day target & active burn pacing"`
+2. Extract the selected keys (e.g. `slash_range=5h` and `slash_sections=quota,kpis,chart,models,sessions`) and persist them via:
+   ```bash
+   ~/.local/bin/agy-stats --settings slash_range=<mode> slash_sections=<comma_separated_keys>
+   ```
+3. Run `~/.local/bin/agy-stats --slash <preview_range>` (using their chosen default range, or `5h` if they chose `ask`) and show the preview inside a fenced `text` code block.
+"""
+
+PLUGIN_README_MD = """# stats (`/stats` Antigravity Plugin)
+
+Companion Antigravity plugin for [`agy-stats`](https://github.com/segfawlt/agy-stats). Automatically installed to `~/.gemini/config/plugins/stats/` by `agy-stats --install` (and removed cleanly by `agy-stats --uninstall`).
+
+## Commands
+
+- `/stats` — Interactive range picker (`5h`, `today`, `7d`, `days`, `all`, `web`) or your pinned default window
+- `/stats 5h` / `/stats today` / `/stats 7d` / `/stats 30d` / `/stats all` — Mini Web Overview for that exact window (live quota bars, window KPIs, visual hourly/daily activity chart, active models, and top sessions)
+- `/stats days` — 10-day daily token & weekly quota bar chart
+- `/stats quota` / `/stats models` / `/stats sessions` — Focused telemetry tables
+- `/stats web` — Launch the detached Web Dashboard (`http://localhost:3872`)
+- `/stats onboard` — Configure bare `/stats` behavior and displayed sections
+"""
+
+def _install_stats_plugin(verbose=True):
+    actions = []
+    try:
+        skills_dir = os.path.join(PLUGIN_DIR, "skills", "stats")
+        assets_dir = os.path.join(PLUGIN_DIR, "assets")
+        os.makedirs(skills_dir, exist_ok=True)
+        os.makedirs(assets_dir, exist_ok=True)
+        files_to_write = [
+            (os.path.join(PLUGIN_DIR, "plugin.json"), _build_plugin_manifest_json()),
+            (os.path.join(PLUGIN_DIR, "README.md"), PLUGIN_README_MD),
+            (os.path.join(skills_dir, "SKILL.md"), PLUGIN_SKILL_MD),
+        ]
+        fav_svg = globals().get("FAVICON_SVG")
+        if fav_svg:
+            files_to_write.append((os.path.join(assets_dir, "logo.svg"), fav_svg + "\n"))
+        changed = False
+        for fpath, fcontent in files_to_write:
+            existing = ""
+            if os.path.exists(fpath):
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    existing = f.read()
+            if existing != fcontent:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(fcontent)
+                changed = True
+        if changed:
+            actions.append(f"Installed /stats plugin -> {PLUGIN_DIR}")
+    except Exception as ex:
+        if verbose:
+            print(f"{C.YELLOW}Warning installing /stats plugin: {ex}{C.RESET}")
+    return actions
 
 def _detect_agy_surfaces_label():
     has_cli = os.path.isdir(os.path.expanduser("~/.gemini/antigravity-cli")) or (_find_agy_binary() is not None)
@@ -3102,6 +3677,9 @@ def install_shell_integration(verbose=True, update_url=None):
                     if verbose:
                         print(f"{C.YELLOW}Warning configuring {shell_name}: {ex}{C.RESET}")
 
+    # 5. Antigravity /stats plugin (~/.gemini/config/plugins/stats/)
+    installed_actions.extend(_install_stats_plugin(verbose=verbose))
+
     if verbose:
         plat_badge = f"{plat_name} (Tested)" if is_tested_linux else f"{plat_name} (Untested)"
         if installed_actions:
@@ -3112,11 +3690,11 @@ def install_shell_integration(verbose=True, update_url=None):
             print(f"\n{C.BOLD}{C.GREEN}✓ Installation & shell hooks are already up to date (v{__version__}).{C.RESET}")
         print(f"  • Platform:  {plat_badge}")
         print(f"  • Surfaces:  {_detect_agy_surfaces_label()}")
-        print(f"  • Footprint: ~/.local/bin/agy-stats + ~/.config/agy-stats/config.json")
+        print(f"  • Footprint: ~/.local/bin/agy-stats + ~/.gemini/config/plugins/stats + ~/.config/agy-stats/config.json")
         if not is_tested_linux:
             print(f"  • {C.YELLOW}[Notice] {plat_name} support is marked (Untested) — only native Linux is verified in production.{C.RESET}")
         shells_lbl = "PowerShell" if sys.platform == "win32" else "Fish, Bash, or Zsh"
-        print(f"  • Ready:     run {C.CYAN}agy stats{C.RESET} in {shells_lbl}.\n")
+        print(f"  • Ready:     run {C.CYAN}agy stats{C.RESET} in {shells_lbl}, or {C.CYAN}/stats{C.RESET} inside Antigravity.\n")
 
     return installed_actions
 
@@ -3190,7 +3768,13 @@ def uninstall_agy_stats(purge=False, dry_run=False):
                     print(f"{C.YELLOW}Warning removing {bin_p}: {ex}{C.RESET}")
             actions.append(f"Removed executable {bin_p}")
 
-    # 5. Purge config directory if requested
+    # 5. Remove Antigravity /stats plugin directory (~/.gemini/config/plugins/stats)
+    if os.path.exists(PLUGIN_DIR):
+        if not dry_run:
+            shutil.rmtree(PLUGIN_DIR, ignore_errors=True)
+        actions.append(f"Removed /stats plugin {PLUGIN_DIR}")
+
+    # 6. Purge config directory if requested
     if purge and os.path.exists(CONFIG_DIR):
         if not dry_run:
             shutil.rmtree(CONFIG_DIR, ignore_errors=True)
@@ -3434,6 +4018,15 @@ def perform_self_update(url_override=None, check_only=False, force=False, quiet=
             os.remove(tmp_pyc)
         os.chmod(tmp_path, 0o755)
         os.replace(tmp_path, target_bin)
+        try:
+            subprocess.run(
+                [sys.executable, target_bin, "--install"],
+                env={**os.environ, "AGY_NONINTERACTIVE": "1"},
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
     except Exception as ex:
         for p in (tmp_path, tmp_pyc):
             if os.path.exists(p):
@@ -4358,6 +4951,12 @@ def handle_settings_cli(args_list):
             updates.setdefault("web", {})["show_reset_breakdown"] = v.lower() in ("1", "true", "yes", "on")
         elif k in ("cli.view", "view", "default_view"):
             updates.setdefault("cli", {})["default_view"] = v.lower()
+        elif k in ("slash_range", "slash_default", "cli.slash_range"):
+            updates.setdefault("cli", {})["slash_range"] = v.strip().lower()
+        elif k in ("slash_sections", "cli.slash_sections"):
+            secs = [x.strip().lower() for x in v.split(",") if x.strip()]
+            if secs:
+                updates.setdefault("cli", {})["slash_sections"] = secs
         elif k in ("display", "preset"):
             if v.lower() == "minimalist":
                 updates.setdefault("cli", {})["disabled_sections"] = list(MINIMALIST_DISABLED_SECTIONS)
@@ -9312,6 +9911,7 @@ def main():
     parser.add_argument("--tokens", action="store_true", help="Show token spent breakdown")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     parser.add_argument("--cli", action="store_true", help="Force CLI terminal view")
+    parser.add_argument("--slash", "--report", nargs="?", const="", default=None, dest="slash", metavar="RANGE", help="Clean range report or web launcher for /stats plugin (e.g. 5h, today, 7d, days, all, web)")
     parser.add_argument("--web", "--serve", action="store_true", dest="web", help="Launch web dashboard")
     parser.add_argument("--no-open", action="store_true", help="Do not auto-open browser in web mode")
     parser.add_argument("--port", type=int, default=None, help="Web dashboard port (default: 3872)")
@@ -9361,6 +9961,10 @@ def main():
 
     if args.settings is not None:
         handle_settings_cli(args.settings)
+        return
+
+    if args.slash is not None:
+        run_slash_command(args.slash)
         return
 
     # Auto-detect first run if not onboarded and interactive TTY without explicit flags

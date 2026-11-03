@@ -52,6 +52,7 @@ cd agy-stats
 `agy-stats` never touches system directories, never asks for `sudo`/Administrator privileges, and never mutates your global `PATH`:
 
 - **Executable:** `~/.local/bin/agy-stats` *(plus `~/.local/bin/agy-stats.cmd` on Windows)*
+- **Antigravity `/stats` Plugin:** `~/.gemini/config/plugins/stats/` *(removed automatically by `agy stats --uninstall`)*
 - **Preferences:** `~/.config/agy-stats/config.json`
 - **Scoped `agy stats` subcommand hook:**
   - **Fish:** `~/.config/fish/functions/agy.fish`
@@ -63,6 +64,23 @@ Works whether you use `agy` CLI, Antigravity Desktop / IDE standalone, or both.
 ---
 
 ## Usage
+
+### Inside Antigravity Chat (`/stats` Companion Plugin)
+
+Installing `agy-stats` automatically registers the `/stats` skill plugin in `~/.gemini/config/plugins/stats/`:
+
+```text
+/stats                # Interactive time-window selector (or your pinned default range)
+/stats 5h             # 5-hour window overview (live quota, KPIs, hourly bar chart, models, sessions)
+/stats today          # Today's overview & hourly activity chart since midnight
+/stats 7d             # 7-day overview & daily bar chart
+/stats days           # 10-day daily token & weekly quota bar chart
+/stats all            # All-time telemetry overview & daily chart
+/stats web            # Launch detached Web Dashboard at http://localhost:3872
+/stats onboard        # Configure bare /stats behavior & displayed report sections
+```
+
+### Terminal CLI & Web Dashboard (`agy stats`)
 
 ```sh
 agy stats                    # Launch your configured default mode (Web Dashboard or CLI)
