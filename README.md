@@ -25,19 +25,29 @@ Ships as a standalone Python 3 stdlib executable (`agy-stats`) with an interacti
 
 ## Installation (Zero Global Bloat)
 
-### Linux (Tested) · macOS `(Untested)` · WSL2 `(Untested)`
+You can choose between:
+- **Both (`agy stats` CLI + `/stats` Antigravity Plugin)** *(Recommended)* — Provides the terminal `agy stats` command (with scoped Fish/Bash/Zsh/PowerShell functions) **plus** the zero-LLM `/stats` slash command inside Antigravity.
+- **Antigravity Plugin Only** — Completely self-contained inside `~/.gemini/config/plugins/stats/` (with bundled `bin/agy-stats`). Does **not** touch `~/.local/bin/`, `.bashrc`, `.zshrc`, or shell configurations.
+
+### Option A: Interactive One-Liner (Prompts for Both or Plugin Only)
+
+#### Linux (Tested) · macOS `(Untested)` · WSL2 `(Untested)`
 
 ```sh
 curl -fsSL https://github.com/segfawlt/agy-stats/releases/latest/download/install.sh | sh
 ```
 
-### Windows PowerShell `(Untested)`
+*(To install Plugin Only non-interactively: `curl -fsSL https://github.com/segfawlt/agy-stats/releases/latest/download/install.sh | sh -s -- --plugin-only`)*
+
+#### Windows PowerShell `(Untested)`
 
 ```powershell
 irm https://github.com/segfawlt/agy-stats/releases/latest/download/install.ps1 | iex
 ```
 
-### Install from a Local Git Checkout
+*(To install Plugin Only non-interactively: `& { $h = irm https://github.com/segfawlt/agy-stats/releases/latest/download/install.ps1; Invoke-Expression "& { $h } --plugin-only" }`)*
+
+### Option B: Install from Local Git Checkout
 
 ```sh
 git clone https://github.com/segfawlt/agy-stats.git
@@ -48,13 +58,13 @@ cd agy-stats
 
 *(On Windows PowerShell `(Untested)`: `.\install.ps1` or `.\install.ps1 --plugin-only`)*
 
-### Install as a Standalone Antigravity Plugin Only (`agy plugin install`)
+### Option C: Standalone Antigravity Plugin Manager (`agy plugin install`)
 
 ```sh
 agy plugin install ./plugins/stats
 ```
 
-When installed as a plugin only, the executable lives inside `~/.gemini/config/plugins/stats/bin/agy-stats` and never writes to `~/.local/bin` or shell profiles.
+When installed via `agy plugin install`, the executable lives strictly inside `~/.gemini/config/plugins/stats/bin/agy-stats` and never writes to `~/.local/bin` or your shell configuration files. The plugin passes `agy plugin validate plugins/stats --strict` with 0 warnings.
 
 ### Exact User-Space Footprint
 
@@ -133,6 +143,8 @@ agy stats --uninstall --purge # Also delete ~/.config/agy-stats/config.json
    - If a third party ever squats the old GitHub username, they do not possess the Ed25519 private key — both `install.sh` and `agy stats --update` cryptographically reject the payload and leave your binary untouched.
 3. **Hardened Local Web Server (`127.0.0.1`):**
    Binds strictly to `127.0.0.1` using `ThreadingHTTPServer`, enforces a loopback `Host` allowlist (DNS-rebinding defense), validates `Origin` and `Sec-Fetch-Site` on API routes, and requires `Content-Type: application/json` + `X-Agy-Stats: 1` anti-CSRF headers with bounded request bodies on all `POST` endpoints.
+4. **Heartbeat-Gated Process Lifecycle:**
+   When launched via `/stats web`, the dashboard page pings `/api/heartbeat` every 30s while open. A background watchdog thread automatically shuts down the server and releases port 3872 after **3 minutes** of inactivity once all browser tabs are closed. You can also stop it instantly from chat with `/stats web stop`.
 
 ---
 
