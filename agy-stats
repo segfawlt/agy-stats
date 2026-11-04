@@ -58,7 +58,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 DEFAULT_REPO = "segfawlt/agy-stats"
 DEFAULT_UPDATE_URL = f"https://github.com/{DEFAULT_REPO}/releases/latest/download/agy-stats"
@@ -260,6 +260,7 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "onboarded": False,
+    "install_scope": "both",  # "both" | "plugin"
     "default_mode": "web",  # "web" | "cli"
     "update_url": DEFAULT_UPDATE_URL,
     "auto_check_updates": True,
@@ -2867,9 +2868,9 @@ def _fmt_hrs_plain(h):
         return f"{total_m // 60}h {total_m % 60}m"
     return f"{total_m}m"
 
-def _launch_web_detached(port=3872, open_browser=True):
+def _launch_web_detached(port=3872, open_browser=True, idle_timeout=180, card=None):
     url = f"http://localhost:{port}"
-    api_url = f"http://127.0.0.1:{port}/api/settings"
+    api_url = f"http://127.0.0.1:{port}/api/heartbeat"
     already_up = False
     try:
         req = urllib.request.Request(api_url, headers={"Host": f"127.0.0.1:{port}"})
@@ -2880,8 +2881,11 @@ def _launch_web_detached(port=3872, open_browser=True):
 
     if not already_up:
         try:
+            cmd_args = [sys.executable, os.path.abspath(__file__), "--web", "--no-open", "--port", str(port)]
+            if idle_timeout and int(idle_timeout) > 0:
+                cmd_args.extend(["--idle-timeout", str(int(idle_timeout))])
             subprocess.Popen(
-                [sys.executable, os.path.abspath(__file__), "--web", "--no-open", "--port", str(port)],
+                cmd_args,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -2907,11 +2911,21 @@ def _launch_web_detached(port=3872, open_browser=True):
             pass
 
     status_lbl = "Running in background (opened in default browser)" if already_up else "Starting on loopback port"
-    print("AGY STATS · WEB DASHBOARD")
-    print("─" * 78)
-    print(f"  URL:     {url}")
-    print(f"  Status:  {status_lbl}")
-    print("─" * 78)
+    ttl_lbl = f"Auto-closes {int(idle_timeout) // 60}m after browser tab closes (or /stats web stop)" if idle_timeout else "Persistent"
+    if card is not None:
+        print(f"{card.HDR}AGY STATS · WEB DASHBOARD{card.RST}")
+        card.section("LOCALHOST SERVER", is_top=True)
+        card.row(f" {card.LBL}URL:      {card.CYN}{url}{card.RST}")
+        card.row(f" {card.LBL}Status:   {card.GRN if already_up else card.AMB}{status_lbl}{card.RST}")
+        card.row(f" {card.LBL}Lifetime: {card.TXT}{ttl_lbl}{card.RST}")
+        card.footer(f"{card.LBL}/stats {card.TXT}5h{card.LBL} | {card.TXT}today{card.LBL} | {card.TXT}days{card.LBL} | {card.TXT}web stop{card.RST}")
+    else:
+        print("AGY STATS · WEB DASHBOARD")
+        print("─" * 78)
+        print(f"  URL:      {url}")
+        print(f"  Status:   {status_lbl}")
+        print(f"  Lifetime: {ttl_lbl}")
+        print("─" * 78)
 
 def _build_slash_activity_rows(telemetry, r_norm, span_ms, now_ms):
     all_reqs = telemetry.get("all_requests") or []
@@ -3164,7 +3178,16 @@ def run_slash_command(arg_str="", use_color=None):
 
     if cmd in ("web", "dashboard", "open", "serve"):
         port = cfg.get("web", {}).get("port", 3872)
-        _launch_web_detached(port=port, open_browser=True)
+        if len(tokens) >= 2 and tokens[1] in ("stop", "kill", "close", "off"):
+            was_up = _is_loopback_port_listening(port)
+            _terminate_existing_listener(port)
+            print(f"{card.HDR}AGY STATS · WEB DASHBOARD{card.RST}")
+            card.section("LOCALHOST SERVER", is_top=True)
+            msg = f"Stopped background server on http://localhost:{port}" if was_up else f"No server was listening on http://localhost:{port}"
+            card.row(f" {card.GRN if was_up else card.LBL}{msg}{card.RST}")
+            card.footer(f"{card.LBL}/stats {card.TXT}web{card.LBL} to launch again{card.RST}")
+            return
+        _launch_web_detached(port=port, open_browser=True, idle_timeout=180, card=card)
         return
 
     port = cfg.get("web", {}).get("port", 3872)
@@ -3349,6 +3372,18 @@ def run_pre_invocation_hook():
     if not isinstance(payload, dict):
         print("{}")
         return
+
+    # If installed via `agy plugin install` with nested skills/stats/SKILL.md, promote to top-level ~/.gemini/config/skills/stats/SKILL.md
+    try:
+        top_skill = os.path.join(SKILL_DIR, "SKILL.md")
+        nested_skills_dir = os.path.join(PLUGIN_DIR, "skills")
+        if not os.path.exists(top_skill) and os.path.isdir(nested_skills_dir):
+            os.makedirs(SKILL_DIR, exist_ok=True)
+            with open(top_skill, "w", encoding="utf-8") as sf:
+                sf.write(PLUGIN_SKILL_MD)
+            shutil.rmtree(nested_skills_dir, ignore_errors=True)
+    except Exception:
+        pass
 
     raw_in = str(payload.get("lastUserInput") or "")
     if raw_in.startswith('"') and raw_in.endswith('"'):
@@ -3617,16 +3652,10 @@ def _build_plugin_manifest_json():
         "license": "MIT",
         "keywords": ["telemetry", "quota", "tokens", "stats", "dashboard", "analytics"],
         "logo": "assets/logo.svg",
-        "assets": {
-            "logo": "./assets/logo.svg"
-        },
         "suggestedPrompts": [
             "/stats",
             "/stats 5h",
-            "/stats today",
-            "/stats days",
-            "/stats web",
-            "/stats onboard"
+            "/stats days"
         ]
     }, indent=2) + "\n"
 
@@ -3636,7 +3665,7 @@ PLUGIN_HOOKS_JSON = json.dumps({
         "PreInvocation": [
             {
                 "type": "command",
-                "command": "~/.local/bin/agy-stats --pre-invocation-hook",
+                "command": "python3 ./bin/agy-stats --pre-invocation-hook",
                 "timeout": 10
             }
         ]
@@ -3650,7 +3679,7 @@ description: Inspect live Antigravity quota pools, time-windowed token and reque
 
 # Antigravity Telemetry & Quota Slash Skill (`/stats`)
 
-Direct `/stats` commands (`/stats`, `/stats 5m`, `/stats 1h`, `/stats 5h`, `/stats 24h`, `/stats today`, `/stats 7d`, `/stats days`, `/stats all`, `/stats web`, `/stats set <range>`) are intercepted automatically in Python before the LLM is called (zero model tokens, ~50ms).
+Direct `/stats` commands (`/stats`, `/stats 5m`, `/stats 1h`, `/stats 5h`, `/stats 24h`, `/stats today`, `/stats 7d`, `/stats days`, `/stats all`, `/stats web`, `/stats web stop`, `/stats set <range>`) are intercepted automatically in Python before the LLM is called (zero model tokens, ~50ms).
 
 This skill is used in two cases:
 1. When the user runs `/stats onboard` (or `/stats setup` / `/stats settings`) to interactively configure their preferences using `ask_question`.
@@ -3658,7 +3687,7 @@ This skill is used in two cases:
 
 ## Command Routing
 
-Always invoke `~/.local/bin/agy-stats` directly via `run_command` (`WaitMsBeforeAsync: 5000`). Do not invoke the shell function `agy stats` inside non-interactive subshells.
+Always invoke `~/.gemini/config/plugins/stats/bin/agy-stats` directly via `run_command` (`WaitMsBeforeAsync: 5000`). Do not invoke the shell function `agy stats` inside non-interactive subshells.
 
 ### 1. Interactive Onboarding (`/stats onboard` or `/stats settings`)
 
@@ -3681,33 +3710,33 @@ Always invoke `~/.local/bin/agy-stats` directly via `run_command` (`WaitMsBefore
      - `"pacing — 6-day target & active burn pacing"`
 2. Extract the selected keys (e.g. `slash_range=5h` and `slash_sections=quota,kpis,chart,models,sessions`) and persist them via:
    ```bash
-   ~/.local/bin/agy-stats --settings slash_range=<mode> slash_sections=<comma_separated_keys>
+   ~/.gemini/config/plugins/stats/bin/agy-stats --settings slash_range=<mode> slash_sections=<comma_separated_keys>
    ```
-3. Run `~/.local/bin/agy-stats --slash <chosen_range>` and show the preview inside a fenced `text` code block.
+3. Run `~/.gemini/config/plugins/stats/bin/agy-stats --slash <chosen_range>` and show the preview inside a fenced `text` code block.
 
 ### 2. Natural-Language Telemetry Questions in Chat
 
-Supported arguments for `~/.local/bin/agy-stats --slash <arg>`:
+Supported arguments for `~/.gemini/config/plugins/stats/bin/agy-stats --slash <arg>`:
 - **Time ranges**: `5m`, `15m`, `30m`, `1h`, `5h`, `6h`, `today`, `24h`, `7d`, `days` (`10d`), `30d`, `all`, or any `<N>m` / `<N>h` / `<N>d`
-- **Focused views**: `quota`, `models`, `sessions`, `web`, `set <range>`
+- **Focused views**: `quota`, `models`, `sessions`, `web`, `web stop`, `set <range>`
 
-Run `~/.local/bin/agy-stats --slash <arg>` via `run_command` and present the stdout inside a fenced `text` code block (` ```text ... ``` `).
+Run `~/.gemini/config/plugins/stats/bin/agy-stats --slash <arg>` via `run_command` and present the stdout inside a fenced `text` code block (` ```text ... ``` `).
 """
 
 PLUGIN_README_MD = """# stats (`/stats` Antigravity Plugin)
 
-Companion Antigravity plugin for [`agy-stats`](https://github.com/segfawlt/agy-stats). Automatically installed to `~/.gemini/config/plugins/stats/` and `~/.gemini/config/skills/stats/` by `agy-stats --install` (and removed cleanly by `agy-stats --uninstall`).
+Self-contained Antigravity plugin for [`agy-stats`](https://github.com/segfawlt/agy-stats). Ships its own bundled runtime in `bin/agy-stats` inside `~/.gemini/config/plugins/stats/` — no files in `~/.local/bin` required unless you also install the terminal `agy stats` CLI.
 
 ## Zero-LLM Instant Slash Commands (0 Model Tokens)
 
-Handled directly in Python via a `PreInvocation` lifecycle hook (`~/.local/bin/agy-stats --pre-invocation-hook`) before the LLM is ever contacted:
+Handled directly in Python via a `PreInvocation` lifecycle hook (`python3 ./bin/agy-stats --pre-invocation-hook`) before the LLM is ever contacted:
 
 - `/stats` — Immediately prints your default window overview (`5h` by default, 0 LLM tokens)
 - `/stats 5m` / `/stats 1h` / `/stats 5h` / `/stats 6h` / `/stats 24h` / `/stats today` / `/stats 7d` / `/stats 30d` / `/stats all` — Mini Web Overview for any preset or custom `<N>m`, `<N>h`, `<N>d` window (live quota bars, window KPIs, visual minute/hourly/daily activity chart, active models, and top sessions)
 - `/stats days` — 10-day daily token & weekly quota bar chart
 - `/stats quota` / `/stats models` / `/stats sessions` — Focused telemetry tables
 - `/stats set <range>` — Change your default bare `/stats` view (e.g. `/stats set today`, `/stats set days`, `/stats set 5h`)
-- `/stats web` — Launch the detached Web Dashboard (`http://localhost:3872`)
+- `/stats web` — Launch the detached Web Dashboard (`http://localhost:3872`, auto-closes 3 minutes after the browser tab is closed, or run `/stats web stop`)
 
 ## Interactive Setup & Chat Skill
 
@@ -3718,13 +3747,28 @@ def _install_stats_plugin(verbose=True):
     actions = []
     try:
         assets_dir = os.path.join(PLUGIN_DIR, "assets")
+        plugin_bin_dir = os.path.join(PLUGIN_DIR, "bin")
         os.makedirs(assets_dir, exist_ok=True)
+        os.makedirs(plugin_bin_dir, exist_ok=True)
         os.makedirs(SKILL_DIR, exist_ok=True)
         # Remove legacy nested plugin skill dir (~/.gemini/config/plugins/stats/skills) so /stats:stats is replaced by top-level /stats
         legacy_nested_skills = os.path.join(PLUGIN_DIR, "skills")
         if os.path.exists(legacy_nested_skills):
             shutil.rmtree(legacy_nested_skills, ignore_errors=True)
             actions.append(f"Removed legacy nested skill dir -> {legacy_nested_skills}")
+
+        # Bundle executable inside ~/.gemini/config/plugins/stats/bin/agy-stats
+        plugin_bin_path = os.path.join(plugin_bin_dir, "agy-stats")
+        current_script = os.path.abspath(__file__)
+        bin_changed = False
+        if os.path.abspath(plugin_bin_path) != current_script and os.path.isfile(current_script):
+            tmp_pbin = os.path.join(plugin_bin_dir, f".agy-stats.tmp.{os.getpid()}")
+            shutil.copy2(current_script, tmp_pbin)
+            os.chmod(tmp_pbin, 0o755)
+            os.replace(tmp_pbin, plugin_bin_path)
+            bin_changed = True
+        elif os.path.exists(plugin_bin_path):
+            os.chmod(plugin_bin_path, 0o755)
 
         files_to_write = [
             (os.path.join(PLUGIN_DIR, "plugin.json"), _build_plugin_manifest_json()),
@@ -3735,7 +3779,7 @@ def _install_stats_plugin(verbose=True):
         fav_svg = globals().get("FAVICON_SVG")
         if fav_svg:
             files_to_write.append((os.path.join(assets_dir, "logo.svg"), fav_svg + "\n"))
-        changed = False
+        changed = bin_changed
         for fpath, fcontent in files_to_write:
             existing = ""
             if os.path.exists(fpath):
@@ -3746,7 +3790,7 @@ def _install_stats_plugin(verbose=True):
                     f.write(fcontent)
                 changed = True
         if changed:
-            actions.append(f"Installed /stats zero-LLM hook & skill -> {PLUGIN_DIR} + {SKILL_DIR}")
+            actions.append(f"Installed self-contained /stats plugin -> {PLUGIN_DIR} (bin/agy-stats) + {SKILL_DIR}")
     except Exception as ex:
         if verbose:
             print(f"{C.YELLOW}Warning installing /stats plugin: {ex}{C.RESET}")
@@ -3763,108 +3807,147 @@ def _detect_agy_surfaces_label():
         return "Antigravity CLI"
     return "Antigravity CLI / Desktop (waiting for first session)"
 
-def install_shell_integration(verbose=True, update_url=None):
+def prompt_install_scope(cfg=None):
+    """Prompt interactive terminal users whether to install Both (CLI + /stats plugin) or /stats Plugin only."""
+    if cfg is None:
+        cfg = load_config()
+    cur_scope = str(cfg.get("install_scope", "both") or "both").strip().lower()
+    raw_tty = _open_raw_tty()
+    if raw_tty is None:
+        return "plugin" if cur_scope == "plugin" else "both"
+    tty_in, tty_out, should_close = raw_tty
+    ui = _ClackUI(tty_in, tty_out)
+    try:
+        act, val = ui.select_one(
+            [f"{C.CYAN}┌{C.RESET}  {C.BOLD}AGY STATS · Installation Scope{C.RESET}", f"{C.DIM}│{C.RESET}"],
+            "How would you like to install agy-stats?",
+            [
+                ("both", "Both `/stats` Plugin & `agy stats` CLI", "Recommended · installs Antigravity plugin + ~/.local/bin/agy-stats", False),
+                ("plugin", "Antigravity `/stats` Plugin Only", "Drops executable inside ~/.gemini/config/plugins/stats/bin/ only (no ~/.local/bin)", False),
+            ],
+            default_idx=(1 if cur_scope == "plugin" else 0),
+            footer="↑/↓ move · Enter select · Esc default (Both)",
+        )
+        chosen = val if (act == "SELECT" and val in ("both", "plugin")) else "both"
+        scope_lbl = "Antigravity /stats Plugin Only" if chosen == "plugin" else "Both /stats Plugin & agy stats CLI"
+        ui.finish([
+            f"{C.CYAN}┌{C.RESET}  {C.BOLD}AGY STATS · Installation Scope{C.RESET}",
+            f"{C.GREEN}└{C.RESET}  Selected: {C.BOLD}{scope_lbl}{C.RESET}",
+        ])
+        return chosen
+    finally:
+        if should_close:
+            try:
+                tty_in.close()
+                tty_out.close()
+            except Exception:
+                pass
+
+def install_shell_integration(verbose=True, update_url=None, plugin_only=False):
     installed_actions = []
     local_bin = os.path.expanduser("~/.local/bin")
     target_bin = os.path.join(local_bin, "agy-stats")
     plat_key, plat_name, is_tested_linux = _detect_runtime_platform()
 
+    cfg_updates = {"install_scope": "plugin" if plugin_only else "both"}
     if update_url:
         u_clean = str(update_url).strip()
         if u_clean.startswith(("https://", "file://")):
-            save_config({"update_url": u_clean})
+            cfg_updates["update_url"] = u_clean
+    save_config(cfg_updates)
 
-    # 1. Atomic user-space binary installation (~/.local/bin/agy-stats)
-    try:
-        current_script = os.path.abspath(__file__)
-        os.makedirs(local_bin, exist_ok=True)
-        if os.path.abspath(target_bin) != current_script and os.path.isfile(current_script):
-            tmp_target = os.path.join(local_bin, f".agy-stats.tmp.{os.getpid()}")
-            shutil.copy2(current_script, tmp_target)
-            os.chmod(tmp_target, 0o755)
-            os.replace(tmp_target, target_bin)
-            installed_actions.append(f"Installed executable -> {target_bin}")
-        elif os.path.exists(target_bin):
-            os.chmod(target_bin, 0o755)
-
-        if sys.platform == "win32":
-            cmd_shim = os.path.join(local_bin, "agy-stats.cmd")
-            existing_cmd = ""
-            if os.path.exists(cmd_shim):
-                with open(cmd_shim, "r", encoding="utf-8", errors="ignore") as f:
-                    existing_cmd = f.read()
-            if existing_cmd != WINDOWS_CMD_SHIM:
-                with open(cmd_shim, "w", encoding="utf-8", newline="") as f:
-                    f.write(WINDOWS_CMD_SHIM)
-                installed_actions.append(f"Installed Windows launcher -> {cmd_shim}")
-    except Exception as ex:
-        if verbose:
-            print(f"{C.YELLOW}Warning installing binary: {ex}{C.RESET}")
-
-    # 2. Windows PowerShell $PROFILE integration (# >>> agy-stats >>> ... # <<< agy-stats <<<)
-    for ps_path, ps_name in _get_powershell_profiles():
+    if not plugin_only:
+        # 1. Atomic user-space binary installation (~/.local/bin/agy-stats)
         try:
-            os.makedirs(os.path.dirname(ps_path), exist_ok=True)
-            content = ""
-            if os.path.exists(ps_path):
-                with open(ps_path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-            cleaned = _FENCED_RC_RE.sub("", content).rstrip()
-            new_content = (cleaned + "\n\n" + POWERSHELL_FENCED_BLOCK) if cleaned else POWERSHELL_FENCED_BLOCK
-            if new_content != content:
-                with open(ps_path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
-                installed_actions.append(f"Configured fenced {ps_name} hook -> {ps_path}")
+            current_script = os.path.abspath(__file__)
+            os.makedirs(local_bin, exist_ok=True)
+            if os.path.abspath(target_bin) != current_script and os.path.isfile(current_script):
+                tmp_target = os.path.join(local_bin, f".agy-stats.tmp.{os.getpid()}")
+                shutil.copy2(current_script, tmp_target)
+                os.chmod(tmp_target, 0o755)
+                os.replace(tmp_target, target_bin)
+                installed_actions.append(f"Installed executable -> {target_bin}")
+            elif os.path.exists(target_bin):
+                os.chmod(target_bin, 0o755)
+
+            if sys.platform == "win32":
+                cmd_shim = os.path.join(local_bin, "agy-stats.cmd")
+                existing_cmd = ""
+                if os.path.exists(cmd_shim):
+                    with open(cmd_shim, "r", encoding="utf-8", errors="ignore") as f:
+                        existing_cmd = f.read()
+                if existing_cmd != WINDOWS_CMD_SHIM:
+                    with open(cmd_shim, "w", encoding="utf-8", newline="") as f:
+                        f.write(WINDOWS_CMD_SHIM)
+                    installed_actions.append(f"Installed Windows launcher -> {cmd_shim}")
         except Exception as ex:
             if verbose:
-                print(f"{C.YELLOW}Warning configuring {ps_name}: {ex}{C.RESET}")
+                print(f"{C.YELLOW}Warning installing binary: {ex}{C.RESET}")
 
-    # 3. Fish shell integration (~/.config/fish/functions/agy.fish, zero global PATH mutation)
-    if sys.platform != "win32":
-        fish_config_dir = os.path.expanduser("~/.config/fish")
-        fish_available = os.path.isdir(fish_config_dir) or (shutil.which("fish") is not None)
-        if fish_available:
+        # 2. Windows PowerShell $PROFILE integration (# >>> agy-stats >>> ... # <<< agy-stats <<<)
+        for ps_path, ps_name in _get_powershell_profiles():
             try:
-                fish_funcs_dir = os.path.join(fish_config_dir, "functions")
-                os.makedirs(fish_funcs_dir, exist_ok=True)
-                fish_file = os.path.join(fish_funcs_dir, "agy.fish")
-                existing_fish = ""
-                if os.path.exists(fish_file):
-                    with open(fish_file, "r", encoding="utf-8", errors="replace") as f:
-                        existing_fish = f.read()
-                if existing_fish != FISH_WRAPPER_CODE and (not existing_fish or "agy-stats" in existing_fish):
-                    with open(fish_file, "w", encoding="utf-8") as f:
-                        f.write(FISH_WRAPPER_CODE)
-                    installed_actions.append(f"Configured Fish wrapper -> {fish_file}")
+                os.makedirs(os.path.dirname(ps_path), exist_ok=True)
+                content = ""
+                if os.path.exists(ps_path):
+                    with open(ps_path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                cleaned = _FENCED_RC_RE.sub("", content).rstrip()
+                new_content = (cleaned + "\n\n" + POWERSHELL_FENCED_BLOCK) if cleaned else POWERSHELL_FENCED_BLOCK
+                if new_content != content:
+                    with open(ps_path, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+                    installed_actions.append(f"Configured fenced {ps_name} hook -> {ps_path}")
             except Exception as ex:
                 if verbose:
-                    print(f"{C.YELLOW}Warning configuring Fish shell: {ex}{C.RESET}")
+                    print(f"{C.YELLOW}Warning configuring {ps_name}: {ex}{C.RESET}")
 
-        # 4. Bash & Zsh fenced integration (# >>> agy-stats >>> ... # <<< agy-stats <<<)
-        user_shell = os.environ.get("SHELL", "")
-        bashrc_path = os.path.expanduser("~/.bashrc")
-        zshrc_path = os.path.expanduser("~/.zshrc")
-        rc_targets = [
-            (bashrc_path, "Bash", os.path.exists(bashrc_path) or user_shell.endswith("/bash")),
-            (zshrc_path, "Zsh", os.path.exists(zshrc_path) or sys.platform == "darwin" or user_shell.endswith("/zsh")),
-        ]
-        for rc_path, shell_name, should_write in rc_targets:
-            if should_write:
+        # 3. Fish shell integration (~/.config/fish/functions/agy.fish, zero global PATH mutation)
+        if sys.platform != "win32":
+            fish_config_dir = os.path.expanduser("~/.config/fish")
+            fish_available = os.path.isdir(fish_config_dir) or (shutil.which("fish") is not None)
+            if fish_available:
                 try:
-                    content = ""
-                    if os.path.exists(rc_path):
-                        with open(rc_path, "r", encoding="utf-8", errors="replace") as f:
-                            content = f.read()
-                    cleaned = _FENCED_RC_RE.sub("", content)
-                    cleaned = _LEGACY_RC_RE.sub("\n", cleaned).rstrip()
-                    new_content = (cleaned + "\n\n" + POSIX_FENCED_BLOCK) if cleaned else POSIX_FENCED_BLOCK
-                    if new_content != content:
-                        with open(rc_path, "w", encoding="utf-8") as f:
-                            f.write(new_content)
-                        installed_actions.append(f"Configured fenced {shell_name} hook -> {rc_path}")
+                    fish_funcs_dir = os.path.join(fish_config_dir, "functions")
+                    os.makedirs(fish_funcs_dir, exist_ok=True)
+                    fish_file = os.path.join(fish_funcs_dir, "agy.fish")
+                    existing_fish = ""
+                    if os.path.exists(fish_file):
+                        with open(fish_file, "r", encoding="utf-8", errors="replace") as f:
+                            existing_fish = f.read()
+                    if existing_fish != FISH_WRAPPER_CODE and (not existing_fish or "agy-stats" in existing_fish):
+                        with open(fish_file, "w", encoding="utf-8") as f:
+                            f.write(FISH_WRAPPER_CODE)
+                        installed_actions.append(f"Configured Fish wrapper -> {fish_file}")
                 except Exception as ex:
                     if verbose:
-                        print(f"{C.YELLOW}Warning configuring {shell_name}: {ex}{C.RESET}")
+                        print(f"{C.YELLOW}Warning configuring Fish shell: {ex}{C.RESET}")
+
+            # 4. Bash & Zsh fenced integration (# >>> agy-stats >>> ... # <<< agy-stats <<<)
+            user_shell = os.environ.get("SHELL", "")
+            bashrc_path = os.path.expanduser("~/.bashrc")
+            zshrc_path = os.path.expanduser("~/.zshrc")
+            rc_targets = [
+                (bashrc_path, "Bash", os.path.exists(bashrc_path) or user_shell.endswith("/bash")),
+                (zshrc_path, "Zsh", os.path.exists(zshrc_path) or sys.platform == "darwin" or user_shell.endswith("/zsh")),
+            ]
+            for rc_path, shell_name, should_write in rc_targets:
+                if should_write:
+                    try:
+                        content = ""
+                        if os.path.exists(rc_path):
+                            with open(rc_path, "r", encoding="utf-8", errors="replace") as f:
+                                content = f.read()
+                        cleaned = _FENCED_RC_RE.sub("", content)
+                        cleaned = _LEGACY_RC_RE.sub("\n", cleaned).rstrip()
+                        new_content = (cleaned + "\n\n" + POSIX_FENCED_BLOCK) if cleaned else POSIX_FENCED_BLOCK
+                        if new_content != content:
+                            with open(rc_path, "w", encoding="utf-8") as f:
+                                f.write(new_content)
+                            installed_actions.append(f"Configured fenced {shell_name} hook -> {rc_path}")
+                    except Exception as ex:
+                        if verbose:
+                            print(f"{C.YELLOW}Warning configuring {shell_name}: {ex}{C.RESET}")
 
     # 5. Antigravity /stats plugin (~/.gemini/config/plugins/stats/)
     installed_actions.extend(_install_stats_plugin(verbose=verbose))
@@ -3879,11 +3962,15 @@ def install_shell_integration(verbose=True, update_url=None):
             print(f"\n{C.BOLD}{C.GREEN}✓ Installation & shell hooks are already up to date (v{__version__}).{C.RESET}")
         print(f"  • Platform:  {plat_badge}")
         print(f"  • Surfaces:  {_detect_agy_surfaces_label()}")
-        print(f"  • Footprint: ~/.local/bin/agy-stats + ~/.gemini/config/plugins/stats + ~/.config/agy-stats/config.json")
-        if not is_tested_linux:
-            print(f"  • {C.YELLOW}[Notice] {plat_name} support is marked (Untested) — only native Linux is verified in production.{C.RESET}")
-        shells_lbl = "PowerShell" if sys.platform == "win32" else "Fish, Bash, or Zsh"
-        print(f"  • Ready:     run {C.CYAN}agy stats{C.RESET} in {shells_lbl}, or {C.CYAN}/stats{C.RESET} inside Antigravity.\n")
+        if plugin_only:
+            print(f"  • Footprint: ~/.gemini/config/plugins/stats (self-contained bin/agy-stats) + ~/.config/agy-stats/config.json")
+            print(f"  • Ready:     run {C.CYAN}/stats{C.RESET} inside Antigravity.\n")
+        else:
+            print(f"  • Footprint: ~/.local/bin/agy-stats + ~/.gemini/config/plugins/stats + ~/.config/agy-stats/config.json")
+            if not is_tested_linux:
+                print(f"  • {C.YELLOW}[Notice] {plat_name} support is marked (Untested) — only native Linux is verified in production.{C.RESET}")
+            shells_lbl = "PowerShell" if sys.platform == "win32" else "Fish, Bash, or Zsh"
+            print(f"  • Ready:     run {C.CYAN}agy stats{C.RESET} in {shells_lbl}, or {C.CYAN}/stats{C.RESET} inside Antigravity.\n")
 
     return installed_actions
 
@@ -4193,8 +4280,18 @@ def perform_self_update(url_override=None, check_only=False, force=False, quiet=
 
     current_script = os.path.abspath(__file__)
     local_bin_dir = os.path.expanduser("~/.local/bin")
-    os.makedirs(local_bin_dir, exist_ok=True)
-    default_target = os.path.join(local_bin_dir, "agy-stats")
+    local_bin_target = os.path.join(local_bin_dir, "agy-stats")
+    plugin_bin_dir = os.path.join(PLUGIN_DIR, "bin")
+    plugin_bin_target = os.path.join(plugin_bin_dir, "agy-stats")
+    is_plugin_only = (cfg.get("install_scope") == "plugin") or (
+        not os.path.exists(local_bin_target) and current_script.startswith(os.path.abspath(PLUGIN_DIR))
+    )
+    if is_plugin_only:
+        os.makedirs(plugin_bin_dir, exist_ok=True)
+        default_target = plugin_bin_target
+    else:
+        os.makedirs(local_bin_dir, exist_ok=True)
+        default_target = local_bin_target
     if os.path.basename(current_script) == "agy-stats" and os.access(os.path.dirname(current_script), os.W_OK):
         target_bin = current_script
     else:
@@ -4212,8 +4309,11 @@ def perform_self_update(url_override=None, check_only=False, force=False, quiet=
         os.chmod(tmp_path, 0o755)
         os.replace(tmp_path, target_bin)
         try:
+            install_cmd = [sys.executable, target_bin, "--install"]
+            if is_plugin_only:
+                install_cmd.append("--plugin-only")
             subprocess.run(
-                [sys.executable, target_bin, "--install"],
+                install_cmd,
                 env={**os.environ, "AGY_NONINTERACTIVE": "1"},
                 capture_output=True,
                 timeout=10,
@@ -7166,7 +7266,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="row" style="justify-content:space-between; align-items:center; gap:8px;">
           <div class="form-section-title" style="margin-bottom:0;">Updates &amp; Maintenance</div>
           <div class="row" style="gap:6px;">
-            <span class="micro mono dim" id="settingVersionBadge">v1.4.2</span>
+            <span class="micro mono dim" id="settingVersionBadge">v1.4.3</span>
             <button type="button" class="btn" data-size="sm" data-variant="outline" id="checkUpdateWebBtn" onclick="triggerWebUpdate(true)">Check Now</button>
             <button type="button" class="btn" data-size="sm" data-variant="ghost" id="applyUpdateWebBtn" onclick="triggerWebUpdate(false)" style="display:none;">Update Now</button>
           </div>
@@ -9867,6 +9967,9 @@ initTheme();
 syncSegmentedThumbs(true);
 fetchSettings();
 setTimeRange("all");
+setInterval(() => {
+  fetch("/api/heartbeat", { cache: "no-store" }).catch(() => {});
+}, 30000);
 </script>
 </body>
 </html>
@@ -9875,6 +9978,11 @@ setTimeRange("all");
 _LOOPBACK_HOST_RE = re.compile(r"^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$", re.IGNORECASE)
 _LOOPBACK_ORIGIN_RE = re.compile(r"^http://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$", re.IGNORECASE)
 _MAX_POST_BYTES = 65536
+_LAST_WEB_ACTIVITY_TS = time.monotonic()
+
+def _touch_web_activity():
+    global _LAST_WEB_ACTIVITY_TS
+    _LAST_WEB_ACTIVITY_TS = time.monotonic()
 
 class _StatsHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
@@ -9932,6 +10040,7 @@ class StatsHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         if not self._verify_request_origin(is_post=False, is_api=False):
             return
+        _touch_web_activity()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -9941,9 +10050,18 @@ class StatsHandler(BaseHTTPRequestHandler):
         is_api = parsed.path.startswith("/api/")
         if not self._verify_request_origin(is_post=False, is_api=is_api):
             return
+        _touch_web_activity()
         qs = urllib.parse.parse_qs(parsed.query)
 
-        if parsed.path in ("/api/stats", "/api/stats/overview"):
+        if parsed.path == "/api/heartbeat":
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif parsed.path in ("/api/stats", "/api/stats/overview"):
             if "refresh" in qs:
                 fetch_live_quota(force_refresh=True)
                 load_raw_telemetry(force=True)
@@ -9994,6 +10112,16 @@ class StatsHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         if not self._verify_request_origin(is_post=True, is_api=True):
+            return
+        _touch_web_activity()
+        if parsed.path == "/api/heartbeat":
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if parsed.path == "/api/settings":
             try:
@@ -10063,11 +10191,12 @@ def _terminate_existing_listener(port):
         pass
     time.sleep(0.25)
 
-def serve_web(port=None, open_browser=True):
+def serve_web(port=None, open_browser=True, idle_timeout=0):
     cfg = load_config()
     if port is None:
         port = cfg.get("web", {}).get("port", 3872)
     _terminate_existing_listener(port)
+    _touch_web_activity()
     socketserver.TCPServer.allow_reuse_address = True
     server = _StatsHTTPServer(("127.0.0.1", port), StatsHandler)
     url = f"http://localhost:{port}"
@@ -10081,6 +10210,18 @@ def serve_web(port=None, open_browser=True):
             except Exception:
                 pass
         threading.Thread(target=_open, daemon=True).start()
+    if idle_timeout and int(idle_timeout) > 0:
+        ttl_s = int(idle_timeout)
+        def _idle_watchdog():
+            while True:
+                time.sleep(5.0)
+                if (time.monotonic() - _LAST_WEB_ACTIVITY_TS) >= float(ttl_s):
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+                    break
+        threading.Thread(target=_idle_watchdog, daemon=True).start()
     print(f"{C.DIM}Press Ctrl+C to stop.{C.RESET}")
     try:
         server.serve_forever()
@@ -10108,8 +10249,10 @@ def main():
     parser.add_argument("--web", "--serve", action="store_true", dest="web", help="Launch web dashboard")
     parser.add_argument("--no-open", action="store_true", help="Do not auto-open browser in web mode")
     parser.add_argument("--port", type=int, default=None, help="Web dashboard port (default: 3872)")
+    parser.add_argument("--idle-timeout", type=int, default=0, dest="idle_timeout", help="Auto-close web server after N seconds of no heartbeat/requests (0 = disabled)")
     parser.add_argument("--onboard", "--setup", action="store_true", dest="onboard", help="Run interactive step-by-step onboarding setup wizard")
-    parser.add_argument("--install", action="store_true", help="Install agy-stats to ~/.local/bin and configure Fish/Bash/Zsh/PowerShell 'agy stats' subcommand")
+    parser.add_argument("--install", action="store_true", help="Install agy-stats to ~/.local/bin and/or Antigravity /stats plugin")
+    parser.add_argument("--plugin-only", action="store_true", dest="plugin_only", help="During --install, install only the self-contained Antigravity /stats plugin (no ~/.local/bin binary)")
     parser.add_argument("--update-url", default=None, help="Persist update source URL during --install")
     parser.add_argument("--update", nargs="?", const="", default=None, metavar="URL", help="Verified atomic self-update (optional source URL)")
     parser.add_argument("--check-update", action="store_true", help="Check if a newer version is available without updating")
@@ -10146,10 +10289,16 @@ def main():
     cfg = load_config()
 
     if args.install:
-        install_shell_integration(verbose=True, update_url=args.update_url)
-        cfg = load_config()
         has_tty = sys.stdin.isatty() or (os.path.exists("/dev/tty") and not os.environ.get("AGY_NONINTERACTIVE"))
-        if not cfg.get("onboarded", False) and has_tty:
+        if args.plugin_only:
+            use_plugin_only = True
+        elif has_tty and not os.environ.get("AGY_NONINTERACTIVE"):
+            use_plugin_only = (prompt_install_scope(cfg) == "plugin")
+        else:
+            use_plugin_only = False
+        install_shell_integration(verbose=True, update_url=args.update_url, plugin_only=use_plugin_only)
+        cfg = load_config()
+        if not cfg.get("onboarded", False) and has_tty and not use_plugin_only:
             cfg = run_onboarding_wizard(cfg)
         return
 
@@ -10206,7 +10355,7 @@ def main():
     if run_web:
         open_br = False if args.no_open else cfg.get("web", {}).get("open_browser", True)
         port = args.port if args.port is not None else cfg.get("web", {}).get("port", 3872)
-        serve_web(port=port, open_browser=open_br)
+        serve_web(port=port, open_browser=open_br, idle_timeout=args.idle_timeout)
         return
 
     data = collect_all_data()

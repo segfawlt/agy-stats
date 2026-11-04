@@ -66,8 +66,11 @@ esac
 
 run_preflight_gates() {
     echo "==> [1/5] Running pre-flight quality & security gates ..."
+    mkdir -p plugins/stats/bin
+    cp agy-stats plugins/stats/bin/agy-stats
+    chmod +x plugins/stats/bin/agy-stats
     CURRENT_VERSION="$(python3 - <<'PY'
-import py_compile, re, subprocess, sys, tempfile
+import os, py_compile, re, subprocess, sys, tempfile
 
 py_compile.compile("agy-stats", doraise=True)
 with open("agy-stats", "r", encoding="utf-8") as f:
@@ -125,10 +128,15 @@ out = subprocess.check_output([sys.executable, "./agy-stats", "--version"], text
 if f"v{ver}" not in out:
     raise SystemExit(f"Error: Unexpected --version output: {out}")
 
+# Antigravity plugin strict validation check (when agy binary is present)
+agy_bin = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+if os.path.isfile(agy_bin) and os.access(agy_bin, os.X_OK):
+    subprocess.run([agy_bin, "plugin", "validate", "plugins/stats", "--strict"], check=True, stdout=subprocess.DEVNULL)
+
 print(ver)
 PY
 )"
-    echo "  • Bytecode, embedded JS, standalone purity, zero-emoji & CLI smoke gates: OK (current v${CURRENT_VERSION})"
+    echo "  • Bytecode, embedded JS, standalone purity, zero-emoji, plugin --strict & CLI smoke gates: OK (current v${CURRENT_VERSION})"
 }
 
 sign_and_verify() {
@@ -414,7 +422,7 @@ if [ -x "${HOME}/.local/bin/agy-stats" ] && [ -x "./install.sh" ]; then
 fi
 
 echo "==> [4/5] Committing, tagging & pushing ${TAG} to origin ..."
-git add agy-stats agy-stats.sha256 agy-stats.sig plugins/stats/plugin.json
+git add agy-stats agy-stats.sha256 agy-stats.sig plugins/stats/plugin.json plugins/stats/bin/agy-stats
 if ! git diff --cached --quiet; then
     git commit -m "chore(release): ${TAG}"
 fi

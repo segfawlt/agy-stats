@@ -42,19 +42,28 @@ irm https://github.com/segfawlt/agy-stats/releases/latest/download/install.ps1 |
 ```sh
 git clone https://github.com/segfawlt/agy-stats.git
 cd agy-stats
-./install.sh
+./install.sh                  # Interactive prompt: choose Both (CLI + Plugin) or Plugin Only
+./install.sh --plugin-only    # Or install only the self-contained /stats plugin (no ~/.local/bin)
 ```
 
-*(On Windows PowerShell `(Untested)`: `.\install.ps1`)*
+*(On Windows PowerShell `(Untested)`: `.\install.ps1` or `.\install.ps1 --plugin-only`)*
+
+### Install as a Standalone Antigravity Plugin Only (`agy plugin install`)
+
+```sh
+agy plugin install ./plugins/stats
+```
+
+When installed as a plugin only, the executable lives inside `~/.gemini/config/plugins/stats/bin/agy-stats` and never writes to `~/.local/bin` or shell profiles.
 
 ### Exact User-Space Footprint
 
 `agy-stats` never touches system directories, never asks for `sudo`/Administrator privileges, and never mutates your global `PATH`:
 
-- **Executable:** `~/.local/bin/agy-stats` *(plus `~/.local/bin/agy-stats.cmd` on Windows)*
-- **Antigravity `/stats` Plugin & Top-Level Skill:** `~/.gemini/config/plugins/stats/` + `~/.gemini/config/skills/stats/` *(removed automatically by `agy stats --uninstall`)*
+- **Antigravity `/stats` Plugin & Top-Level Skill:** `~/.gemini/config/plugins/stats/` (with bundled `bin/agy-stats`) + `~/.gemini/config/skills/stats/` *(removed automatically by `agy stats --uninstall`)*
+- **Terminal CLI Executable *(when Both is selected)*:** `~/.local/bin/agy-stats` *(plus `~/.local/bin/agy-stats.cmd` on Windows)*
 - **Preferences:** `~/.config/agy-stats/config.json`
-- **Scoped `agy stats` subcommand hook:**
+- **Scoped `agy stats` subcommand hook *(when Both is selected)*:**
   - **Fish:** `~/.config/fish/functions/agy.fish`
   - **Bash / Zsh:** fenced `# >>> agy-stats >>> ... # <<< agy-stats <<<` function in `~/.bashrc` / `~/.zshrc`
   - **PowerShell `(Untested)`:** fenced `# >>> agy-stats >>> ... # <<< agy-stats <<<` function in `$PROFILE`
@@ -67,7 +76,7 @@ Works whether you use `agy` CLI, Antigravity Desktop / IDE standalone, or both.
 
 ### Inside Antigravity Chat (`/stats` Zero-LLM Companion Plugin)
 
-Installing `agy-stats` automatically registers a top-level `/stats` command (`~/.gemini/config/skills/stats/SKILL.md`) backed by a `PreInvocation` hook (`~/.gemini/config/plugins/stats/hooks.json`) that executes in pure Python in ~50ms with **0 LLM tokens**:
+Installing `agy-stats` automatically registers a top-level `/stats` command (`~/.gemini/config/skills/stats/SKILL.md`) backed by a `PreInvocation` hook (`~/.gemini/config/plugins/stats/hooks.json`) that executes `./bin/agy-stats` in pure Python in ~50ms with **0 LLM tokens**:
 
 ```text
 /stats                # Immediately print your default window overview (5h by default, 0 LLM tokens)
@@ -77,7 +86,8 @@ Installing `agy-stats` automatically registers a top-level `/stats` command (`~/
 /stats 7d | 30d | all # Multi-day or all-time overview & daily bar chart
 /stats days           # 10-day daily token & weekly quota bar chart
 /stats set <range>    # Change what bare /stats prints by default (e.g. /stats set today)
-/stats web            # Launch detached Web Dashboard at http://localhost:3872
+/stats web            # Launch detached Web Dashboard at http://localhost:3872 (auto-closes 3m after tab closes)
+/stats web stop       # Immediately stop the background Web Dashboard server
 /stats onboard        # Interactive setup wizard (via LLM ask_question) to customize default view & sections
 ```
 

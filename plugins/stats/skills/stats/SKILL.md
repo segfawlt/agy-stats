@@ -5,7 +5,7 @@ description: Inspect live Antigravity quota pools, time-windowed token and reque
 
 # Antigravity Telemetry & Quota Slash Skill (`/stats`)
 
-Direct `/stats` commands (`/stats`, `/stats 5m`, `/stats 1h`, `/stats 5h`, `/stats 24h`, `/stats today`, `/stats 7d`, `/stats days`, `/stats all`, `/stats web`, `/stats set <range>`) are intercepted automatically in Python before the LLM is called (zero model tokens, ~50ms).
+Direct `/stats` commands (`/stats`, `/stats 5m`, `/stats 1h`, `/stats 5h`, `/stats 24h`, `/stats today`, `/stats 7d`, `/stats days`, `/stats all`, `/stats web`, `/stats web stop`, `/stats set <range>`) are intercepted automatically in Python before the LLM is called (zero model tokens, ~50ms).
 
 This skill is used in two cases:
 1. When the user runs `/stats onboard` (or `/stats setup` / `/stats settings`) to interactively configure their preferences using `ask_question`.
@@ -13,7 +13,7 @@ This skill is used in two cases:
 
 ## Command Routing
 
-Always invoke `~/.local/bin/agy-stats` directly via `run_command` (`WaitMsBeforeAsync: 5000`). Do not invoke the shell function `agy stats` inside non-interactive subshells.
+Always invoke `~/.gemini/config/plugins/stats/bin/agy-stats` directly via `run_command` (`WaitMsBeforeAsync: 5000`). Do not invoke the shell function `agy stats` inside non-interactive subshells.
 
 ### 1. Interactive Onboarding (`/stats onboard` or `/stats settings`)
 
@@ -36,14 +36,14 @@ Always invoke `~/.local/bin/agy-stats` directly via `run_command` (`WaitMsBefore
      - `"pacing — 6-day target & active burn pacing"`
 2. Extract the selected keys (e.g. `slash_range=5h` and `slash_sections=quota,kpis,chart,models,sessions`) and persist them via:
    ```bash
-   ~/.local/bin/agy-stats --settings slash_range=<mode> slash_sections=<comma_separated_keys>
+   ~/.gemini/config/plugins/stats/bin/agy-stats --settings slash_range=<mode> slash_sections=<comma_separated_keys>
    ```
-3. Run `~/.local/bin/agy-stats --slash <chosen_range>` and show the preview inside a fenced `text` code block.
+3. Run `~/.gemini/config/plugins/stats/bin/agy-stats --slash <chosen_range>` and show the preview inside a fenced `text` code block.
 
 ### 2. Natural-Language Telemetry Questions in Chat
 
-Supported arguments for `~/.local/bin/agy-stats --slash <arg>`:
+Supported arguments for `~/.gemini/config/plugins/stats/bin/agy-stats --slash <arg>`:
 - **Time ranges**: `5m`, `15m`, `30m`, `1h`, `5h`, `6h`, `today`, `24h`, `7d`, `days` (`10d`), `30d`, `all`, or any `<N>m` / `<N>h` / `<N>d`
-- **Focused views**: `quota`, `models`, `sessions`, `web`, `set <range>`
+- **Focused views**: `quota`, `models`, `sessions`, `web`, `web stop`, `set <range>`
 
-Run `~/.local/bin/agy-stats --slash <arg>` via `run_command` and present the stdout inside a fenced `text` code block (` ```text ... ``` `).
+Run `~/.gemini/config/plugins/stats/bin/agy-stats --slash <arg>` via `run_command` and present the stdout inside a fenced `text` code block (` ```text ... ``` `).

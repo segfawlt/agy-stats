@@ -1,7 +1,7 @@
 {
   "name": "stats",
   "displayName": "Antigravity Telemetry & Quota (/stats)",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Zero-LLM instant /stats slash commands (/stats, /stats 5m, /stats 1h, /stats 5h, /stats 24h, /stats today, /stats days), live quota pools, visual activity charts, and Web Dashboard launcher.",
   "author": {
     "name": "segfawlt",
@@ -18,15 +18,9 @@
     "analytics"
   ],
   "logo": "assets/logo.svg",
-  "assets": {
-    "logo": "./assets/logo.svg"
-  },
   "suggestedPrompts": [
     "/stats",
     "/stats 5h",
-    "/stats today",
-    "/stats days",
-    "/stats web",
-    "/stats onboard"
+    "/stats days"
   ]
 }

@@ -43,8 +43,7 @@ if (-not $PyExe) {
     throw "Python 3.8+ is required to run agy-stats. Install Python from https://www.python.org/downloads/windows/ and re-run."
 }
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$StageDir = Join-Path $InstallDir (".agy-stats-stage-" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
+$StageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("agy-stats-stage-" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
 
 try {
@@ -217,15 +216,13 @@ py_compile.compile(bin_path, cfile=bin_path + ".pyc", doraise=True)
         throw "Bytecode verification failed — aborting install."
     }
 
-    Move-Item -LiteralPath $TmpBin -Destination $TargetBin -Force
+    if ($PersistUrl) {
+        & $PyExe @PyArgs $TmpBin --install --update-url $PersistUrl @args
+    } else {
+        & $PyExe @PyArgs $TmpBin --install @args
+    }
 } finally {
     if (Test-Path -LiteralPath $StageDir) {
         Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-}
-
-if ($PersistUrl) {
-    & $PyExe @PyArgs $TargetBin --install --update-url $PersistUrl
-} else {
-    & $PyExe @PyArgs $TargetBin --install
 }

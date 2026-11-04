@@ -62,9 +62,8 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-mkdir -p "${INSTALL_DIR}"
-
-STAGE_DIR="$(mktemp -d "${INSTALL_DIR}/.agy-stats-stage.XXXXXX")"
+mkdir -p "${TMPDIR:-/tmp}"
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agy-stats-stage.XXXXXX")"
 cleanup() {
     rm -rf "${STAGE_DIR}"
 }
@@ -103,7 +102,7 @@ PYEOF
 PERSIST_URL_ARG=""
 if [ -n "${LOCAL_SOURCE}" ] && [ -z "${AGY_STATS_URL:-}" ]; then
     cp "${LOCAL_SOURCE}" "${TMP_BIN}"
-    printf "  • Copied local repository binary -> %s\n" "${TARGET_BIN}"
+    printf "  • Staged local repository binary (%s)\n" "${LOCAL_SOURCE}"
 else
     case "${SCRIPT_URL}" in
         https://*|file://*) ;;
@@ -250,13 +249,10 @@ fi
 python3 -c 'import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)' "${TMP_BIN}" "${STAGE_DIR}/check.pyc"
 
 chmod 755 "${TMP_BIN}"
-mv -f "${TMP_BIN}" "${TARGET_BIN}"
-cleanup
-trap - EXIT INT TERM
 
 # Configure shell wrappers & launch interactive onboarding wizard if on a TTY
 if [ -n "${PERSIST_URL_ARG}" ]; then
-    exec "${TARGET_BIN}" --install --update-url "${PERSIST_URL_ARG}"
+    python3 "${TMP_BIN}" --install --update-url "${PERSIST_URL_ARG}" "$@"
 else
-    exec "${TARGET_BIN}" --install
+    python3 "${TMP_BIN}" --install "$@"
 fi
