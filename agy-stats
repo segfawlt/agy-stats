@@ -347,6 +347,8 @@ def _read_config_with_status():
 
     if isinstance(cfg, dict):
         res["onboarded"] = _safe_bool(cfg.get("onboarded"), False)
+        if str(cfg.get("install_scope") or "").strip().lower() in ("both", "plugin"):
+            res["install_scope"] = str(cfg.get("install_scope")).strip().lower()
         raw_url = cfg.get("update_url")
         res["update_url"] = str(raw_url).strip() if raw_url is not None and str(raw_url).strip() else DEFAULT_UPDATE_URL
         res["auto_check_updates"] = _safe_bool(cfg.get("auto_check_updates"), True)
@@ -400,6 +402,10 @@ def save_config(updates):
         return cur
     if "onboarded" in updates:
         cur["onboarded"] = _safe_bool(updates["onboarded"], cur["onboarded"])
+    if "install_scope" in updates:
+        sc = str(updates["install_scope"] or "").strip().lower()
+        if sc in ("both", "plugin"):
+            cur["install_scope"] = sc
     if "update_url" in updates:
         u_val = str(updates["update_url"] or "").strip()
         cur["update_url"] = u_val if u_val else DEFAULT_UPDATE_URL
@@ -3443,9 +3449,11 @@ def _prompt_tty(prompt_str):
                 return line.rstrip("\r\n")
     except Exception:
         pass
-    if os.path.exists("/dev/tty"):
+    if not os.environ.get("AGY_NONINTERACTIVE") and sys.stdout.isatty() and os.path.exists("/dev/tty"):
         try:
             with open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
+                if _HAS_TERMIOS:
+                    termios.tcgetattr(tty_in.fileno())
                 tty_out.write(prompt_str)
                 tty_out.flush()
                 line = tty_in.readline()
@@ -4440,8 +4448,13 @@ def _open_raw_tty():
     if os.environ.get("AGY_NONINTERACTIVE"):
         return None
     if sys.stdin.isatty() and sys.stdout.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT):
+        if _HAS_TERMIOS:
+            try:
+                termios.tcgetattr(sys.stdin.fileno())
+            except Exception:
+                return None
         return (sys.stdin, sys.stdout, False)
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() and sys.stdout.isatty():
         try:
             rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
             if rlist:
@@ -4449,13 +4462,35 @@ def _open_raw_tty():
         except Exception:
             pass
         if _HAS_TERMIOS and os.path.exists("/dev/tty"):
+            t_in = None
+            t_out = None
             try:
                 t_in = open("/dev/tty", "r")
                 t_out = open("/dev/tty", "w")
+                termios.tcgetattr(t_in.fileno())
                 return (t_in, t_out, True)
-            except OSError:
+            except Exception:
+                for fh in (t_in, t_out):
+                    if fh is not None:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
                 return None
     return None
+
+def _has_interactive_tty():
+    raw_tty = _open_raw_tty()
+    if raw_tty is None:
+        return False
+    tty_in, tty_out, should_close = raw_tty
+    if should_close:
+        for fh in (tty_in, tty_out):
+            try:
+                fh.close()
+            except Exception:
+                pass
+    return True
 
 def _read_tty_key(tty_in):
     if _HAS_MSVCRT and not _HAS_TERMIOS:
@@ -5218,6 +5253,9 @@ def handle_settings_cli(args_list):
         k, v = k.strip().lower(), v.strip()
         if k in ("onboarded", "onboard"):
             updates["onboarded"] = v.lower() in ("1", "true", "yes", "on")
+        elif k in ("install_scope", "scope"):
+            if v.lower() in ("both", "plugin", "plugin-only"):
+                updates["install_scope"] = "plugin" if v.lower().startswith("plugin") else "both"
         elif k in ("update_url", "repo_url"):
             updates["update_url"] = v
         elif k in ("auto_check_updates", "check_updates"):
@@ -10253,6 +10291,8 @@ def main():
     parser.add_argument("--onboard", "--setup", action="store_true", dest="onboard", help="Run interactive step-by-step onboarding setup wizard")
     parser.add_argument("--install", action="store_true", help="Install agy-stats to ~/.local/bin and/or Antigravity /stats plugin")
     parser.add_argument("--plugin-only", action="store_true", dest="plugin_only", help="During --install, install only the self-contained Antigravity /stats plugin (no ~/.local/bin binary)")
+    parser.add_argument("--both", action="store_true", dest="both_scope", help="During --install, install both the Antigravity /stats plugin and ~/.local/bin/agy-stats CLI")
+    parser.add_argument("-y", "--yes", "--non-interactive", action="store_true", dest="non_interactive", help="Run --install non-interactively with sensible defaults (no TTY prompts)")
     parser.add_argument("--update-url", default=None, help="Persist update source URL during --install")
     parser.add_argument("--update", nargs="?", const="", default=None, metavar="URL", help="Verified atomic self-update (optional source URL)")
     parser.add_argument("--check-update", action="store_true", help="Check if a newer version is available without updating")
@@ -10289,17 +10329,23 @@ def main():
     cfg = load_config()
 
     if args.install:
-        has_tty = sys.stdin.isatty() or (os.path.exists("/dev/tty") and not os.environ.get("AGY_NONINTERACTIVE"))
+        non_interactive = bool(args.non_interactive or os.environ.get("AGY_NONINTERACTIVE"))
+        has_tty = False if non_interactive else _has_interactive_tty()
         if args.plugin_only:
             use_plugin_only = True
-        elif has_tty and not os.environ.get("AGY_NONINTERACTIVE"):
+        elif args.both_scope:
+            use_plugin_only = False
+        elif has_tty:
             use_plugin_only = (prompt_install_scope(cfg) == "plugin")
         else:
-            use_plugin_only = False
+            use_plugin_only = (cfg.get("install_scope") == "plugin")
         install_shell_integration(verbose=True, update_url=args.update_url, plugin_only=use_plugin_only)
         cfg = load_config()
-        if not cfg.get("onboarded", False) and has_tty and not use_plugin_only:
-            cfg = run_onboarding_wizard(cfg)
+        if not cfg.get("onboarded", False):
+            if has_tty and not use_plugin_only:
+                cfg = run_onboarding_wizard(cfg)
+            else:
+                save_config({"onboarded": True})
         return
 
     if args.onboard:

@@ -417,7 +417,7 @@ fi
 sign_and_verify
 
 if [ -x "${HOME}/.local/bin/agy-stats" ] && [ -x "./install.sh" ]; then
-    ./install.sh < /dev/null >/dev/null
+    ./install.sh --yes >/dev/null
     echo "  • Synced local binary -> ${HOME}/.local/bin/agy-stats (v${NEXT_VERSION})"
 fi
 

@@ -37,7 +37,7 @@ You can choose between:
 curl -fsSL https://github.com/segfawlt/agy-stats/releases/latest/download/install.sh | sh
 ```
 
-*(To install Plugin Only non-interactively: `curl -fsSL https://github.com/segfawlt/agy-stats/releases/latest/download/install.sh | sh -s -- --plugin-only`)*
+*(Non-interactive flags: pass `sh -s -- --yes` for Both with defaults, or `sh -s -- --plugin-only --yes` for Plugin Only)*
 
 #### Windows PowerShell `(Untested)`
 
@@ -45,7 +45,7 @@ curl -fsSL https://github.com/segfawlt/agy-stats/releases/latest/download/instal
 irm https://github.com/segfawlt/agy-stats/releases/latest/download/install.ps1 | iex
 ```
 
-*(To install Plugin Only non-interactively: `& { $h = irm https://github.com/segfawlt/agy-stats/releases/latest/download/install.ps1; Invoke-Expression "& { $h } --plugin-only" }`)*
+*(Non-interactive flags: `& { $h = irm https://github.com/segfawlt/agy-stats/releases/latest/download/install.ps1; Invoke-Expression "& { $h } --yes" }` or `--plugin-only --yes`)*
 
 ### Option B: Install from Local Git Checkout
 
@@ -53,10 +53,11 @@ irm https://github.com/segfawlt/agy-stats/releases/latest/download/install.ps1 |
 git clone https://github.com/segfawlt/agy-stats.git
 cd agy-stats
 ./install.sh                  # Interactive prompt: choose Both (CLI + Plugin) or Plugin Only
-./install.sh --plugin-only    # Or install only the self-contained /stats plugin (no ~/.local/bin)
+./install.sh --yes            # Non-interactive install: Both (CLI + Plugin) with sensible defaults
+./install.sh --plugin-only    # Self-contained /stats plugin only (no ~/.local/bin)
 ```
 
-*(On Windows PowerShell `(Untested)`: `.\install.ps1` or `.\install.ps1 --plugin-only`)*
+*(On Windows PowerShell `(Untested)`: `.\install.ps1`, `.\install.ps1 --yes`, or `.\install.ps1 --plugin-only`)*
 
 ### Option C: Standalone Antigravity Plugin Manager (`agy plugin install`)
 
@@ -65,6 +66,23 @@ agy plugin install ./plugins/stats
 ```
 
 When installed via `agy plugin install`, the executable lives strictly inside `~/.gemini/config/plugins/stats/bin/agy-stats` and never writes to `~/.local/bin` or your shell configuration files. The plugin passes `agy plugin validate plugins/stats --strict` with 0 warnings.
+
+### Option D: Install via Antigravity Agent (Copy-Paste Prompt)
+
+Paste this into any Antigravity session to have the agent ask your preferences and install `agy-stats` non-interactively:
+
+```text
+Install agy-stats for me:
+1. First, call ask_question with 2 questions:
+   - "How would you like to install agy-stats?" -> "(Recommended) Both — /stats Plugin + agy stats CLI", "Plugin Only — ~/.gemini/config/plugins/stats/ only (no ~/.local/bin)"
+   - "What should bare /stats print by default?" -> "(Recommended) 5h — Active 5-hour quota window", "today — Since midnight", "24h — Last 24 hours", "7d — Last 7 days", "days — 10-day daily ledger", "web — Launch Web Dashboard"
+2. Run the verified installer non-interactively via run_command:
+   - If Both: curl -fsSL https://github.com/segfawlt/agy-stats/releases/latest/download/install.sh | sh -s -- --both --yes
+   - If Plugin Only: curl -fsSL https://github.com/segfawlt/agy-stats/releases/latest/download/install.sh | sh -s -- --plugin-only --yes
+3. Apply the chosen default view and print a live preview:
+   ~/.gemini/config/plugins/stats/bin/agy-stats --settings slash_range=<chosen_range>
+   ~/.gemini/config/plugins/stats/bin/agy-stats --slash <chosen_range>
+```
 
 ### Exact User-Space Footprint
 
