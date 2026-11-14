@@ -223,6 +223,24 @@ MODEL_QUOTA_WEIGHTS = {
     "other":              (0.35,  2.00, 0.035),
 }
 
+# Pool-level quota weight calibration: server /usage deltas during dedicated
+# model windows directly scale the estimated units so the "This setup" pacing
+# converges on server truth (see _update_weight_calibration).
+WEIGHT_SCALES_FILE = os.path.expanduser("~/.config/agy-stats/weight_scales.json")
+_WEIGHT_SCALES = {}
+_WEIGHT_SCALE_LOCK = threading.Lock()
+_WEIGHT_SCALE_STATE = {"last_update_ts": 0.0}
+try:
+    with open(WEIGHT_SCALES_FILE, "r", encoding="utf-8") as _wsf:
+        _ws_data = json.load(_wsf)
+    if isinstance(_ws_data.get("scales"), dict):
+        _WEIGHT_SCALES = {str(k): float(v) for k, v in _ws_data["scales"].items()
+                          if isinstance(v, (int, float)) and 0.25 <= float(v) <= 15.0}
+    if isinstance(_ws_data.get("state"), dict):
+        _WEIGHT_SCALE_STATE.update(_ws_data["state"])
+except Exception:
+    pass
+
 def compute_quota_units(model_name, inp, out, cache):
     ml = (model_name or "").lower()
     if "orchestrator" in ml:
@@ -256,7 +274,8 @@ def compute_quota_units(model_name, inp, out, cache):
         w = MODEL_QUOTA_WEIGHTS["gpt_oss"]
     else:
         w = MODEL_QUOTA_WEIGHTS["other"]
-    return (inp * w[0] + out * w[1] + cache * w[2]) / 1_000_000.0
+    scale = _WEIGHT_SCALES.get("3p" if _is_3p_model(model_name) else "gemini", 1.0)
+    return (inp * w[0] + out * w[1] + cache * w[2]) * scale / 1_000_000.0
 
 def units_to_pct_5h(u, digits=2, is_3p=False):
     ratio = get_pool_burst_to_wk_pct("3p" if is_3p else "gemini") / 100.0
@@ -708,6 +727,71 @@ def _project_reset_ms(reset_ms, period_ms, now_ms):
 def _is_3p_model(model_name):
     ml = (model_name or "").lower()
     return ("claude" in ml) or ("opus" in ml) or ("sonnet" in ml) or ("haiku" in ml) or ("gpt" in ml) or ("openai" in ml)
+
+def _update_weight_calibration(all_requests, quota_pools, now):
+    """Guarded pool-level quota-weight calibration from the server's own 5h delta.
+
+    Compares the server-reported gemini 5h burn since cycle start against the
+    locally estimated units for the same window and blends a multiplicative
+    scale into _WEIGHT_SCALES["gemini"] so "This setup" pacing converges on
+    server truth even when the Orchestrator-era metering differs from the
+    pre-calibrated model weights. Guards: >=30m elapsed in cycle, >=8% server
+    burn, measured ratio clamped to [0.25, 15], one update per 10 minutes.
+    Dedicated Orchestrator (Carbon/Argon) sessions therefore self-calibrate."""
+    if not all_requests or not quota_pools:
+        return
+    gem5 = next((q for q in quota_pools if q.get("id") == "gemini-5h"), None)
+    if not gem5 or gem5.get("disabled"):
+        return
+    rem = gem5.get("remaining_fraction")
+    reset_raw = gem5.get("resetTime")
+    if not isinstance(rem, (int, float)) or not reset_raw:
+        return
+    now_ms = int(now * 1000)
+    period_5h_ms = 5 * 3600 * 1000
+    fh_reset_ms = _project_reset_ms(parse_iso_ms(reset_raw), period_5h_ms, now_ms)
+    if not fh_reset_ms:
+        return
+    cycle_start = fh_reset_ms - period_5h_ms
+    elapsed_min = (now_ms - cycle_start) / 60000.0
+    if elapsed_min < 30.0:
+        return
+    server_used = 1.0 - float(rem)
+    if server_used < 0.08:
+        return
+    setup_units = 0.0
+    for r in all_requests:
+        if r["ts"] < cycle_start or _is_3p_model(r["model"]):
+            continue
+        setup_units += r["units"]
+    if setup_units <= 0:
+        return
+    with _WEIGHT_SCALE_LOCK:
+        if now - float(_WEIGHT_SCALE_STATE.get("last_update_ts", 0.0) or 0.0) < 600.0:
+            return
+        setup_pct = units_to_pct_5h(setup_units, 4)
+        if setup_pct <= 0.001:
+            return
+        measured = (server_used * 100.0) / setup_pct
+        if not (0.25 <= measured <= 15.0):
+            return
+        old = float(_WEIGHT_SCALES.get("gemini", 1.0))
+        proposed = max(0.25, min(15.0, old * measured))
+        new = round(max(0.25, min(15.0, old * 0.5 + proposed * 0.5)), 4)
+        _WEIGHT_SCALES["gemini"] = new
+        _WEIGHT_SCALE_STATE["last_update_ts"] = now
+        hist = _WEIGHT_SCALE_STATE.setdefault("history", [])
+        hist.append({
+            "ts": round(now, 1),
+            "measured": round(measured, 3),
+            "scale": new,
+            "server_pct": round(server_used * 100.0, 2),
+            "setup_pct": round(setup_pct, 3),
+            "elapsed_min": round(elapsed_min),
+            "requests": sum(1 for r in all_requests if r["ts"] >= cycle_start and not _is_3p_model(r["model"]))
+        })
+        _WEIGHT_SCALE_STATE["history"] = hist[-20:]
+        _atomic_write_json(WEIGHT_SCALES_FILE, {"scales": _WEIGHT_SCALES, "state": _WEIGHT_SCALE_STATE})
 
 _LAST_QUOTA_REFRESH_ATTEMPT = 0.0
 _RECENT_SERVER_RATES = {}
@@ -2047,6 +2131,10 @@ def load_raw_telemetry(force=False):
         }
 
     quota_pools = fetch_live_quota()
+    try:
+        _update_weight_calibration(all_requests, quota_pools, now)
+    except Exception:
+        pass
     elapsed_ms = int((time.time() - t0) * 1000)
 
     _TELEMETRY_CACHE = {
@@ -2973,6 +3061,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "sessions": sessions_list,
         "quota": effective_quota_list,
         "reconciliation": telemetry.get("reconciliation"),
+        "weight_scales": dict(_WEIGHT_SCALES),
         "today": {
             "date": today_str,
             **today_entry

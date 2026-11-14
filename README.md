@@ -147,6 +147,8 @@ agy-stats attributes every request to the model that actually served it — incl
 
 Token totals are **DB-authoritative**: the `conversations/*.db` databases (`gen_metadata` / `steps` protobuf rows) carry identity-keyed usage that lets retries, step mirrors, and source copies be merged instead of double-counted, and restores days whose transcript records were compacted. Transcripts remain the source for latency, tools, errors, and frustration signals, and act as fallback when a database is unreadable. Run `agy stats --json` and inspect the `reconciliation` block to see the per-day before/after of that alignment.
 
+Quota pacing is **self-calibrating**: whenever the current 5-hour window has burned at least 8% server-side (and 30+ minutes have elapsed), the estimated units are compared against the server's own `/usage` delta and a guarded multiplicative scale (clamped, EMA-smoothed, one update per 10 minutes) is persisted to `~/.config/agy-stats/weight_scales.json` — so dedicated Orchestrator sessions automatically pull the "This setup" pacing onto server truth. Inspect `weight_scales` in `--json` output to see the current factor and its measurement history.
+
 ### Onboarding, Preferences & Maintenance
 
 ```sh
