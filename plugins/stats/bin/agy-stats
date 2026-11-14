@@ -199,8 +199,17 @@ def get_pool_burst_to_wk_pct(pool_key="gemini"):
 
 MODEL_QUOTA_WEIGHTS = {
     # (input_per_1M, output_per_1M, cache_read_per_1M)
+    # Orchestrator / Carbon / Hydrogen tiers are initial estimates pending
+    # /usage delta calibration; pool-level pacing stays server-anchored.
+    "carbon_high":        (0.52,  4.20, 0.052),
+    "carbon_med":         (0.45,  3.60, 0.045),
+    "orch_argon":         (0.38,  3.04, 0.038),
+    "orch_carbon":        (0.45,  3.60, 0.045),
     "argon_high":         (0.45,  3.60, 0.045),
     "argon_med":          (0.38,  3.04, 0.038),
+    "hydrogen_high":      (0.30,  2.40, 0.030),
+    "hydrogen_med":       (0.20,  1.60, 0.020),
+    "hydrogen_low":       (0.10,  0.80, 0.010),
     "flash_high":         (0.30,  2.40, 0.030),
     "flash_med":          (0.20,  1.60, 0.020),
     "flash_low":          (0.10,  0.80, 0.010),
@@ -216,7 +225,13 @@ MODEL_QUOTA_WEIGHTS = {
 
 def compute_quota_units(model_name, inp, out, cache):
     ml = (model_name or "").lower()
-    if "argon (high)" in ml or "pro (high)" in ml:
+    if "orchestrator" in ml:
+        w = MODEL_QUOTA_WEIGHTS["orch_carbon"] if "carbon" in ml else MODEL_QUOTA_WEIGHTS["orch_argon"]
+    elif "carbon" in ml:
+        w = MODEL_QUOTA_WEIGHTS["carbon_high"] if "high" in ml else MODEL_QUOTA_WEIGHTS["carbon_med"]
+    elif "hydrogen" in ml:
+        w = MODEL_QUOTA_WEIGHTS["hydrogen_high"] if "high" in ml else (MODEL_QUOTA_WEIGHTS["hydrogen_low"] if "low" in ml else MODEL_QUOTA_WEIGHTS["hydrogen_med"])
+    elif "argon (high)" in ml or "pro (high)" in ml:
         w = MODEL_QUOTA_WEIGHTS["argon_high"]
     elif "argon" in ml or "pro" in ml:
         w = MODEL_QUOTA_WEIGHTS["argon_med"]
@@ -860,10 +875,50 @@ WORKER_WORKSPACE_RE = re.compile(r"^Workspace:\s*(.+?)\s*$", re.MULTILINE)
 WORKER_LEGACY_HDR_RE = re.compile(r"Watched Session Role:\s*`([^`]+)`\s*\(`([0-9a-fA-F]{8,})`\)")
 INTERNAL_SUBAGENTS_PATH = os.path.expanduser("~/.agents/internal_subagents.json")
 
-def _map_model_slug_to_display(mod):
-    ml = (mod or "").strip().lower()
-    if not ml or ml == "inherit":
+# Central model identity map: raw transcript slugs / registry slugs -> canonical display names.
+# Orchestrator tiers and Hydrogen landed Nov 2026; the generic orchestrator slug
+# ("gemini-pro-orchestrator", verified via cli.log "Orchestrator (Carbon)" correlation)
+# is the Carbon tier; "-argon" is the Argon tier.
+_MODEL_DISPLAY_EXACT = {
+    "gemini-pro-orchestrator": "Orchestrator (Carbon)",
+    "gemini-pro-orchestrator-carbon": "Orchestrator (Carbon)",
+    "gemini-pro-orchestrator-argon": "Orchestrator (Argon)",
+    "gemini-4-carbon-high": "Gemini 4 Carbon (High)",
+    "gemini-4-carbon-medium": "Gemini 4 Carbon (Medium)",
+    "gemini-4-carbon": "Gemini 4 Carbon (Medium)",
+    "gemini-4-hydrogen-high": "Gemini 4 Hydrogen (High)",
+    "gemini-4-hydrogen-medium": "Gemini 4 Hydrogen (Medium)",
+    "gemini-4-hydrogen-low": "Gemini 4 Hydrogen (Low)",
+    "gemini-4-argon-high": "Gemini 4 Argon (High)",
+    "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
+    "gemini-4-argon": "Gemini 4 Argon (Medium)",
+    "gemini-flash-worker-agy": "Gemini Flash Worker (internal)",
+    "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
+    "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
+    "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
+}
+
+def normalize_model_display(mod):
+    """Canonicalize any raw slug or picker label to the agy-stats display name (None if unknown)."""
+    s = str(mod or "").strip()
+    if not s or s.lower() == "inherit":
         return None
+    ml = s.lower()
+    hit = _MODEL_DISPLAY_EXACT.get(ml)
+    if hit:
+        return hit
+    if "orchestrator" in ml:
+        return "Orchestrator (Carbon)" if "carbon" in ml else "Orchestrator (Argon)"
+    if "carbon" in ml:
+        return "Gemini 4 Carbon (High)" if "high" in ml else "Gemini 4 Carbon (Medium)"
+    if "hydrogen" in ml:
+        if "low" in ml:
+            return "Gemini 4 Hydrogen (Low)"
+        if "high" in ml:
+            return "Gemini 4 Hydrogen (High)"
+        return "Gemini 4 Hydrogen (Medium)"
+    if "worker" in ml:
+        return "Gemini Flash Worker (internal)"
     if "argon" in ml or ml == "pro" or "pro-" in ml:
         return "Gemini 4 Argon (High)" if ("high" in ml or ml == "pro") else "Gemini 4 Argon (Medium)"
     if "flash_lite" in ml or ("flash" in ml and "low" in ml):
@@ -885,6 +940,9 @@ def _map_model_slug_to_display(mod):
     if "gpt" in ml:
         return "GPT-OSS 120B (Medium)"
     return None
+
+def _map_model_slug_to_display(mod):
+    return normalize_model_display(mod)
 
 def _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, internal_worker_cids=None, visited=None):
     if visited is None:
@@ -916,6 +974,465 @@ def _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, inter
     if is_iw:
         return "Gemini 4 Argon (High)"
     return "Gemini 4 Argon (Medium)"
+
+# ---------------------------------------------------------------------------
+# gen_metadata / steps token authority (conversations/*.db)
+#
+# Each conversation DB carries protobuf-encoded generation metadata whose
+# token buckets mirror the transcript records — but with identity keys
+# (response_id / provider message id) that let retry, step, and source-copy
+# duplicates be merged instead of double-counted. The DB is treated as the
+# token source of truth; transcripts remain the source for latency, tools,
+# errors, and frustration signals, and as fallback when a DB is unreadable.
+# Protobuf field numbers mirror the Antigravity schema (gen_metadata.data:
+# field 1 = chat model {4: usage, 17: retry_info, 9: gen_info ts, 19/21: model},
+# field 2 = packed step indices; steps.metadata: 9: usage, 28: retry_info,
+# 24: model_info, 8/1: ts; ModelUsage: 2 in, 3 total_out, 4 cache_w, 5 cache_r,
+# 9 reasoning, 10 visible_out, 7/11/12 message/response/provider ids).
+
+def _proto_decode_fields(blob):
+    """Decode one protobuf message into a list of (field_number, value) tuples."""
+    fields = []
+    i, n = 0, len(blob)
+    while i < n:
+        tag = 0
+        shift = 0
+        while True:
+            b = blob[i]
+            i += 1
+            tag |= (b & 0x7F) << shift
+            if not (b & 0x80):
+                break
+            shift += 7
+            if shift > 63:
+                raise ValueError("protobuf varint overflow")
+        fnum = tag >> 3
+        wire = tag & 7
+        if wire == 0:
+            val = 0
+            shift = 0
+            while True:
+                b = blob[i]
+                i += 1
+                val |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    break
+                shift += 7
+                if shift > 63:
+                    raise ValueError("protobuf varint overflow")
+            fields.append((fnum, val))
+        elif wire == 1:
+            fields.append((fnum, bytes(blob[i:i + 8])))
+            i += 8
+        elif wire == 2:
+            ln = 0
+            shift = 0
+            while True:
+                b = blob[i]
+                i += 1
+                ln |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    break
+                shift += 7
+                if shift > 63:
+                    raise ValueError("protobuf length overflow")
+            fields.append((fnum, bytes(blob[i:i + ln])))
+            i += ln
+        elif wire == 5:
+            fields.append((fnum, bytes(blob[i:i + 4])))
+            i += 4
+        else:
+            raise ValueError("unsupported protobuf wire type")
+    return fields
+
+def _proto_bytes(fields, num):
+    for f, v in fields:
+        if f == num and isinstance(v, (bytes, bytearray)):
+            return bytes(v)
+    return None
+
+def _proto_varint(fields, num):
+    val = None
+    for f, v in fields:
+        if f == num and isinstance(v, int):
+            val = v
+    return val
+
+def _proto_text(fields, num):
+    b = _proto_bytes(fields, num)
+    if b is None:
+        return None
+    try:
+        t = b.decode("utf-8").strip()
+        return t or None
+    except Exception:
+        return None
+
+def _proto_ts_ms(blob):
+    """Parse a protobuf Timestamp message ({1: seconds, 2: nanos}) to epoch ms."""
+    if not blob:
+        return None
+    try:
+        fields = _proto_decode_fields(blob)
+    except Exception:
+        return None
+    secs = _proto_varint(fields, 1)
+    if not secs or secs <= 0:
+        return None
+    nanos = _proto_varint(fields, 2) or 0
+    return secs * 1000 + (nanos // 1_000_000)
+
+def _proto_model_usage(blob):
+    """Parse a ModelUsage protobuf message into a plain dict."""
+    fields = _proto_decode_fields(blob)
+    return {
+        "model_id": _proto_varint(fields, 1) or 0,
+        "input": _proto_varint(fields, 2) or 0,
+        "total_output": _proto_varint(fields, 3) or 0,
+        "cache_write": _proto_varint(fields, 4) or 0,
+        "cache_read": _proto_varint(fields, 5) or 0,
+        "message_id": _proto_text(fields, 7),
+        "reasoning": _proto_varint(fields, 9) or 0,
+        "visible_output": _proto_varint(fields, 10) or 0,
+        "response_id": _proto_text(fields, 11),
+        "provider_msg_id": _proto_text(fields, 12),
+    }
+
+def _mu_identity_keys(mu):
+    keys = []
+    if mu.get("response_id"):
+        keys.append("response:" + mu["response_id"])
+    if mu.get("provider_msg_id"):
+        keys.append("provider:" + mu["provider_msg_id"])
+    if mu.get("message_id"):
+        keys.append("message:" + mu["message_id"])
+    return keys
+
+def _mu_same_counts(a, b):
+    return all(a[k] == b[k] for k in ("model_id", "input", "total_output", "cache_write", "cache_read", "reasoning", "visible_output"))
+
+def _mu_is_mirror(mu, primary):
+    p_keys = _mu_identity_keys(primary)
+    return _mu_same_counts(mu, primary) and all(k in p_keys for k in _mu_identity_keys(mu))
+
+def _mu_token_bearing(mu):
+    return bool(mu["input"] or mu["total_output"] or mu["cache_write"] or mu["cache_read"] or mu["reasoning"] or mu["visible_output"])
+
+def _mu_event(mu, model_text, ts_ms, ts_rank, fallback_identities):
+    """Convert a ModelUsage into an agy-stats token event (in/out/cache buckets)."""
+    total_output = max(mu["total_output"], mu["visible_output"] + mu["reasoning"])
+    return {
+        "in": mu["input"],
+        "out": total_output,
+        "cache": mu["cache_read"],
+        "total": mu["input"] + mu["cache_write"] + mu["cache_read"] + total_output,
+        "model": normalize_model_display(model_text),
+        "ts": ts_ms,
+        "ts_rank": ts_rank,
+        "identities": _mu_identity_keys(mu) or list(fallback_identities),
+    }
+
+def _merge_db_event(target, dup):
+    """Merge a duplicate event into its target: max() per bucket, best model/ts wins."""
+    for k in ("in", "out", "cache", "total"):
+        target[k] = max(target[k], dup[k])
+    if dup.get("model") and not target.get("model"):
+        target["model"] = dup["model"]
+    if (dup.get("ts_rank", 0) > target.get("ts_rank", 0)
+            or (dup.get("ts_rank", 0) == target.get("ts_rank", 0) and (dup.get("ts") or 0) < (target.get("ts") or 0))):
+        target["ts"] = dup.get("ts")
+        target["ts_rank"] = dup.get("ts_rank", 0)
+    for k in dup["identities"]:
+        if k not in target["identities"]:
+            target["identities"].append(k)
+
+def _dedup_db_events(events):
+    """Merge events sharing any identity key, then fold unkeyed mirror copies
+    with identical model + token counts (step/source duplicates)."""
+    slots = []
+    identity_idx = {}
+    for ev in events:
+        matches = sorted({identity_idx[k] for k in ev["identities"] if k in identity_idx})
+        if not matches:
+            for k in ev["identities"]:
+                identity_idx[k] = len(slots)
+            slots.append(ev)
+            continue
+        tgt = slots[matches[0]]
+        for extra in matches[1:]:
+            other = slots[extra]
+            if other is not None:
+                _merge_db_event(tgt, other)
+                slots[extra] = None
+        _merge_db_event(tgt, ev)
+    merged = [s for s in slots if s is not None]
+    folded = []
+    unkeyed = []
+    for ev in merged:
+        if not ev["identities"]:
+            hit = next((t for t in unkeyed
+                        if t["model"] == ev["model"] and t["in"] == ev["in"]
+                        and t["out"] == ev["out"] and t["cache"] == ev["cache"]), None)
+            if hit:
+                _merge_db_event(hit, ev)
+                continue
+            unkeyed.append(ev)
+        folded.append(ev)
+    return folded
+
+def _parse_gen_row(blob):
+    """Parse one gen_metadata.data protobuf row -> (usage, retries, model_text, ts_ms)."""
+    root = _proto_decode_fields(blob)
+    chat = _proto_bytes(root, 1)
+    if chat is None:
+        return None
+    cf = _proto_decode_fields(chat)
+    usage = None
+    usage_b = _proto_bytes(cf, 4)
+    if usage_b:
+        try:
+            usage = _proto_model_usage(usage_b)
+        except Exception:
+            usage = None
+    retries = []
+    for f, v in cf:
+        if f == 17 and isinstance(v, (bytes, bytearray)):
+            try:
+                rf = _proto_decode_fields(bytes(v))
+                rb = _proto_bytes(rf, 2)
+                if rb:
+                    retries.append(_proto_model_usage(rb))
+            except Exception:
+                pass
+    if usage is not None:
+        for i, r in enumerate(retries):
+            if _mu_is_mirror(r, usage):
+                retries.pop(i)
+                break
+    ts = None
+    gen_info = _proto_bytes(cf, 9)
+    if gen_info:
+        try:
+            ts = _proto_ts_ms(_proto_bytes(_proto_decode_fields(gen_info), 4))
+        except Exception:
+            ts = None
+    model = _proto_text(cf, 19) or _proto_text(cf, 21)
+    return {"usage": usage, "retries": retries, "model": model, "ts": ts}
+
+def _parse_step_row(blob):
+    """Parse one steps.metadata protobuf -> (usage, retries, model_text, ts_ms)."""
+    fields = _proto_decode_fields(blob)
+    usage = None
+    ub = _proto_bytes(fields, 9)
+    if ub:
+        try:
+            usage = _proto_model_usage(ub)
+        except Exception:
+            usage = None
+    retries = []
+    for f, v in fields:
+        if f == 28 and isinstance(v, (bytes, bytearray)):
+            try:
+                rf = _proto_decode_fields(bytes(v))
+                rb = _proto_bytes(rf, 2)
+                if rb:
+                    retries.append(_proto_model_usage(rb))
+            except Exception:
+                pass
+    if usage is not None:
+        for i, r in enumerate(retries):
+            if _mu_is_mirror(r, usage):
+                retries.pop(i)
+                break
+    model = None
+    mi_b = _proto_bytes(fields, 24)
+    if mi_b:
+        try:
+            mf = _proto_decode_fields(mi_b)
+            model = _proto_text(mf, 12) or _proto_text(mf, 8)
+        except Exception:
+            model = None
+    ts = _proto_ts_ms(_proto_bytes(fields, 8)) or _proto_ts_ms(_proto_bytes(fields, 1))
+    return {"usage": usage, "retries": retries, "model": model, "ts": ts}
+
+def _db_events_for_row(row, cid, kind, idx, traj_ts, mtime_ms):
+    """Yield token events for a parsed DB row's primary usage + retry usages."""
+    if row is None:
+        return []
+    ts = row["ts"] or traj_ts
+    rank = 2 if row["ts"] else (1 if traj_ts else 0)
+    fb = [f"syn:{cid}:{kind}:{idx}:{n}" for n in range(3)]
+    events = []
+    for mu in [row["usage"]] + row["retries"]:
+        if mu is None:
+            continue
+        events.append(_mu_event(mu, row["model"], ts, rank, fb))
+    return [e for e in events if (e["in"] or e["out"] or e["cache"])]
+
+_CONV_DB_CACHE = {"ts": 0.0, "by_cid": None, "by_cid_day": None, "meta": {}}
+
+def _load_conv_db_tokens(force=False):
+    """Authoritative per-conversation token totals from conversations/*.db.
+
+    Returns ({cid: {"in","out","cache","total","events"}},
+             {cid: {local_date: {"in","out","cache","total","units"}}},
+             meta dict). Sessions without a readable/token-bearing DB are
+    simply absent (transcript fallback)."""
+    now = time.time()
+    if not force and _CONV_DB_CACHE["by_cid"] is not None and (now - _CONV_DB_CACHE["ts"] < 30):
+        return _CONV_DB_CACHE["by_cid"], _CONV_DB_CACHE["by_cid_day"], _CONV_DB_CACHE["meta"]
+    by_cid = {}
+    by_cid_day = {}
+    dbs_parsed = 0
+    dbs_skipped = 0
+    total_events = 0
+    for root in _discover_agy_roots():
+        for dbp in glob.glob(os.path.join(root, "conversations", "*.db")):
+            cid = os.path.splitext(os.path.basename(dbp))[0]
+            if not _VALID_CID_RE.match(cid):
+                continue
+            try:
+                conn = sqlite3.connect("file:%s?mode=ro" % dbp, uri=True)
+                try:
+                    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if "gen_metadata" not in tables:
+                        continue
+                    traj_ts = None
+                    if "trajectory_metadata_blob" in tables:
+                        for (tblob,) in conn.execute("SELECT data FROM trajectory_metadata_blob ORDER BY rowid ASC"):
+                            try:
+                                traj_ts = _proto_ts_ms(_proto_bytes(_proto_decode_fields(tblob if isinstance(tblob, bytes) else bytes(tblob or b"")), 2))
+                            except Exception:
+                                traj_ts = None
+                            if traj_ts:
+                                break
+                    try:
+                        mtime_ms = int(os.path.getmtime(dbp) * 1000)
+                    except OSError:
+                        mtime_ms = int(now * 1000)
+                    events = []
+                    last_model = None
+                    for kind, query in (
+                        ("gen", "SELECT idx, data FROM gen_metadata ORDER BY idx ASC"),
+                        ("step", "SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC" if "steps" in tables else None),
+                    ):
+                        if query is None:
+                            continue
+                        for (idx, blob) in conn.execute(query):
+                            if not blob:
+                                continue
+                            try:
+                                row = _parse_gen_row(blob if isinstance(blob, bytes) else bytes(blob)) if kind == "gen" else _parse_step_row(blob if isinstance(blob, bytes) else bytes(blob))
+                            except Exception:
+                                continue
+                            if row is None:
+                                continue
+                            if row["model"]:
+                                last_model = row["model"]
+                            if row["model"] is None and last_model:
+                                row["model"] = last_model
+                            events.extend(_db_events_for_row(row, cid, kind, idx, traj_ts, mtime_ms))
+                    for ev in events:
+                        if not ev.get("ts"):
+                            ev["ts"] = traj_ts or mtime_ms
+                            ev["ts_rank"] = 0
+                    deduped = _dedup_db_events(events)
+                    if not deduped:
+                        continue
+                    agg = by_cid.setdefault(cid, {"in": 0, "out": 0, "cache": 0, "total": 0, "events": 0})
+                    day_map = by_cid_day.setdefault(cid, {})
+                    for ev in deduped:
+                        agg["in"] += ev["in"]
+                        agg["out"] += ev["out"]
+                        agg["cache"] += ev["cache"]
+                        agg["total"] += ev["total"]
+                        agg["events"] += 1
+                        try:
+                            ev_day = datetime.fromtimestamp(ev["ts"] / 1000).astimezone().strftime("%Y-%m-%d") if ev.get("ts") else ""
+                        except (OSError, OverflowError, ValueError):
+                            ev_day = ""
+                        if ev_day:
+                            dv = day_map.setdefault(ev_day, {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0})
+                            dv["in"] += ev["in"]
+                            dv["out"] += ev["out"]
+                            dv["cache"] += ev["cache"]
+                            dv["total"] += ev["total"]
+                            dv["units"] += compute_quota_units(ev["model"], ev["in"], ev["out"], ev["cache"])
+                    total_events += len(deduped)
+                    dbs_parsed += 1
+                finally:
+                    conn.close()
+            except Exception:
+                dbs_skipped += 1
+    _CONV_DB_CACHE["ts"] = now
+    _CONV_DB_CACHE["by_cid"] = by_cid
+    _CONV_DB_CACHE["by_cid_day"] = by_cid_day
+    _CONV_DB_CACHE["meta"] = {"dbs_parsed": dbs_parsed, "dbs_skipped": dbs_skipped, "db_events": total_events}
+    return by_cid, by_cid_day, _CONV_DB_CACHE["meta"]
+
+def _scale_request_bucket(reqs, key, tr_val, db_val):
+    """Distribute a per-conversation DB-vs-transcript token delta across that
+    conversation's requests proportionally, keeping the DB total exact."""
+    factor = db_val / float(tr_val)
+    scaled = [r[key] * factor for r in reqs]
+    residual = db_val - sum(scaled)
+    if scaled:
+        j = max(range(len(scaled)), key=lambda i: scaled[i])
+        scaled[j] += residual
+    vals = [max(0, int(round(s))) for s in scaled]
+    diff = db_val - sum(vals)
+    if diff and vals:
+        j = max(range(len(vals)), key=lambda i: vals[i])
+        vals[j] = max(0, vals[j] + diff)
+    for r, v in zip(reqs, vals):
+        r[key] = v
+
+def _distribute_missing_bucket(reqs, key, db_val):
+    """Transcripts reported 0 for this bucket but the DB holds usage (e.g.
+    compacted/rotated transcripts) — spread it across the conversation's
+    requests proportional to their token totals, keeping the DB total exact."""
+    weights = [max(1, r["total"]) for r in reqs]
+    wsum = float(sum(weights))
+    scaled = [db_val * (w / wsum) for w in weights]
+    residual = db_val - sum(scaled)
+    if scaled:
+        j = max(range(len(scaled)), key=lambda i: scaled[i])
+        scaled[j] += residual
+    vals = [max(0, int(round(s))) for s in scaled]
+    diff = db_val - sum(vals)
+    if diff and vals:
+        j = max(range(len(vals)), key=lambda i: vals[i])
+        vals[j] = max(0, vals[j] + diff)
+    for r, v in zip(reqs, vals):
+        r[key] = v
+
+def _rebuild_daily_from_requests(all_requests, errors):
+    """Rebuild the daily ledger from (corrected) requests + error records."""
+    daily = defaultdict(lambda: {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "steps": 0, "errors": 0, "tools": 0})
+    for r in all_requests:
+        dt = r.get("date") or ""
+        if not dt:
+            continue
+        dv = daily[dt]
+        dv["in"] += r["in"]
+        dv["out"] += r["out"]
+        dv["cache"] += r["cache"]
+        dv["total"] += r["total"]
+        dv["units"] += r["units"]
+        dv["steps"] += 1
+        dv["tools"] += len(r.get("tools") or [])
+    for e in errors:
+        raw = e.get("time") or ""
+        if not raw:
+            continue
+        dt = raw[:10]
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        if dt:
+            daily[dt]["errors"] += 1
+    return daily
 
 def load_raw_telemetry(force=False):
     global _TELEMETRY_CACHE, _TELEMETRY_CACHE_TIME
@@ -1257,7 +1774,10 @@ def load_raw_telemetry(force=False):
                         out = int(d.get("output_tokens", 0) or 0)
                         cch = int(d.get("cache_read_tokens", 0) or 0)
                         tot = inp + out + cch
-                        q_units = compute_quota_units(current_model, inp, out, cch)
+                        # Per-record attribution: each PLANNER_RESPONSE carries the model
+                        # that actually served it (orchestrator leads vs delegated workers).
+                        rec_model = normalize_model_display(d.get("model")) or current_model
+                        q_units = compute_quota_units(rec_model, inp, out, cch)
 
                         tcalls = d.get("tool_calls", [])
                         tc_count = len(tcalls)
@@ -1316,7 +1836,7 @@ def load_raw_telemetry(force=False):
                                 "tool": tname,
                                 "ts": ts_ms,
                                 "time": raw_dt,
-                                "model": current_model,
+                                "model": rec_model,
                                 "args_chars": len(args_str),
                                 "result_chars": 0,
                                 "tokens_share": tc_tok_share,
@@ -1337,7 +1857,7 @@ def load_raw_telemetry(force=False):
                             "time": raw_dt,
                             "ts": ts_ms,
                             "date": loc_dt_str,
-                            "model": current_model,
+                            "model": rec_model,
                             "agent": agent_type,
                             "title": meta_entry.get("title") or (f"{agent_type} ({cid[:8]})" if meta_entry.get("parent") else "Untitled Session"),
                             "project": inferred_proj or fallback_tool_proj or ws_proj or "(unassigned)",
@@ -1346,7 +1866,7 @@ def load_raw_telemetry(force=False):
                             "cache": cch,
                             "total": tot,
                             "units": q_units,
-                            "pct_5h": units_to_pct_5h(q_units, 3, is_3p=_is_3p_model(current_model)),
+                            "pct_5h": units_to_pct_5h(q_units, 3, is_3p=_is_3p_model(rec_model)),
                             "pct_week": units_to_pct_week(q_units, 3),
                             "durationMs": est_dur_ms,
                             "durMeasured": False,
@@ -1422,6 +1942,102 @@ def load_raw_telemetry(force=False):
     errors.sort(key=lambda x: x["ts"], reverse=True)
     frustrations.sort(key=lambda x: x["ts"], reverse=True)
 
+    # DB-authoritative token correction: align per-conversation, per-day
+    # transcript token totals with the identity-deduped gen_metadata/steps
+    # totals, then rebuild the daily ledger from the corrected requests
+    # (transcripts keep owning latency/tools/errors/frustration signals).
+    # Days whose transcript records no longer exist (compacted/rotated
+    # transcripts) are restored directly from DB event timestamps.
+    recon = None
+    try:
+        db_tokens, db_by_cid_day, db_meta = _load_conv_db_tokens(force=force)
+    except Exception:
+        db_tokens, db_by_cid_day, db_meta = {}, {}, {}
+    if db_tokens:
+        before_by_day = defaultdict(int)
+        for r in all_requests:
+            if r.get("date"):
+                before_by_day[r["date"]] += r["total"]
+        before_total = sum(r["total"] for r in all_requests)
+        corrected_cids = 0
+        db_only_daily = {}
+        for c_id, day_map in db_by_cid_day.items():
+            reqs = reqs_by_cid.get(c_id)
+            if not reqs:
+                continue
+            corrected_cids += 1
+            tr_by_day = defaultdict(lambda: [0, 0, 0])
+            for r in reqs:
+                d = r.get("date")
+                if d:
+                    tr_by_day[d][0] += r["in"]
+                    tr_by_day[d][1] += r["out"]
+                    tr_by_day[d][2] += r["cache"]
+            for day in set(tr_by_day) | set(day_map):
+                dbd = day_map.get(day) or {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0}
+                trd = tr_by_day.get(day, [0, 0, 0])
+                day_reqs_check = [r for r in reqs if r.get("date") == day]
+                if not day_reqs_check:
+                    if dbd["total"] > 0:
+                        resid = db_only_daily.setdefault(day, {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0})
+                        resid["in"] += dbd["in"]
+                        resid["out"] += dbd["out"]
+                        resid["cache"] += dbd["cache"]
+                        resid["total"] += dbd["total"]
+                        resid["units"] += dbd["units"]
+                    continue
+                if dbd["total"] == 0 and (trd[0] or trd[1] or trd[2]):
+                    continue
+                for key, tr_val, db_val in (("in", trd[0], dbd["in"]), ("out", trd[1], dbd["out"]), ("cache", trd[2], dbd["cache"])):
+                    if db_val == tr_val:
+                        continue
+                    if tr_val > 0:
+                        _scale_request_bucket(day_reqs_check, key, tr_val, db_val)
+                    elif db_val > 0:
+                        _distribute_missing_bucket(day_reqs_check, key, db_val)
+            for r in reqs:
+                r["total"] = r["in"] + r["out"] + r["cache"]
+                r["units"] = compute_quota_units(r["model"], r["in"], r["out"], r["cache"])
+                r["pct_5h"] = units_to_pct_5h(r["units"], 3, is_3p=_is_3p_model(r["model"]))
+                r["pct_week"] = units_to_pct_week(r["units"], 3)
+        daily = _rebuild_daily_from_requests(all_requests, errors)
+        for day, resid in db_only_daily.items():
+            dv = daily.setdefault(day, {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "steps": 0, "errors": 0, "tools": 0})
+            dv["in"] += resid["in"]
+            dv["out"] += resid["out"]
+            dv["cache"] += resid["cache"]
+            dv["total"] += resid["total"]
+            dv["units"] += resid["units"]
+        after_by_day = defaultdict(int)
+        for r in all_requests:
+            if r.get("date"):
+                after_by_day[r["date"]] += r["total"]
+        for day, resid in db_only_daily.items():
+            after_by_day[day] += resid["total"]
+        after_total = sum(r["total"] for r in all_requests) + sum(v["total"] for v in db_only_daily.values())
+        by_day = []
+        for dt_k in sorted(set(before_by_day) | set(after_by_day))[-30:]:
+            b_val = before_by_day.get(dt_k, 0)
+            a_val = after_by_day.get(dt_k, 0)
+            if b_val or a_val:
+                by_day.append({
+                    "date": dt_k,
+                    "before": b_val,
+                    "after": a_val,
+                    "delta_pct": round(((a_val - b_val) / b_val * 100.0) if b_val else 0.0, 2)
+                })
+        recon = {
+            "dbs_parsed": db_meta.get("dbs_parsed", 0),
+            "dbs_skipped": db_meta.get("dbs_skipped", 0),
+            "db_events": db_meta.get("db_events", 0),
+            "cids_corrected": corrected_cids,
+            "transcript_total_before": before_total,
+            "transcript_total_after": after_total,
+            "db_total": sum(a["total"] for a in db_tokens.values()),
+            "db_only_days": len(db_only_daily),
+            "by_day": by_day
+        }
+
     daily_out = {}
     for dt_k, dv in sorted(daily.items()):
         daily_out[dt_k] = {
@@ -1451,6 +2067,7 @@ def load_raw_telemetry(force=False):
         "commands": dict(commands.most_common(20)),
         "files_read": dict(files_read.most_common(15)),
         "files_edited": dict(files_edited.most_common(15)),
+        "reconciliation": recon,
         "quota": quota_pools
     }
     _TELEMETRY_CACHE_TIME = now
@@ -2355,6 +2972,7 @@ def compute_stats_for_range(range_str="all", from_ms=None, to_ms=None):
         "projects": projects_list,
         "sessions": sessions_list,
         "quota": effective_quota_list,
+        "reconciliation": telemetry.get("reconciliation"),
         "today": {
             "date": today_str,
             **today_entry
@@ -2471,26 +3089,27 @@ def build_session_trace(cid):
                         out = int(d.get("output_tokens", 0) or 0)
                         cch = int(d.get("cache_read_tokens", 0) or 0)
                         tot = inp + out + cch
-                        qu = compute_quota_units(cur_m, inp, out, cch)
+                        rec_m = normalize_model_display(d.get("model")) or cur_m
+                        qu = compute_quota_units(rec_m, inp, out, cch)
                         tcalls = [tc.get("name", "tool") for tc in d.get("tool_calls", [])]
                         tot_tokens += tot
                         tot_units += qu
                         tot_tools += len(tcalls)
                         if is_err:
                             tot_errors += 1
-                        models_seen.add(cur_m)
+                        models_seen.add(rec_m)
                         raw_spans.append({
                             "id": f"{t_cid[:8]}-{idx}",
                             "cid": t_cid,
                             "step": idx,
                             "kind": "error" if is_err else ("subagent" if t_cid != cid else "model"),
                             "agent": ag,
-                            "model": cur_m,
+                            "model": rec_m,
                             "time": raw_dt,
                             "ts": ts_ms,
                             "durationMs": dur_ms,
                             "in": inp, "out": out, "cache": cch, "total": tot,
-                            "pct5h": units_to_pct_5h(qu, 3, is_3p=_is_3p_model(cur_m)),
+                            "pct5h": units_to_pct_5h(qu, 3, is_3p=_is_3p_model(rec_m)),
                             "pctWeek": units_to_pct_week(qu, 3),
                             "tools": tcalls,
                             "isError": is_err,
@@ -2734,7 +3353,7 @@ def print_cli_quota(data):
             if q_mode_cli == "multi":
                 print(f"    {'Setup attribution:':<24} {C.DIM}This setup: {base_p['localWkUsedPct']:.2f}% | Other surfaces: {base_p['otherWkUsedPct']:.2f}% (Server total: {base_p['serverWkUsedPct']:.1f}%){C.RESET}")
 
-def print_cli_tokens(data, limit_days=10):
+def print_cli_tokens(data, limit_days=10, mode="daily"):
     ov = data["overall"]
     td = data["today"]
     print(f"\n{C.BOLD}{C.CYAN}TOKEN SPENT OVERVIEW{C.RESET}")
@@ -2743,7 +3362,7 @@ def print_cli_tokens(data, limit_days=10):
     print(f"  Uncached Input:      {C.BOLD}{format_tokens(ov['totalInputTokens'])}{C.RESET} | Output Tokens: {C.BOLD}{format_tokens(ov['totalOutputTokens'])}{C.RESET}")
     print(f"  Today ({td['date']}):     {C.BOLD}{format_tokens(td['total'])}{C.RESET} ({td['pct_week']:.2f}% weekly quota)")
     print_cli_models(data)
-    print_cli_days(data, limit_days)
+    print_cli_days(data, limit_days, mode)
 
 def print_cli_models(data):
     print(f"\n{C.BOLD}{C.CYAN}MODELS{C.RESET}")
@@ -2753,20 +3372,61 @@ def print_cli_models(data):
     for m, st in data["models"].items():
         print(f"  {m:<30} {st['steps']:>8,} {st['in']/1e6:>10.2f}M {st['out']/1e6:>9.2f}M {st['cache']/1e6:>11.1f}M {C.CYAN}{st['pct_week']:>9.2f}%{C.RESET}")
 
-def print_cli_days(data, limit_days):
-    print(f"\n{C.BOLD}{C.CYAN}DAILY LEDGER ({'ALL' if limit_days >= 999 else f'LAST {limit_days}D'}){C.RESET}")
+def _rollup_daily_buckets(daily, mode):
+    """Aggregate the daily ledger into ISO-week or calendar-month buckets."""
+    rolled = {}
+    for dt_k, st in daily.items():
+        try:
+            d = datetime.strptime(dt_k, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        if mode == "weeks":
+            iso = d.isocalendar()
+            key = f"{iso[0]}-W{iso[1]:02d}"
+        else:
+            key = dt_k[:7]
+        agg = rolled.setdefault(key, {"in": 0, "out": 0, "cache": 0, "total": 0, "units": 0.0, "steps": 0, "errors": 0, "tools": 0})
+        for k in ("in", "out", "cache", "total", "steps", "errors", "tools"):
+            agg[k] += st.get(k, 0)
+        agg["units"] += st.get("units", 0.0)
+    for agg in rolled.values():
+        agg["pct_5h"] = units_to_pct_5h(agg["units"], 2)
+        agg["pct_week"] = units_to_pct_week(agg["units"], 2)
+    return dict(sorted(rolled.items()))
+
+def print_cli_days(data, limit_days, mode="daily"):
+    now_local = datetime.now().astimezone()
+    if mode == "weeks":
+        iso = now_local.isocalendar()
+        today_key = f"{iso[0]}-W{iso[1]:02d}"
+        header = f"WEEKLY LEDGER ({'ALL' if limit_days >= 999 else f'LAST {limit_days}W'})"
+        date_w = 9
+        col_label = "Week"
+        items = list(_rollup_daily_buckets(data["daily"], "weeks").items())[-limit_days:]
+    elif mode == "months":
+        today_key = now_local.strftime("%Y-%m")
+        header = f"MONTHLY LEDGER ({'ALL' if limit_days >= 999 else f'LAST {limit_days}M'})"
+        date_w = 8
+        col_label = "Month"
+        items = list(_rollup_daily_buckets(data["daily"], "months").items())[-limit_days:]
+    else:
+        today_key = data["today"]["date"]
+        header = f"DAILY LEDGER ({'ALL' if limit_days >= 999 else f'LAST {limit_days}D'})"
+        date_w = 11
+        col_label = "Date"
+        items = list(data["daily"].items())[-limit_days:]
+    print(f"\n{C.BOLD}{C.CYAN}{header}{C.RESET}")
     print(f"{C.DIM}{'─' * 98}{C.RESET}")
-    print(f"  {C.BOLD}{'Date':<12} {'Activity':<12} {'Reqs':>7} {'Input':>10} {'Output':>9} {'Cache':>11} {'Total':>10} {'Wk Quota':>9}{C.RESET}")
+    print(f"  {C.BOLD}{col_label:<{date_w + 1}} {'Activity':<12} {'Reqs':>7} {'Input':>10} {'Output':>9} {'Cache':>11} {'Total':>10} {'Wk Quota':>9}{C.RESET}")
     print(f"{C.DIM}{'─' * 98}{C.RESET}")
-    items = list(data["daily"].items())[-limit_days:]
     peak_tok = max((st["total"] for _, st in items), default=1) or 1
     for dt, st in items:
-        mark = f"{C.GREEN}*{C.RESET}" if dt == data["today"]["date"] else " "
+        mark = f"{C.GREEN}*{C.RESET}" if dt == today_key else " "
         fill = int(round((min(max(st["total"], 0), peak_tok) / float(peak_tok)) * 12))
         if st["total"] > 0 and fill == 0:
             fill = 1
         bar = f"{C.CYAN}{'█' * fill}{C.DIM}{'░' * (12 - fill)}{C.RESET}"
-        print(f" {mark}{dt:<11} {bar} {st['steps']:>7,} {st['in']/1e6:>9.2f}M {st['out']/1e6:>8.2f}M {st['cache']/1e6:>10.1f}M {st['total']/1e6:>9.1f}M {C.CYAN}{st['pct_week']:>8.2f}%{C.RESET}")
+        print(f" {mark}{dt:<{date_w}} {bar} {st['steps']:>7,} {st['in']/1e6:>9.2f}M {st['out']/1e6:>8.2f}M {st['cache']/1e6:>10.1f}M {st['total']/1e6:>9.1f}M {C.CYAN}{st['pct_week']:>8.2f}%{C.RESET}")
 
 def print_cli_sessions(data, limit=15):
     print(f"\n{C.BOLD}{C.CYAN}SESSIONS{C.RESET}")
@@ -2816,13 +3476,13 @@ OVERVIEW_SECTION_ITEMS = [
 
 MINIMALIST_DISABLED_SECTIONS = ["sessions", "requests", "tools", "frustration"]
 
-def run_cli_view(view_name, data, disabled_sections=None, limit_days=10):
+def run_cli_view(view_name, data, disabled_sections=None, limit_days=10, ledger_mode="daily"):
     disabled = set(disabled_sections or [])
     if view_name == "summary":
         print_cli_summary(data)
         return
     if view_name == "tokens":
-        print_cli_tokens(data, limit_days)
+        print_cli_tokens(data, limit_days, ledger_mode)
         return
     if view_name == "quota":
         print_cli_quota(data)
@@ -2843,7 +3503,7 @@ def run_cli_view(view_name, data, disabled_sections=None, limit_days=10):
     if "models" not in disabled:
         print_cli_models(data)
     if "days" not in disabled:
-        print_cli_days(data, limit_days)
+        print_cli_days(data, limit_days, ledger_mode)
     if "sessions" not in disabled:
         print_cli_sessions(data, 15)
     if "tools" not in disabled:
@@ -3483,6 +4143,7 @@ def print_usage_cheatsheet():
     print(f"  {C.CYAN}{'--models | --sessions':<24}{C.RESET} Model breakdown or top sessions leaderboard")
     print(f"  {C.CYAN}{'--tools  | --frustration':<24}{C.RESET} Tool/command stats or frustration signals")
     print(f"  {C.CYAN}{'--days N | --today':<24}{C.RESET} Filter terminal ledger window (default: 10d)")
+    print(f"  {C.CYAN}{'--weeks N | --months N':<24}{C.RESET} Weekly or monthly ledger rollups")
     print(f"  {C.CYAN}{'--settings [k=v ...]':<24}{C.RESET} Interactive preferences menu or CLI config")
     print(f"  {C.CYAN}{'--onboard':<24}{C.RESET} Re-run guided onboarding setup wizard")
     print(f"  {C.CYAN}{'--update [--check-update]':<24}{C.RESET} Verified atomic self-update in ~/.local/bin")
@@ -10274,6 +10935,8 @@ def main():
     parser.add_argument("--summary", action="store_true", help="Compact 1-line summary")
     parser.add_argument("--today", action="store_true", help="Show only today")
     parser.add_argument("--days", type=int, default=None, help="Number of days to show (default: 10)")
+    parser.add_argument("--weeks", type=int, default=None, help="Number of weeks to show (weekly ledger rollup)")
+    parser.add_argument("--months", type=int, default=None, help="Number of months to show (monthly ledger rollup)")
     parser.add_argument("--all", action="store_true", help="Show all days")
     parser.add_argument("--models", action="store_true", help="Show model breakdown")
     parser.add_argument("--quota", action="store_true", help="Show live quota pools")
@@ -10362,7 +11025,7 @@ def main():
 
     # Auto-detect first run if not onboarded and interactive TTY without explicit flags
     has_explicit_flag = any([
-        args.summary, args.today, args.days is not None, args.all, args.models,
+        args.summary, args.today, args.days is not None, args.weeks is not None, args.months is not None, args.all, args.models,
         args.quota, args.sessions, args.tools, args.frustration, args.tokens,
         args.json, args.no_open, args.cli, args.web, args.onboard,
         args.install, args.settings is not None
@@ -10378,14 +11041,16 @@ def main():
 
     cfg_days = cfg.get("cli", {}).get("days", 10)
     limit_days = 1 if args.today else (9999 if args.all else (args.days if args.days is not None else cfg_days))
+    rollup_mode = "weeks" if args.weeks is not None else ("months" if args.months is not None else "daily")
+    rollup_limit = args.weeks if args.weeks is not None else (args.months if args.months is not None else limit_days)
 
     if args.tokens:
         data = collect_all_data()
-        print_cli_tokens(data, limit_days)
+        print_cli_tokens(data, rollup_limit if rollup_mode != "daily" else limit_days, rollup_mode)
         return
 
     section_flags = any([args.summary, args.models, args.quota, args.sessions, args.tools, args.frustration])
-    range_cli_flags = any([args.today, args.all, args.days is not None])
+    range_cli_flags = any([args.today, args.all, args.days is not None, args.weeks is not None, args.months is not None])
     force_cli = args.cli or section_flags or range_cli_flags or args.json
 
     # Determine mode:
@@ -10416,7 +11081,7 @@ def main():
     if not section_flags:
         def_view = cfg.get("cli", {}).get("default_view", "overview")
         dis_sec = cfg.get("cli", {}).get("disabled_sections", [])
-        run_cli_view(def_view, data, dis_sec, limit_days)
+        run_cli_view(def_view, data, dis_sec, rollup_limit if rollup_mode != "daily" else limit_days, rollup_mode)
         return
 
     print_cli_summary(data)
@@ -10425,7 +11090,7 @@ def main():
     if args.models:
         print_cli_models(data)
     if range_cli_flags:
-        print_cli_days(data, limit_days)
+        print_cli_days(data, rollup_limit if rollup_mode != "daily" else limit_days, rollup_mode)
     if args.sessions:
         print_cli_sessions(data, 15)
     if args.tools:

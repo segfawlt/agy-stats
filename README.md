@@ -135,9 +135,17 @@ agy stats --tools            # Tool call & shell command leaderboard
 agy stats --frustration      # Detected frustration & error-loop signals
 agy stats --today            # Filter CLI ledger to today
 agy stats --days 30          # Filter CLI ledger to the last 30 days
+agy stats --weeks 8          # Weekly ledger rollup (last 8 ISO weeks)
+agy stats --months 6         # Monthly ledger rollup (last 6 calendar months)
 agy stats --all              # Show full historical daily ledger
 agy stats --json             # Emit raw structured JSON telemetry
 ```
+
+### Model Attribution & Token Authority (Orchestrator era)
+
+agy-stats attributes every request to the model that actually served it — including **Orchestrator (Carbon) / Orchestrator (Argon)** planning steps, delegated **Gemini Flash Worker (internal)** calls, and **Gemini 4 Carbon / Argon / Hydrogen** tiers — via each transcript record's own `model` field plus a central alias table. Mid-session model switches are tracked from `Model Selection` events, and quota pacing weights for the new Orchestrator / Hydrogen tiers are initial estimates pending `/usage` delta calibration.
+
+Token totals are **DB-authoritative**: the `conversations/*.db` databases (`gen_metadata` / `steps` protobuf rows) carry identity-keyed usage that lets retries, step mirrors, and source copies be merged instead of double-counted, and restores days whose transcript records were compacted. Transcripts remain the source for latency, tools, errors, and frustration signals, and act as fallback when a database is unreadable. Run `agy stats --json` and inspect the `reconciliation` block to see the per-day before/after of that alignment.
 
 ### Onboarding, Preferences & Maintenance
 
